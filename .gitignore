@@ -1,0 +1,30 @@
+# ── Sensitive / credentials ────────────────────────────────────────────────────
+access_token.txt
+.env
+*.env
+secrets.py
+
+# ── Trade logs (personal financial data) ──────────────────────────────────────
+trades/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
