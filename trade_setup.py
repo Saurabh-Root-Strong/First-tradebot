@@ -1,19 +1,22 @@
 """
 trade_setup.py  --  Quant-grade intraday option trade engine.
 
-8-layer signal system (weighted for intraday):
-  Layer 1  Technical      28%   EMA 9/21/50 · MACD · RSI 14 · VWAP · Bollinger
-  Layer 2  OI Flow        12%   4-quadrant OI change vs price · ATM activity · walls
-  Layer 3  Velocity       22%   OI/IV/wall/PCR velocity over session history  ← NEW
-  Layer 4  Institutional  18%   FII futures net · FAO smart-money vs retail divergence · PE
+9-layer signal system (weighted for intraday):
+  Layer 1  Technical      25%   EMA 9/21/50 · MACD · RSI 14 · VWAP · Bollinger
+  Layer 2  OI Flow        10%   4-quadrant OI change vs price · ATM activity · walls
+  Layer 3  Velocity       18%   OI/IV/wall/PCR velocity over session history
+  Layer 4  Institutional  10%   FII futures net · FAO smart-money vs retail divergence · PE
   Layer 5  Futures         8%   Live basis · term structure · institutional direction
   Layer 6  IV              6%   ATM IV level · put/call skew
-  Layer 7  PCR             3%   Contrarian/momentum PCR bands
-  Layer 8  Max Pain        3%   Expiry gravity (low weight for intraday)
+  Layer 7  PCR             4%   Contrarian/momentum PCR bands
+  Layer 8  Max Pain        2%   Expiry gravity (low weight for intraday)
+  Layer 9  Daily Context  17%   EOD structural setup from Daily_Cash_Market DB
+                                (prediction engine · HMM regime · FII trend ·
+                                 market breadth · VIX regime · EOD OI footprint)
 
 Each layer returns a score in [-4, +4] range.
 Positive = bullish, Negative = bearish.
-Velocity layer requires ~9 minutes of session history; degrades gracefully to 0 before that.
+Layer 9 degrades to 0 gracefully when Daily_Cash_Market DB is unavailable.
 """
 
 import datetime
@@ -24,6 +27,12 @@ try:
     _INTRADAY_STORE_AVAILABLE = True
 except Exception:
     _INTRADAY_STORE_AVAILABLE = False
+
+try:
+    from daily_context_bridge import get_bridge as _get_bridge
+    _BRIDGE_AVAILABLE = True
+except Exception:
+    _BRIDGE_AVAILABLE = False
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
@@ -597,33 +606,43 @@ def _velocity_layer(sym: str, spot: float) -> tuple[float, list]:
 
 # ── Composite score + conviction ──────────────────────────────────────────────
 def _composite(tech_score, oi_score, vel_score, inst_score,
-               fut_score, iv_score, pcr_score, mp_score) -> tuple[float, str, str]:
+               fut_score, iv_score, pcr_score, mp_score,
+               ctx_score) -> tuple[float, str, str]:
     """
-    8-layer weighted composite. Returns (weighted_score, verdict, color).
-    Velocity takes 22% — the session-memory layer is now the second-largest weight.
+    9-layer weighted composite. Returns (weighted_score, verdict, color).
+
+    Weight rationale:
+      Daily Context (17%) provides yesterday's EOD structural setup from a
+      24-signal prediction engine + HMM regime + FII trend — a dense,
+      pre-computed signal that anchors intraday decisions.
+      Institutional (10%) reduced because FII data now also appears in
+      Layer 9, avoiding double-counting.
     """
     w = {
-        "tech":    0.28,
-        "oi":      0.12,
-        "vel":     0.22,
-        "inst":    0.18,
+        "tech":    0.25,
+        "oi":      0.10,
+        "vel":     0.18,
+        "inst":    0.10,
         "futures": 0.08,
         "iv":      0.06,
-        "pcr":     0.03,
-        "mp":      0.03,
+        "pcr":     0.04,
+        "mp":      0.02,
+        "ctx":     0.17,   # Daily Context bridge
     }
+    # Weights sum = 0.25+0.10+0.18+0.10+0.08+0.06+0.04+0.02+0.17 = 1.00
 
     tech_n = max(min(tech_score / 2, 4), -4)
 
     composite = (
-        tech_n    * w["tech"]    +
-        oi_score  * w["oi"]      +
-        vel_score * w["vel"]     +
-        inst_score* w["inst"]    +
-        fut_score * w["futures"] +
-        iv_score  * w["iv"]      +
-        pcr_score * w["pcr"]     +
-        mp_score  * w["mp"]
+        tech_n     * w["tech"]    +
+        oi_score   * w["oi"]      +
+        vel_score  * w["vel"]     +
+        inst_score * w["inst"]    +
+        fut_score  * w["futures"] +
+        iv_score   * w["iv"]      +
+        pcr_score  * w["pcr"]     +
+        mp_score   * w["mp"]      +
+        ctx_score  * w["ctx"]
     )
 
     if   composite >= 2.0:  return composite, "STRONG BUY",  "#22c55e"
@@ -707,6 +726,15 @@ def build_recommendation(
     # ── Layer 8: Institutional (FII futures + FAO smart-money + PE) ───────────
     inst_score, inst_signals = get_institutional_bias(sym, spot)
 
+    # ── Layer 9: Daily Context (EOD structural setup from Daily_Cash_Market) ──
+    if _BRIDGE_AVAILABLE:
+        try:
+            ctx_score, ctx_signals = _get_bridge().score_index(sym)
+        except Exception:
+            ctx_score, ctx_signals = 0.0, [("neut", "Daily context: error reading bridge")]
+    else:
+        ctx_score, ctx_signals = 0.0, [("neut", "Daily context: bridge module unavailable")]
+
     # ── Session phase quality multiplier ─────────────────────────────────────
     if _INTRADAY_STORE_AVAILABLE:
         phase_name, phase_mult, phase_caution = session_phase()
@@ -716,15 +744,17 @@ def build_recommendation(
     # ── Composite direction ───────────────────────────────────────────────────
     composite, verdict, verdict_clr = _composite(
         tech_score, oi_score, vel_score, inst_score,
-        fut_score, iv_score, pcr_score, mp_score
+        fut_score, iv_score, pcr_score, mp_score,
+        ctx_score,
     )
 
-    # Count layer agreements (how many of the 8 layers agree with composite direction?)
+    # Count layer agreements (how many of the 9 layers agree with composite direction?)
     layer_scores = [tech_score / 2, oi_score, vel_score,
-                    inst_score, fut_score, iv_score, pcr_score, mp_score]
+                    inst_score, fut_score, iv_score, pcr_score, mp_score,
+                    ctx_score]
     bull_layers  = sum(1 for s in layer_scores if s > 0.3)
     bear_layers  = sum(1 for s in layer_scores if s < -0.3)
-    neut_layers  = 8 - bull_layers - bear_layers
+    neut_layers  = 9 - bull_layers - bear_layers
 
     if composite > 0:
         agreement = bull_layers
@@ -837,21 +867,22 @@ def build_recommendation(
         warnings.append("Daily + intraday trend ALIGNED (bearish) — higher conviction, can hold with trailing SL")
 
     if agreement <= 2:
-        warnings.append(f"Only {agreement}/8 signal layers agree — CONFLICTED setup, small size or skip")
+        warnings.append(f"Only {agreement}/9 signal layers agree — CONFLICTED setup, small size or skip")
     elif agreement == 3:
-        warnings.append(f"{agreement}/8 layers agree — mixed conviction, use half position size")
+        warnings.append(f"{agreement}/9 layers agree — mixed conviction, use half position size")
 
     if atm_iv > 20:
         warnings.append(f"ATM IV {atm_iv:.1f}% elevated — buy dips in premium if possible, IV crush will erode gains fast")
 
     # Layered signals for "WHY THIS TRADE?" panel (combine all layers)
     all_opt_signals = (
-        vel_signals[:3] +          # Velocity first — time-series context
-        inst_signals[:2] +         # Institutional next
+        ctx_signals[:3] +          # Daily context first — structural EOD setup
+        vel_signals[:2] +          # Intraday velocity next
+        inst_signals[:2] +
         oi_signals[:2] +
         pcr_signals +
         mp_signals +
-        fut_signals[:2]
+        fut_signals[:1]
     )
 
     # Session phase caution appended to warnings
@@ -862,15 +893,16 @@ def build_recommendation(
 
     # ── Layer summary ─────────────────────────────────────────────────────────
     layer_summary = {
-        "tech":     {"score": round(tech_score / 2, 2), "label": "Technical"},
-        "oi":       {"score": oi_score,   "label": "OI Flow (snapshot)"},
-        "velocity": {"score": vel_score,  "label": "OI/IV/Wall Velocity"},
-        "inst":     {"score": inst_score, "label": "Institutional (FII/FAO)"},
-        "fut":      {"score": fut_score,  "label": "Futures"},
-        "iv":       {"score": iv_score,   "label": "IV"},
-        "pcr":      {"score": pcr_score,  "label": "PCR"},
-        "mp":       {"score": mp_score,   "label": "Max Pain"},
-        "agree":    f"{agreement}/8 layers aligned",
+        "tech":     {"score": round(tech_score / 2, 2), "label": "Technical (25%)"},
+        "oi":       {"score": oi_score,   "label": "OI Flow snapshot (10%)"},
+        "velocity": {"score": vel_score,  "label": "OI/IV/Wall Velocity (18%)"},
+        "inst":     {"score": inst_score, "label": "Institutional FII/FAO (10%)"},
+        "futures":  {"score": fut_score,  "label": "Futures Basis (8%)"},
+        "iv":       {"score": iv_score,   "label": "IV (6%)"},
+        "pcr":      {"score": pcr_score,  "label": "PCR (4%)"},
+        "mp":       {"score": mp_score,   "label": "Max Pain (2%)"},
+        "context":  {"score": ctx_score,  "label": "Daily Context EOD (17%)"},
+        "agree":    f"{agreement}/9 layers aligned",
         "phase":    phase_name,
     }
 

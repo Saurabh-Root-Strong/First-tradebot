@@ -19,6 +19,11 @@ from fyers_apiv3.FyersWebsocket import data_ws
 from signals import run_full_analysis, recommend_option
 from trade_setup import build_recommendation, TF_PROFILES
 from intraday_store import candle_store, oi_store, build_oi_snapshot
+try:
+    from daily_context_bridge import get_bridge as _get_ctx_bridge
+    _CTX_BRIDGE_OK = True
+except Exception:
+    _CTX_BRIDGE_OK = False
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_ID     = "WVDZUTO6HL-100"
@@ -753,6 +758,8 @@ app.layout = dbc.Container([
                               style={"height": "260px"}),
                 ]), style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "marginBottom": "12px"}),
+                # Daily EOD context from Daily_Cash_Market bridge
+                html.Div(id="context-panel"),
                 # Trade signals panel
                 html.Div(id="signal-panel"),
             ]),
@@ -826,6 +833,135 @@ app.layout = dbc.Container([
     dcc.Interval(id="setup-tick", interval=30000, n_intervals=0),
 
 ], fluid=True, style={"background": BG, "minHeight": "100vh", "padding": "0"})
+
+
+# ── Daily context panel renderer ─────────────────────────────────────────────
+def _render_context_panel() -> html.Div:
+    """
+    Compact 4-column card showing yesterday's EOD structural setup for all
+    4 indices. Uses Daily_Cash_Market bridge (Layer 9 data).
+    Renders a 'building' state when bridge is loading or DB is unavailable.
+    """
+    if not _CTX_BRIDGE_OK:
+        return html.Div()
+
+    bridge = _get_ctx_bridge()
+    if not bridge.is_available():
+        return dbc.Card(dbc.CardBody(
+            html.Div(
+                "Daily Context (Layer 9): Daily_Cash_Market DB not reachable "
+                "— run daily ingestion after 6:30 PM",
+                style={"color": "#334155", "fontSize": "0.62rem", **MONO},
+            )
+        ), style={"background": "#080f1c", "border": "1px solid #1a2535",
+                  "borderRadius": "8px", "marginBottom": "10px"})
+
+    cols = []
+    for sym in INDEX_SYMBOLS:
+        data   = bridge.get_panel_data(sym)
+        color  = COLORS[sym]
+        label  = LABELS[sym]
+        common = data.get("__common__", {})
+
+        direction  = data.get("direction", "?")
+        confidence = data.get("confidence", "?")
+        hmm        = data.get("hmm_state", "?")
+        acc        = data.get("pred_acc_30d")
+        fii_5d     = data.get("fii_5d_cr")
+        vix        = common.get("india_vix")
+        breadth    = common.get("breadth_pct")
+        pred_date  = data.get("pred_date")
+        rng_lo     = data.get("range_low")
+        rng_hi     = data.get("range_high")
+        target     = data.get("target_close")
+        score, _   = bridge.score_index(sym)
+
+        # Direction colour
+        dir_clr = ("#22c55e" if direction == "UP"
+                   else "#ef4444" if direction == "DOWN"
+                   else "#f59e0b")
+        score_clr = "#22c55e" if score > 0.5 else "#ef4444" if score < -0.5 else "#94a3b8"
+
+        def _kv(k, v, vc="#475569"):
+            return html.Div([
+                html.Span(k + "  ", style={"color": "#334155", "fontSize": "0.55rem"}),
+                html.Span(str(v),   style={"color": vc, "fontSize": "0.62rem", **MONO}),
+            ], style={"marginBottom": "2px"})
+
+        date_str = (pred_date.strftime("%d %b") if pred_date and
+                    hasattr(pred_date, "strftime") else str(pred_date or "—"))
+
+        col_children = [
+            html.Div(label, style={"color": color, "fontSize": "0.58rem",
+                                    "letterSpacing": "0.12em", "fontWeight": "700",
+                                    "marginBottom": "6px"}),
+            html.Div([
+                html.Span(direction or "—",
+                          style={"color": dir_clr, "fontWeight": "800",
+                                 "fontSize": "0.85rem", **MONO}),
+                html.Span(f"  [{confidence}]" if confidence else "",
+                          style={"color": "#475569", "fontSize": "0.58rem"}),
+            ], style={"marginBottom": "4px"}),
+            _kv("REGIME",  hmm or "—",         "#94a3b8"),
+            _kv("FII 5D",  f"{fii_5d:+,.0f}Cr" if fii_5d is not None else "—",
+                "#22c55e" if (fii_5d or 0) > 0 else "#ef4444"),
+            _kv("VIX",     f"{vix:.1f}%" if vix else "—",
+                "#f59e0b" if vix and vix > 18 else "#94a3b8"),
+            _kv("BREADTH", f"{breadth:.0f}%" if breadth else "—",
+                "#22c55e" if (breadth or 0) > 60 else "#ef4444" if (breadth or 0) < 40 else "#94a3b8"),
+        ]
+
+        if rng_lo and rng_hi:
+            col_children.append(_kv(
+                "PRED RNG",
+                f"{rng_lo:,.0f} – {rng_hi:,.0f}",
+                "#fbbf24",
+            ))
+
+        col_children.append(html.Div([
+            html.Span("L9 SCORE  ", style={"color": "#334155", "fontSize": "0.55rem"}),
+            html.Span(f"{score:+.2f}", style={"color": score_clr, "fontWeight": "700",
+                                               "fontSize": "0.65rem", **MONO}),
+            html.Span(f"  ({date_str})", style={"color": "#1e2d40", "fontSize": "0.52rem"}),
+        ], style={"marginTop": "4px", "borderTop": "1px solid #111d2e", "paddingTop": "4px"}))
+
+        if acc is not None:
+            col_children.append(html.Div(
+                f"30D accuracy: {acc:.0f}%",
+                style={"color": "#1e2d40", "fontSize": "0.52rem", **MONO},
+            ))
+
+        cols.append(dbc.Col(
+            html.Div(col_children, style={
+                "padding": "10px 12px",
+                "background": "#0a1020",
+                "borderRadius": "6px",
+                "borderLeft": f"3px solid {color}",
+                "border": f"1px solid {color}22",
+            }),
+            md=3, xs=6, className="mb-2 px-1",
+        ))
+
+    return dbc.Card(dbc.CardBody([
+        dbc.Row([
+            dbc.Col(html.Div("DAILY  CONTEXT  —  LAYER 9  (EOD  STRUCTURAL  SETUP)", style={
+                "fontSize": "0.58rem", "letterSpacing": "0.14em",
+                "color": "#1e3a5f", "fontWeight": "600",
+            })),
+            dbc.Col(html.Div(
+                "Source: Daily_Cash_Market · 24-signal engine · refreshes post-market",
+                style={"fontSize": "0.52rem", "color": "#1e2d40",
+                       "textAlign": "right"},
+            )),
+        ], className="mb-2 align-items-center"),
+        dbc.Row(cols, className="gx-2"),
+    ]), style={
+        "background": "#080f1c",
+        "border":     "1px solid #111d2e",
+        "borderTop":  "2px solid #1e3a5f",
+        "borderRadius": "8px",
+        "marginBottom": "12px",
+    })
 
 
 # ── Velocity monitor renderer ────────────────────────────────────────────────
@@ -1617,6 +1753,18 @@ def update_trade_rec(tf_key, _, expiry, sym):
     )
 
     return _render_trade_rec(rec, sym), _render_velocity_panel(sym)
+
+
+# ── Callback: daily context panel (60-second refresh, same interval) ──────────
+@app.callback(
+    Output("context-panel", "children"),
+    Input("signal-tick",    "n_intervals"),
+    State("sel-sym",        "data"),
+)
+def update_context_panel(_, sel):
+    if sel:   # overview hidden while OC panel is active
+        return no_update
+    return _render_context_panel()
 
 
 # ── Callback: trade signals (60-second refresh) ────────────────────────────────
