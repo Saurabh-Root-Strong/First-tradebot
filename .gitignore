@@ -28,3 +28,13 @@ env/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ── Historical data (large binary — regenerate with download_historical.py) ───
+data/
+
+# ── Log files ─────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Claude Code local memory (machine-specific, not project code) ─────────────
+.claude/
