@@ -28,6 +28,7 @@ Usage:
 """
 
 import datetime
+import sys
 import threading
 import time
 from pathlib import Path
@@ -80,11 +81,14 @@ class DailyContextBridge:
     """
 
     def __init__(self):
-        self._lock      = threading.Lock()
+        self._lock        = threading.Lock()
         self._cache: dict = {}          # {fyers_sym: data_dict, "__common__": ...}
         self._loaded_at: float = 0.0
         self._available: bool  = False
+        self._loading:   bool  = False  # prevents thundering-herd on stale cache
         # Load silently in background so dashboard startup is not delayed
+        with self._lock:
+            self._loading = True
         threading.Thread(target=self._load, daemon=True, name="dcb-init").start()
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -131,14 +135,17 @@ class DailyContextBridge:
     def get_panel_data(self, fyers_sym: str) -> dict:
         """
         Full context dict for the dashboard 'Daily Context' card.
+        All reads under a single lock acquisition for consistency.
         """
         self._maybe_refresh()
         with self._lock:
-            data   = dict(self._cache.get(fyers_sym, {}))
-            common = dict(self._cache.get("__common__", {}))
+            data      = dict(self._cache.get(fyers_sym, {}))
+            common    = dict(self._cache.get("__common__", {}))
+            available = self._available
+            loaded_at = self._loaded_at
         data["__common__"] = common
-        data["available"]  = self._available
-        data["loaded_at"]  = self._loaded_at
+        data["available"]  = available
+        data["loaded_at"]  = loaded_at
         return data
 
     def is_available(self) -> bool:
@@ -149,35 +156,51 @@ class DailyContextBridge:
 
     def _maybe_refresh(self):
         with self._lock:
-            age = time.time() - self._loaded_at
-        if age > CACHE_TTL:
+            age     = time.time() - self._loaded_at
+            loading = self._loading
+        # Only launch one refresh thread at a time — prevents thundering herd
+        # when multiple Dash callbacks fire simultaneously on a stale cache.
+        if age > CACHE_TTL and not loading:
+            with self._lock:
+                # Double-check under lock; another thread may have won the race
+                if not self._loading:
+                    self._loading = True
+                else:
+                    return
             threading.Thread(target=self._load, daemon=True, name="dcb-refresh").start()
 
     def _load(self):
         """Fetch all context in a single DuckDB session and update cache atomically."""
-        if not DB_PATH.exists():
-            with self._lock:
-                self._available = False
-            return
         try:
-            import duckdb
-            con = duckdb.connect(str(DB_PATH), read_only=True)
+            if not DB_PATH.exists():
+                with self._lock:
+                    self._available = False
+                    self._loading   = False
+                return
             try:
-                cache = {}
-                cache["__common__"] = self._fetch_common(con)
-                for fyers_sym, dcm_sym in _SYM.items():
-                    cache[fyers_sym] = self._fetch_symbol(con, dcm_sym)
-            finally:
-                con.close()
+                import duckdb
+                con = duckdb.connect(str(DB_PATH), read_only=True)
+                try:
+                    cache = {}
+                    cache["__common__"] = self._fetch_common(con)
+                    for fyers_sym, dcm_sym in _SYM.items():
+                        cache[fyers_sym] = self._fetch_symbol(con, dcm_sym)
+                finally:
+                    con.close()
 
-            with self._lock:
-                self._cache      = cache
-                self._loaded_at  = time.time()
-                self._available  = True
+                with self._lock:
+                    self._cache      = cache
+                    self._loaded_at  = time.time()
+                    self._available  = True
 
-        except Exception:
+            except Exception as exc:
+                print(f"[DCBridge] load failed: {exc}", file=sys.stderr)
+                with self._lock:
+                    self._available = False
+        finally:
+            # Always clear the loading flag so future refreshes can proceed
             with self._lock:
-                self._available = False
+                self._loading = False
 
     # ── Data fetchers ──────────────────────────────────────────────────────────
 
@@ -318,6 +341,8 @@ class DailyContextBridge:
             pass
 
         # ── prediction accuracy (last 30 filled predictions) ─────────────────
+        # IMPORTANT: LIMIT on an aggregate query is a no-op — it limits the
+        # single-row result, not the source rows.  Use a subquery instead.
         try:
             row = con.execute("""
                 SELECT
@@ -326,11 +351,14 @@ class DailyContextBridge:
                     AVG(CASE WHEN confidence_pred = 'HIGH' AND was_correct THEN 1.0
                               WHEN confidence_pred = 'HIGH'                 THEN 0.0
                          END)                                                AS hi_acc
-                FROM prediction_log
-                WHERE fno_symbol    = ?
-                  AND outcome_filled = TRUE
-                ORDER BY trade_date DESC
-                LIMIT 30
+                FROM (
+                    SELECT was_correct, confidence_pred
+                    FROM prediction_log
+                    WHERE fno_symbol    = ?
+                      AND outcome_filled = TRUE
+                    ORDER BY trade_date DESC
+                    LIMIT 30
+                ) recent
             """, [dcm_sym]).fetchone()
             if row and row[0]:
                 r["pred_acc_30d"]      = round((row[1] or 0) / row[0] * 100, 1)
@@ -410,10 +438,11 @@ class DailyContextBridge:
             if not df.empty:
                 ce  = df[df["option_type"] == "CE"]
                 pe  = df[df["option_type"] == "PE"]
-                c_oi  = int(ce["oi"].iloc[0])    if not ce.empty else 0
-                p_oi  = int(pe["oi"].iloc[0])    if not pe.empty else 0
-                c_chg = int(ce["oi_chg"].iloc[0]) if not ce.empty else 0
-                p_chg = int(pe["oi_chg"].iloc[0]) if not pe.empty else 0
+                # fillna(0): new contracts on first trading day have NULL chg_in_oi
+                c_oi  = int(ce["oi"].fillna(0).iloc[0])     if not ce.empty else 0
+                p_oi  = int(pe["oi"].fillna(0).iloc[0])     if not pe.empty else 0
+                c_chg = int(ce["oi_chg"].fillna(0).iloc[0]) if not ce.empty else 0
+                p_chg = int(pe["oi_chg"].fillna(0).iloc[0]) if not pe.empty else 0
                 r["eod_call_oi"]  = c_oi
                 r["eod_put_oi"]   = p_oi
                 r["eod_pcr"]      = round(p_oi / c_oi, 3) if c_oi else 0.0
@@ -539,7 +568,6 @@ class DailyContextBridge:
         fii_5d   = data.get("fii_5d_cr",       0.0) or 0.0
         fii_10d  = data.get("fii_10d_cr",      0.0) or 0.0
         pos_days = data.get("fii_5d_pos_days", 0)   or 0
-        today_cr = data.get("fii_today_cr",    0.0) or 0.0
 
         if not (fii_5d or fii_10d):
             return 0.0
@@ -631,9 +659,16 @@ class DailyContextBridge:
     # ── B5: VIX Regime ────────────────────────────────────────────────────────
 
     def _b5_vix(self, data: dict, common: dict, signals: list) -> float:
-        # India VIX from DB > fall back to prediction_log feature
-        vix     = common.get("india_vix") or data.get("feat_vix") or 0.0
-        vix_5d  = common.get("india_vix_5d_chg") or data.get("feat_vix_5d_chg") or 0.0
+        # India VIX level: DB value preferred; fall back to prediction_log feature.
+        # Use explicit None check — VIX of 0 is impossible so "or" would be safe,
+        # but being explicit avoids confusion.
+        vix_db = common.get("india_vix")
+        vix    = vix_db if vix_db is not None else (data.get("feat_vix") or 0.0)
+
+        # 5D change: DB stores absolute point change; feat_vix_5d_chg is relative %.
+        # Only fall back to the feature if DB value genuinely absent (not just zero).
+        vix_5d_db = common.get("india_vix_5d_chg")
+        vix_5d    = vix_5d_db if vix_5d_db is not None else (data.get("feat_vix_5d_chg") or 0.0)
 
         if not vix:
             return 0.0

@@ -764,10 +764,11 @@ def build_recommendation(
         agreement = neut_layers
 
     # Confidence from composite magnitude + layer agreement + session phase.
-    # Threshold = 4 (majority of 8). Each layer beyond 4 agreeing adds +5%.
+    # Threshold = 5 (majority of 9 layers).  Each layer beyond 5 agreeing adds +5%.
+    # Below threshold: each missing layer subtracts 5% (reduces false conviction).
     # Clamped [0, 95] — negative confidence is meaningless and breaks UI/delta.
     raw_conf    = min(abs(composite) / 2.5 * 100, 95)
-    align_bonus = (agreement - 4) * 5
+    align_bonus = (agreement - 5) * 5
     confidence  = min(max(round((raw_conf + align_bonus) * phase_mult, 0), 0), 95)
 
     # Neutral — no clear edge.
