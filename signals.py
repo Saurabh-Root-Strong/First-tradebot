@@ -150,9 +150,13 @@ def _macd(s: pd.Series, fast=12, slow=26, sig=9):
 
 
 def _vwap(df: pd.DataFrame) -> pd.Series:
-    tp  = (df["high"] + df["low"] + df["close"]) / 3
-    grp = df["ts"].dt.date
-    return (tp * df["volume"]).groupby(grp).cumsum() / df["volume"].groupby(grp).cumsum()
+    tp      = (df["high"] + df["low"] + df["close"]) / 3
+    grp     = df["ts"].dt.date
+    cum_vol = df["volume"].groupby(grp).cumsum()
+    # Guard: zero cumulative volume (session open before any volume received, or
+    # index bars with no traded volume) returns NaN so the VWAP signal is skipped
+    # rather than firing a spurious bearish score every session open.
+    return (tp * df["volume"]).groupby(grp).cumsum() / cum_vol.replace(0, float("nan"))
 
 
 def _bollinger(s: pd.Series, n=20, k=2):
@@ -346,6 +350,13 @@ def analyze_index(sym: str) -> dict:
     elif w_score <=-1.0: result["overall"] = ("SELL",         "#f87171")
     elif w_score <=-0.3: result["overall"] = ("MILD SELL",   "#fca5a5")
     else:                result["overall"] = ("NEUTRAL",      "#94a3b8")
+
+    # Persist to intraday DB (non-blocking; fires only on fresh computation)
+    try:
+        from intraday_db import idb
+        idb.write_signal(result)
+    except Exception:
+        pass
 
     with _signal_lock:
         _signal_cache[sym] = {"data": result, "ts": time.time()}

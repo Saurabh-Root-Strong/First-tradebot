@@ -10,8 +10,9 @@ Two stores, one purpose: give every signal layer a full session memory.
                        Velocity queries: OI change, IV trend, wall shift, PCR slope
                        over any lookback window (15m / 30m / 1hr)
 
-Thread-safe. Session-scoped RAM. No disk I/O.
-Reset on restart — intentional, stale yesterday data is worse than no data.
+Thread-safe. Session-scoped RAM.
+Completed bars and OI snapshots are also persisted to DuckDB via intraday_db
+(background, non-blocking) so the session is replayable after market close.
 """
 
 import datetime
@@ -70,7 +71,11 @@ class _CandleBuilder:
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def on_tick(self, ts: datetime.datetime, ltp: float, cum_vol: float):
+    def on_tick(self, ts: datetime.datetime, ltp: float, cum_vol: float) -> "dict | None":
+        """
+        Process one tick.  Returns the completed bar dict when a bar closes,
+        None otherwise.  Callers use the return value to trigger DB writes.
+        """
         with self._lock:
             b = self._bucket(ts)
 
@@ -87,25 +92,28 @@ class _CandleBuilder:
                     "low": ltp, "close": ltp, "volume": 0.0,
                 }
                 self._vol0 = cum_vol
-                return
+                return None
 
             if b > self._live["ts"]:
                 # Volume was updated on every tick in the else-branch below,
                 # so self._live["volume"] is already correct for the old candle.
                 # Using cum_vol here would include this first tick of the NEW
                 # candle in the OLD candle's volume — wrong.
-                self._done.append(dict(self._live))
+                closed = dict(self._live)
+                self._done.append(closed)
                 # open the next candle; this tick belongs to it
                 self._live = {
                     "ts": b, "open": ltp, "high": ltp,
                     "low": ltp, "close": ltp, "volume": 0.0,
                 }
                 self._vol0 = cum_vol
+                return closed   # ← signal to caller that a bar just closed
             else:
                 self._live["high"]   = max(self._live["high"], ltp)
                 self._live["low"]    = min(self._live["low"],  ltp)
                 self._live["close"]  = ltp
                 self._live["volume"] = max(0.0, cum_vol - self._vol0)
+                return None
 
     def forming(self) -> dict | None:
         with self._lock:
@@ -137,8 +145,10 @@ class CandleStore:
         if sym not in self._builders:
             return
         t = ts or datetime.datetime.now(tz=IST)
-        for builder in self._builders[sym].values():
-            builder.on_tick(t, ltp, cum_vol)
+        for res, builder in self._builders[sym].items():
+            closed = builder.on_tick(t, ltp, cum_vol)
+            if closed:
+                _idb_write_candle(sym, res, closed)
 
     def forming_candle(self, sym: str, res: str) -> dict | None:
         b = self._builders.get(sym, {}).get(res)
@@ -161,6 +171,56 @@ class CandleStore:
         if not rows:
             return pd.DataFrame()
         return pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
+
+
+# ── DB write helpers (non-blocking; lazy-import to avoid circular deps) ───────
+
+def _idb_write_candle(sym: str, res: str, bar: dict) -> None:
+    try:
+        from intraday_db import idb
+        idb.write_candle(sym, res, bar)
+    except Exception:
+        pass
+
+
+def _idb_write_oi(snap) -> None:
+    try:
+        from intraday_db import idb
+        idb.write_oi_snapshot(snap)
+    except Exception:
+        pass
+
+
+def record_tick(
+    sym:      str,
+    ts,
+    ltp:      float,
+    cum_vol:  float = 0.0,
+    day_open: float = 0.0,
+    day_high: float = 0.0,
+    day_low:  float = 0.0,
+    ch:       float = 0.0,
+    chp:      float = 0.0,
+) -> None:
+    """
+    Persist a raw WebSocket tick to DuckDB and feed the candle builders.
+
+    Call this from every WebSocket SymbolUpdate callback — it is the single
+    entry point that keeps both the in-memory candle store and the persistent
+    tick ledger in sync.
+
+    All DB I/O is non-blocking (queue-based background thread).
+    """
+    # 1. Feed candle builders for all 4 resolutions
+    candle_store.on_tick(sym, ltp, cum_vol, ts)
+
+    # 2. Persist raw tick to DuckDB
+    try:
+        from intraday_db import idb
+        idb.write_tick(sym, ts, ltp, cum_vol,
+                       day_open, day_high, day_low, ch, chp)
+    except Exception:
+        pass
 
 
 # ── OI Snapshot ───────────────────────────────────────────────────────────────
@@ -233,6 +293,7 @@ class OITimeSeriesStore:
 
     def add(self, snap: OISnapshot, min_interval_sec: int = 90):
         """Add snapshot. Silently drops if called too soon after last add."""
+        accepted = False
         with self._lock:
             now = _time.time()
             if now - self._last_ts.get(snap.sym, 0) < min_interval_sec:
@@ -240,6 +301,9 @@ class OITimeSeriesStore:
             if snap.sym in self._s:
                 self._s[snap.sym].append(snap)
                 self._last_ts[snap.sym] = now
+                accepted = True
+        if accepted:
+            _idb_write_oi(snap)
 
     def latest(self, sym: str) -> OISnapshot | None:
         with self._lock:

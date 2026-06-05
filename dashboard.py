@@ -18,10 +18,16 @@ import plotly.graph_objects as go
 from fyers_apiv3.FyersWebsocket import data_ws
 from signals import run_full_analysis, recommend_option
 from trade_setup import build_recommendation, TF_PROFILES
-from intraday_store import candle_store, oi_store, build_oi_snapshot
+from intraday_store import candle_store, oi_store, build_oi_snapshot, session_phase, record_tick
+try:
+    from dcm_prediction import get_dcm_reader as _get_dcm_reader
+    _DCM_OK = True
+except Exception:
+    _DCM_OK = False
 try:
     from daily_context_bridge import get_bridge as _get_ctx_bridge
     _CTX_BRIDGE_OK = True
+    _get_ctx_bridge()  # pre-warm singleton: start background data load at startup
 except Exception:
     _CTX_BRIDGE_OK = False
 
@@ -171,6 +177,16 @@ _fut_cache: dict = {}
 _fut_lock  = threading.Lock()
 
 
+def _idb_write_futures(index_sym: str, futures: list) -> None:
+    """Non-blocking DB write for the futures strip. Spot from live tick cache."""
+    try:
+        from intraday_db import idb
+        spot = float((_latest.get(index_sym) or {}).get("ltp") or 0.0)
+        idb.write_futures(index_sym, futures, spot)
+    except Exception:
+        pass
+
+
 def fetch_futures(index_sym: str) -> list[dict]:
     """Fetch near/next/far futures quotes. Cached 2s."""
     with _fut_lock:
@@ -217,6 +233,7 @@ def fetch_futures(index_sym: str) -> list[dict]:
 
     with _fut_lock:
         _fut_cache[index_sym] = {"data": result, "ts": time.time()}
+    _idb_write_futures(index_sym, result)
     return result
 
 
@@ -297,12 +314,15 @@ def render_futures(futures: list[dict], spot: float) -> html.Div:
 
 
 def compute_max_pain(chain: list) -> float:
+    # Max pain = price minimising total ITM intrinsic loss for option WRITERS.
+    # CE writer loses max(0, test - strike): ITM when test > strike.
+    # PE writer loses max(0, strike - test): ITM when test < strike.
     strikes = [r["strike_price"] for r in chain]
     best, mp = float("inf"), strikes[0]
     for test in strikes:
         loss = sum(
-            ((r.get("call_options") or {}).get("oi") or 0) * max(0, r["strike_price"] - test) +
-            ((r.get("put_options")  or {}).get("oi") or 0) * max(0, test - r["strike_price"])
+            ((r.get("call_options") or {}).get("oi") or 0) * max(0, test - r["strike_price"]) +
+            ((r.get("put_options")  or {}).get("oi") or 0) * max(0, r["strike_price"] - test)
             for r in chain
         )
         if loss < best:
@@ -525,21 +545,32 @@ def _onmessage(msg: dict) -> None:
     sym = msg.get("symbol")
     if sym not in INDEX_SYMBOLS:
         return
+
+    # ── Extract all fields from Fyers SymbolUpdate ────────────────────────────
     ft  = msg.get("exch_feed_time", 0)
     ts  = datetime.datetime.fromtimestamp(ft, tz=IST) if ft else datetime.datetime.now(tz=IST)
-    ltp = float(msg.get("ltp", 0))
-    vol = float(msg.get("volume", 0))
+    ltp = float(msg.get("ltp",        0) or 0)
+    vol = float(msg.get("volume",     0) or 0)
+    # Day OHLC, change — available in every SymbolUpdate packet
+    day_open = float(msg.get("open_price",     0) or 0)
+    day_high = float(msg.get("high_price",     0) or 0)
+    day_low  = float(msg.get("low_price",      0) or 0)
+    ch       = float(msg.get("ch",             0) or 0)
+    chp      = float(msg.get("chp",            0) or 0)
+
     with _lock:
         _latest[sym] = msg
         _history[sym].append((ts, ltp))
-    # feed into candle builder — every tick, real time
+
     if ltp:
-        candle_store.on_tick(sym, ltp, vol, ts)
+        # Single call: feeds candle builders AND persists raw tick to DuckDB
+        record_tick(sym, ts, ltp, vol, day_open, day_high, day_low, ch, chp)
+
     if sym not in _seen:
         _seen.add(sym)
         print(f"  [WS]   First tick  {LABELS[sym]:<14}  LTP {ltp:>10,.2f}")
         if len(_seen) == len(INDEX_SYMBOLS):
-            print("  [WS]   All 4 indices live ✓")
+            print("  [WS]   All 4 indices live ✓  — ticks persisting to DuckDB")
 
 def _onopen():
     print("  [WS]   Connected — subscribing...")
@@ -635,32 +666,39 @@ def _slug(sym: str) -> str:
 def _nav_card(sym: str) -> html.Div:
     slug, color = _slug(sym), COLORS[sym]
     return html.Div(id=f"nav-{slug}", n_clicks=0, children=[
-        # Top row: label + click hint
+        # Top row: label + live dot + OC hint
         html.Div([
-            html.Span(LABELS[sym], style={
-                "color": color, "fontSize": "0.6rem",
-                "letterSpacing": "0.15em", "fontWeight": "700",
+            html.Div([
+                html.Span(className="live-dot", style={"marginRight": "6px", "flexShrink": "0"}),
+                html.Span(LABELS[sym], style={
+                    "color": color, "fontSize": "0.6rem",
+                    "letterSpacing": "0.15em", "fontWeight": "800",
+                }),
+            ], style={"display": "flex", "alignItems": "center"}),
+            html.Span("OC ›", style={
+                "color": f"{color}55", "fontSize": "0.52rem", "letterSpacing": "0.06em",
             }),
-            html.Span(" ⛓ CHAIN", style={
-                "color": "#1e3a5f", "fontSize": "0.52rem",
-                "float": "right", "letterSpacing": "0.05em",
-            }),
-        ], style={"marginBottom": "4px"}),
+        ], style={"display": "flex", "justifyContent": "space-between",
+                  "alignItems": "center", "marginBottom": "7px"}),
+        # LTP — hero number
         html.Div(id=f"s-ltp-{slug}", children="—", style={
-            **MONO, "fontSize": "1.2rem", "fontWeight": "bold", "color": "#e2e8f0",
+            **MONO, "fontSize": "1.5rem", "fontWeight": "900", "color": "#f1f5f9",
+            "letterSpacing": "-0.02em", "lineHeight": "1",
         }),
+        # Change line
         html.Div(id=f"s-chg-{slug}", children="", style={
-            **MONO, "fontSize": "0.68rem", "marginTop": "2px",
+            **MONO, "fontSize": "0.7rem", "marginTop": "4px",
         }),
-        # Bottom click prompt
-        html.Div("▶  Click for Option Chain + Futures", style={
-            "fontSize": "0.52rem", "color": "#1e3a5f",
-            "marginTop": "6px", "letterSpacing": "0.04em",
+        # Decorative gradient bar
+        html.Div(style={
+            "height": "2px", "marginTop": "9px", "borderRadius": "1px",
+            "background": f"linear-gradient(90deg, {color}, {color}22, transparent)",
         }),
     ], style={
-        "padding": "12px 14px", "marginBottom": "8px", "borderRadius": "8px",
-        "border": f"1px solid {color}33", "borderLeft": f"3px solid {color}",
-        "background": BG_CARD, "cursor": "pointer", "transition": "all 0.15s",
+        "padding": "13px 15px", "marginBottom": "8px", "borderRadius": "10px",
+        "border": f"1px solid {color}22", "borderLeft": f"3px solid {color}",
+        "background": f"linear-gradient(135deg, #0c1522 0%, {color}0a 100%)",
+        "cursor": "pointer",
     })
 
 
@@ -669,25 +707,39 @@ def _overview_card(sym: str) -> dbc.Col:
     slug, color = _slug(sym), COLORS[sym]
     return dbc.Col(
         dbc.Card(dbc.CardBody([
-            html.Div(LABELS[sym], style={
-                "color": color, "fontSize": "0.68rem",
-                "letterSpacing": "0.18em", "fontWeight": "700", "marginBottom": "8px",
-            }),
+            # Label + live dot
+            html.Div([
+                html.Span(LABELS[sym], style={
+                    "color": color, "fontSize": "0.6rem",
+                    "letterSpacing": "0.18em", "fontWeight": "800",
+                }),
+                html.Span(className="live-dot", style={"marginLeft": "8px"}),
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "8px"}),
+            # LTP hero
             html.Div(id=f"ov-ltp-{slug}", style={
-                **MONO, "fontSize": "2rem", "fontWeight": "bold",
-                "color": "#f1f5f9", "lineHeight": "1",
+                **MONO, "fontSize": "2.2rem", "fontWeight": "900",
+                "color": "#f1f5f9", "lineHeight": "1", "letterSpacing": "-0.03em",
             }),
+            # Change line
             html.Div(id=f"ov-chg-{slug}", style={
-                **MONO, "fontSize": "0.88rem", "marginTop": "5px",
+                **MONO, "fontSize": "0.9rem", "marginTop": "5px", "fontWeight": "600",
             }),
-            html.Hr(style={"borderColor": "#1e2d40", "margin": "10px 0 8px"}),
+            # Animated separator
+            html.Div(style={
+                "height": "1px",
+                "background": f"linear-gradient(90deg, {color}55, {color}22, transparent)",
+                "margin": "10px 0 9px",
+            }),
+            # OHLPC
             html.Div(id=f"ov-ohlpc-{slug}", style={
-                **MONO, "fontSize": "0.67rem", "color": "#4a5568", "lineHeight": "2",
+                **MONO, "fontSize": "0.65rem", "lineHeight": "1.95",
             }),
         ]), style={
-            "background": BG_CARD, "borderRadius": "10px",
-            "border": "1px solid #1a2535", "borderTop": f"3px solid {color}",
-        }),
+            "background": f"linear-gradient(160deg, #0c1826 0%, {color}0e 100%)",
+            "borderRadius": "12px",
+            "border": f"1px solid {color}22",
+            "borderTop": f"3px solid {color}",
+        }, className="depth-card"),
         md=3, xs=6, className="mb-3 px-2",
     )
 
@@ -700,54 +752,288 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
 )
 
-# Inject hover CSS for nav cards
-app.index_string = app.index_string.replace(
-    "</head>",
-    """<style>
-[id^="nav-"]:hover {
-    filter: brightness(1.25);
-    border-color: rgba(255,255,255,0.15) !important;
-    transform: translateX(3px);
+_CSS = """
+<style>
+/* ── Global ──────────────────────────────────────────────────────── */
+body { background:#030810 !important; overflow-x:hidden; }
+* { box-sizing:border-box; }
+
+/* ── Scrollbars ──────────────────────────────────────────────────── */
+::-webkit-scrollbar { width:4px; height:4px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:#1a3050; border-radius:2px; }
+::-webkit-scrollbar-thumb:hover { background:#2d5080; }
+
+/* ── Keyframes ───────────────────────────────────────────────────── */
+@keyframes live-pulse {
+  0%,100%{ opacity:1; box-shadow:0 0 0 0 rgba(34,197,94,.5); }
+  60%    { opacity:.7; box-shadow:0 0 0 7px rgba(34,197,94,0); }
 }
-[id^="nav-"] { transition: all 0.18s ease !important; }
-</style></head>"""
-)
+@keyframes amber-pulse {
+  0%,100%{ box-shadow:0 0 0 0 rgba(245,158,11,.5); }
+  60%    { box-shadow:0 0 0 7px rgba(245,158,11,0); }
+}
+@keyframes red-pulse {
+  0%,100%{ box-shadow:0 0 0 0 rgba(239,68,68,.6); }
+  60%    { box-shadow:0 0 0 7px rgba(239,68,68,0); }
+}
+@keyframes glow-bull {
+  0%,100%{ box-shadow:0 0 12px rgba(34,197,94,.1),0 2px 20px rgba(0,0,0,.5); }
+  50%    { box-shadow:0 0 32px rgba(34,197,94,.4),0 2px 20px rgba(0,0,0,.5); }
+}
+@keyframes glow-bear {
+  0%,100%{ box-shadow:0 0 12px rgba(239,68,68,.1),0 2px 20px rgba(0,0,0,.5); }
+  50%    { box-shadow:0 0 32px rgba(239,68,68,.4),0 2px 20px rgba(0,0,0,.5); }
+}
+@keyframes bar-grow { from { width:0 !important; } }
+@keyframes conf-fill { from { width:0 !important; } }
+@keyframes slide-up {
+  from { opacity:0; transform:translateY(12px); }
+  to   { opacity:1; transform:translateY(0); }
+}
+@keyframes ticket-appear {
+  from { opacity:0; transform:translateY(-8px) scale(.98); }
+  to   { opacity:1; transform:translateY(0) scale(1); }
+}
+@keyframes num-flash {
+  0%  { background:rgba(251,191,36,.15); border-radius:3px; }
+  100%{ background:transparent; }
+}
+
+/* ── Live dots ───────────────────────────────────────────────────── */
+.live-dot {
+  width:8px; height:8px; border-radius:50%;
+  background:#22c55e; display:inline-block; flex-shrink:0;
+  animation:live-pulse 1.8s ease-out infinite;
+}
+.live-dot-amber { background:#f59e0b !important; animation:amber-pulse 1.8s ease-out infinite; }
+.live-dot-dead  { background:#ef4444 !important; animation:red-pulse .9s ease-out infinite; }
+
+/* ── Signal glow cards ───────────────────────────────────────────── */
+.sig-bull { animation:glow-bull 2.8s ease-in-out infinite; }
+.sig-bear { animation:glow-bear 2.8s ease-in-out infinite; }
+.sig-card { animation:slide-up .35s cubic-bezier(.22,.68,0,1.2); }
+
+/* ── Signal strength bar ─────────────────────────────────────────── */
+.sbar-track {
+  height:6px; border-radius:4px; overflow:hidden;
+  background:rgba(255,255,255,.04); margin:9px 0 7px;
+}
+.sbar-fill {
+  height:100%; border-radius:4px;
+  animation:bar-grow .8s cubic-bezier(.22,.68,0,1.2);
+  transition:width .6s ease;
+}
+
+/* ── Confidence bar ──────────────────────────────────────────────── */
+.conf-track {
+  height:4px; border-radius:3px; overflow:hidden;
+  background:rgba(255,255,255,.05);
+}
+.conf-fill { height:100%; border-radius:3px; animation:conf-fill .9s ease-out; }
+
+/* ── Timeframe pill badges ───────────────────────────────────────── */
+.tf-pill {
+  display:inline-block; padding:2px 7px; border-radius:20px;
+  font-size:.55rem; font-family:'Courier New',monospace;
+  font-weight:700; letter-spacing:.07em; margin:1px 2px;
+  border:1px solid transparent; white-space:nowrap;
+  transition:all .15s ease;
+}
+.tf-pill:hover { filter:brightness(1.3); }
+.tf-bull { background:rgba(34,197,94,.14);  color:#4ade80; border-color:rgba(34,197,94,.3); }
+.tf-bear { background:rgba(239,68,68,.14);  color:#f87171; border-color:rgba(239,68,68,.3); }
+.tf-neut { background:rgba(148,163,184,.07);color:#475569; border-color:rgba(148,163,184,.13); }
+
+/* ── Metric chips ────────────────────────────────────────────────── */
+.metric-chip {
+  display:inline-flex; align-items:center; gap:5px;
+  padding:4px 10px; border-radius:5px; font-size:.62rem;
+  background:rgba(255,255,255,.04);
+  border:1px solid rgba(255,255,255,.07); margin:2px 3px;
+  font-family:'Courier New',monospace;
+  transition:background .15s ease;
+}
+.metric-chip:hover { background:rgba(255,255,255,.07); }
+
+/* ── Section label ───────────────────────────────────────────────── */
+.sec-label {
+  font-size:.54rem; letter-spacing:.22em; color:#1e3a5f;
+  font-weight:700; text-transform:uppercase;
+}
+
+/* ── Nav card hover ──────────────────────────────────────────────── */
+[id^="nav-"] { transition:all .18s ease !important; }
+[id^="nav-"]:hover {
+  filter:brightness(1.45) !important;
+  transform:translateX(5px) !important;
+  box-shadow:3px 0 22px rgba(0,0,0,.5) !important;
+}
+
+/* ── Overview card depth + hover lift ───────────────────────────── */
+.depth-card {
+  box-shadow:0 4px 28px rgba(0,0,0,.5),0 1px 3px rgba(0,0,0,.6);
+  transition:transform .2s ease,box-shadow .2s ease;
+}
+.depth-card:hover {
+  transform:translateY(-2px);
+  box-shadow:0 8px 36px rgba(0,0,0,.65),0 2px 6px rgba(0,0,0,.7);
+}
+
+/* ── Trade ticket entrance ───────────────────────────────────────── */
+.trade-ticket { animation:ticket-appear .4s cubic-bezier(.22,.68,0,1.2); }
+
+/* ── OC table row hover ──────────────────────────────────────────── */
+.oc-row:hover td { background:rgba(255,255,255,.03) !important; }
+
+/* ── Dash dropdown dark override ─────────────────────────────────── */
+.Select-control,.Select-menu-outer { background:#0c1522 !important; border-color:#1e2d40 !important; }
+.Select-option.is-focused { background:#1e2d40 !important; }
+.Select-value-label,.Select-placeholder { color:#94a3b8 !important; }
+.Select-option { color:#94a3b8 !important; }
+
+/* ── Velocity progress bars ──────────────────────────────────────── */
+.vbar-track {
+  height:5px; border-radius:3px; overflow:hidden;
+  background:rgba(255,255,255,.04);
+}
+.vbar-fill { height:100%; border-radius:3px; transition:width .7s ease; }
+
+/* ── Verdict glow text ───────────────────────────────────────────── */
+.verdict-bull { color:#22c55e !important; text-shadow:0 0 22px rgba(34,197,94,.55); }
+.verdict-bear { color:#ef4444 !important; text-shadow:0 0 22px rgba(239,68,68,.55); }
+.verdict-neut { color:#94a3b8 !important; }
+
+/* ── Header shimmer gradient line ────────────────────────────────── */
+.header-line {
+  height:1px; margin-bottom:14px;
+  background:linear-gradient(90deg,transparent,#00d4ff33,#ff6b9d33,#4ade8033,transparent);
+}
+
+/* ── Rec card hover lift ─────────────────────────────────────────── */
+.rec-card { transition:all .2s ease; }
+.rec-card:hover {
+  transform:translateY(-3px);
+  box-shadow:0 14px 32px rgba(0,0,0,.55) !important;
+}
+
+/* ── Index Prediction cards ──────────────────────────────────────── */
+.pred-card {
+  transition:transform .2s ease,box-shadow .2s ease;
+  animation:slide-up .4s cubic-bezier(.22,.68,0,1.2);
+}
+.pred-card:hover {
+  transform:translateY(-3px);
+  box-shadow:0 14px 36px rgba(0,0,0,.65) !important;
+}
+.pred-meter-track {
+  height:6px; border-radius:4px; overflow:hidden;
+  background:rgba(255,255,255,.05); margin-bottom:12px;
+}
+.pred-meter-fill {
+  height:100%; border-radius:4px;
+  transition:width .9s cubic-bezier(.22,.68,0,1.2);
+}
+.pred-metric {
+  flex:1; min-width:0; padding:5px 7px; border-radius:5px;
+  background:rgba(255,255,255,.03);
+  border:1px solid rgba(255,255,255,.055);
+}
+.pred-regime-badge {
+  display:inline-block; padding:3px 8px; border-radius:4px;
+  background:#060e1a; border:1px solid #1a2535;
+  margin:0 3px 3px 0;
+}
+.pred-section-header {
+  font-size:.46rem; letter-spacing:.16em;
+  color:#1e3a5f; margin-bottom:5px; display:block;
+}
+
+/* ── Signal score badge ──────────────────────────────────────────── */
+.score-badge {
+  display:inline-block; padding:2px 8px; border-radius:12px;
+  font-size:.58rem; font-weight:700; font-family:'Courier New',monospace;
+  border:1px solid transparent;
+}
+.score-bull { background:rgba(34,197,94,.12); color:#4ade80; border-color:rgba(34,197,94,.25); }
+.score-bear { background:rgba(239,68,68,.12); color:#f87171; border-color:rgba(239,68,68,.25); }
+.score-neut { background:rgba(148,163,184,.07); color:#64748b; border-color:rgba(148,163,184,.15); }
+</style>
+"""
+app.index_string = app.index_string.replace("</head>", _CSS + "</head>")
 
 app.layout = dbc.Container([
-    # Header
+    # ── Header ─────────────────────────────────────────────────────────────────
     dbc.Row([
-        dbc.Col(html.Div("NSE  INDEX  LIVE  DASHBOARD", style={
-            "fontSize": "0.95rem", "fontWeight": "800",
-            "letterSpacing": "0.2em", "color": "#e2e8f0",
-        }), width=8),
+        dbc.Col([
+            html.Div([
+                html.Span("◆ ", style={
+                    "color": "#00d4ff", "fontSize": "0.9rem", "marginRight": "8px",
+                }),
+                html.Span("NSE", style={
+                    "fontSize": "0.72rem", "fontWeight": "900", "letterSpacing": "0.3em",
+                    "color": "#00b4d8", "marginRight": "8px",
+                }),
+                html.Span("INDEX LIVE", style={
+                    "fontSize": "0.82rem", "fontWeight": "700", "letterSpacing": "0.2em",
+                    "color": "#e2e8f0",
+                }),
+                html.Span("  DASHBOARD", style={
+                    "fontSize": "0.82rem", "fontWeight": "300", "letterSpacing": "0.2em",
+                    "color": "#475569",
+                }),
+            ], style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
+            html.Div([
+                html.Span("NIFTY 50", style={"color": COLORS["NSE:NIFTY50-INDEX"],
+                          "fontSize": "0.5rem", "letterSpacing": "0.1em", "marginRight": "12px"}),
+                html.Span("BANK NIFTY", style={"color": COLORS["NSE:NIFTYBANK-INDEX"],
+                          "fontSize": "0.5rem", "letterSpacing": "0.1em", "marginRight": "12px"}),
+                html.Span("FIN NIFTY", style={"color": COLORS["NSE:FINNIFTY-INDEX"],
+                          "fontSize": "0.5rem", "letterSpacing": "0.1em", "marginRight": "12px"}),
+                html.Span("MIDCAP NIFTY", style={"color": COLORS["NSE:MIDCPNIFTY-INDEX"],
+                          "fontSize": "0.5rem", "letterSpacing": "0.1em"}),
+            ], style={"marginLeft": "26px"}),
+        ], width=8),
         dbc.Col(html.Div(id="status", style={
-            "textAlign": "right", "fontSize": "0.72rem", "marginTop": "4px",
+            "textAlign": "right", "fontSize": "0.68rem",
         }), width=4),
-    ], className="mt-3 mb-3 align-items-center"),
+    ], className="mt-3 mb-2 align-items-center",
+       style={"paddingBottom": "10px"}),
+    html.Div(className="header-line"),
 
     dbc.Row([
         # ── Left sidebar ───────────────────────────────────────────────────────
         dbc.Col([
-            html.Div("INDICES", style={
-                "fontSize": "0.58rem", "letterSpacing": "0.2em",
-                "color": "#1e3a5f", "marginBottom": "10px",
-            }),
+            html.Div([
+                html.Span("INDICES", style={"letterSpacing": "0.22em", "color": "#1e3a5f",
+                                             "fontWeight": "700"}),
+            ], style={"fontSize": "0.54rem", "marginBottom": "12px"}),
             *[_nav_card(sym) for sym in INDEX_SYMBOLS],
-            html.Div("👆 Click any index above",
-                     style={"fontSize": "0.58rem", "color": "#334155",
-                            "textAlign": "center", "marginTop": "16px",
-                            "letterSpacing": "0.05em"}),
+            html.Div([
+                html.Span("▲ ", style={"color": "#1e3a5f", "fontSize": "0.6rem"}),
+                html.Span("click to open chain", style={"color": "#1e2d40",
+                                                          "fontSize": "0.52rem", "letterSpacing": "0.04em"}),
+            ], style={"textAlign": "center", "marginTop": "14px"}),
+            # ── EOD Prediction signal breakdown (always visible) ──────────────
+            html.Div(id="sidebar-pred"),
         ], md=2, style={
             "background": BG_SIDE, "padding": "16px 10px",
             "borderRight": "1px solid #111d2e",
             "minHeight": "calc(100vh - 70px)",
+            "overflowY": "auto",
         }),
 
         # ── Main content ────────────────────────────────────────────────────────
         dbc.Col([
             # OVERVIEW PANEL
             html.Div(id="overview-panel", children=[
+                # Live index prices (4 cards)
                 dbc.Row([_overview_card(s) for s in INDEX_SYMBOLS], className="gx-0 mb-2"),
+                # ── INDEX PREDICTION — above chart so visible on first load ──────
+                # This is tomorrow's directional forecast from the 24-signal engine.
+                # Placed here (not after the chart) so analysts see it immediately.
+                html.Div(id="context-panel"),
+                # Intraday % change chart
                 dbc.Card(dbc.CardBody([
                     html.Div("INTRADAY  %  CHANGE  FROM  PREVIOUS  CLOSE", style={
                         "fontSize": "0.62rem", "letterSpacing": "0.12em",
@@ -755,11 +1041,9 @@ app.layout = dbc.Container([
                     }),
                     dcc.Graph(id="ov-chart",
                               config={"displayModeBar": False},
-                              style={"height": "260px"}),
+                              style={"height": "220px"}),
                 ]), style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "marginBottom": "12px"}),
-                # Daily EOD context from Daily_Cash_Market bridge
-                html.Div(id="context-panel"),
                 # Trade signals panel
                 html.Div(id="signal-panel"),
             ]),
@@ -835,222 +1119,825 @@ app.layout = dbc.Container([
 ], fluid=True, style={"background": BG, "minHeight": "100vh", "padding": "0"})
 
 
-# ── Daily context panel renderer ─────────────────────────────────────────────
-def _render_context_panel() -> html.Div:
+# ── Compact number formatters ─────────────────────────────────────────────────
+
+def _fmt_cr(v) -> str:
+    """Format a ₹Cr value compactly for narrow chips: 12345 → +12.3K, -2500 → -2.5K."""
+    if v is None:
+        return "—"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    sign = "+" if v >= 0 else ""
+    a    = abs(v)
+    if a >= 1_00_000:                    # ≥ 1 lakh Cr → show in L
+        return f"{sign if v >= 0 else '-'}{a/1_00_000:.1f}L"
+    if a >= 10_000:                      # ≥ 10,000 Cr → "12.3K"
+        return f"{sign if v >= 0 else '-'}{a/1_000:.0f}K"
+    if a >= 1_000:                       # ≥ 1,000 Cr  → "1.2K"
+        return f"{sign if v >= 0 else '-'}{a/1_000:.1f}K"
+    return f"{v:+.0f}"
+
+
+def _fmt_contracts(v) -> str:
+    """Format FAO net contracts compactly: -259253 → -259K, 12000000 → +12M."""
+    if v is None:
+        return "—"
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return "—"
+    a    = abs(v)
+    sign = "+" if v >= 0 else "-"
+    if a >= 1_000_000:
+        return f"{sign}{a/1_000_000:.1f}M"
+    if a >= 1_000:
+        return f"{sign}{a/1_000:.0f}K"
+    return f"{v:+,d}"
+
+
+# ── Sidebar prediction block ──────────────────────────────────────────────────
+
+def _render_sidebar_pred() -> html.Div:
     """
-    Compact 4-column card showing yesterday's EOD structural setup for all
-    4 indices. Uses Daily_Cash_Market bridge (Layer 9 data).
-    Renders a 'building' state when bridge is loading or DB is unavailable.
+    Compact always-visible sidebar block showing yesterday's signal verdicts
+    per index: FII futures flow, EOD option chain PCR, FPI equity, VIX, breadth,
+    futures carry, and HMM statistical regime.
     """
     if not _CTX_BRIDGE_OK:
         return html.Div()
 
     bridge = _get_ctx_bridge()
+
     if not bridge.is_available():
-        return dbc.Card(dbc.CardBody(
-            html.Div(
-                "Daily Context (Layer 9): Daily_Cash_Market DB not reachable "
-                "— run daily ingestion after 6:30 PM",
-                style={"color": "#334155", "fontSize": "0.62rem", **MONO},
-            )
-        ), style={"background": "#080f1c", "border": "1px solid #1a2535",
-                  "borderRadius": "8px", "marginBottom": "10px"})
-
-    cols = []
-    for sym in INDEX_SYMBOLS:
-        data   = bridge.get_panel_data(sym)
-        color  = COLORS[sym]
-        label  = LABELS[sym]
-        common = data.get("__common__", {})
-
-        direction  = data.get("direction", "?")
-        confidence = data.get("confidence", "?")
-        hmm        = data.get("hmm_state", "?")
-        acc        = data.get("pred_acc_30d")
-        fii_5d     = data.get("fii_5d_cr")
-        vix        = common.get("india_vix")
-        breadth    = common.get("breadth_pct")
-        pred_date  = data.get("pred_date")
-        rng_lo     = data.get("range_low")
-        rng_hi     = data.get("range_high")
-        target     = data.get("target_close")
-        score, _   = bridge.score_index(sym)
-
-        # Direction colour
-        dir_clr = ("#22c55e" if direction == "UP"
-                   else "#ef4444" if direction == "DOWN"
-                   else "#f59e0b")
-        score_clr = "#22c55e" if score > 0.5 else "#ef4444" if score < -0.5 else "#94a3b8"
-
-        def _kv(k, v, vc="#475569"):
-            return html.Div([
-                html.Span(k + "  ", style={"color": "#334155", "fontSize": "0.55rem"}),
-                html.Span(str(v),   style={"color": vc, "fontSize": "0.62rem", **MONO}),
-            ], style={"marginBottom": "2px"})
-
-        date_str = (pred_date.strftime("%d %b") if pred_date and
-                    hasattr(pred_date, "strftime") else str(pred_date or "—"))
-
-        col_children = [
-            html.Div(label, style={"color": color, "fontSize": "0.58rem",
-                                    "letterSpacing": "0.12em", "fontWeight": "700",
-                                    "marginBottom": "6px"}),
-            html.Div([
-                html.Span(direction or "—",
-                          style={"color": dir_clr, "fontWeight": "800",
-                                 "fontSize": "0.85rem", **MONO}),
-                html.Span(f"  [{confidence}]" if confidence else "",
-                          style={"color": "#475569", "fontSize": "0.58rem"}),
-            ], style={"marginBottom": "4px"}),
-            _kv("REGIME",  hmm or "—",         "#94a3b8"),
-            _kv("FII 5D",  f"{fii_5d:+,.0f}Cr" if fii_5d is not None else "—",
-                "#22c55e" if (fii_5d or 0) > 0 else "#ef4444"),
-            _kv("VIX",     f"{vix:.1f}%" if vix else "—",
-                "#f59e0b" if vix and vix > 18 else "#94a3b8"),
-            _kv("BREADTH", f"{breadth:.0f}%" if breadth else "—",
-                "#22c55e" if (breadth or 0) > 60 else "#ef4444" if (breadth or 0) < 40 else "#94a3b8"),
-        ]
-
-        if rng_lo and rng_hi:
-            col_children.append(_kv(
-                "PRED RNG",
-                f"{rng_lo:,.0f} – {rng_hi:,.0f}",
-                "#fbbf24",
-            ))
-
-        col_children.append(html.Div([
-            html.Span("L9 SCORE  ", style={"color": "#334155", "fontSize": "0.55rem"}),
-            html.Span(f"{score:+.2f}", style={"color": score_clr, "fontWeight": "700",
-                                               "fontSize": "0.65rem", **MONO}),
-            html.Span(f"  ({date_str})", style={"color": "#1e2d40", "fontSize": "0.52rem"}),
-        ], style={"marginTop": "4px", "borderTop": "1px solid #111d2e", "paddingTop": "4px"}))
-
-        if acc is not None:
-            col_children.append(html.Div(
-                f"30D accuracy: {acc:.0f}%",
-                style={"color": "#1e2d40", "fontSize": "0.52rem", **MONO},
-            ))
-
-        cols.append(dbc.Col(
-            html.Div(col_children, style={
-                "padding": "10px 12px",
-                "background": "#0a1020",
-                "borderRadius": "6px",
-                "borderLeft": f"3px solid {color}",
-                "border": f"1px solid {color}22",
+        return html.Div(
+            html.Div("EOD data loading...", style={
+                "color": "#475569", "fontSize": "0.5rem", **MONO,
+                "textAlign": "center", "padding": "6px 0",
             }),
-            md=3, xs=6, className="mb-2 px-1",
-        ))
+            style={"borderTop": "1px solid #1e3a5f", "paddingTop": "10px",
+                   "marginTop": "6px"},
+        )
 
-    return dbc.Card(dbc.CardBody([
-        dbc.Row([
-            dbc.Col(html.Div("DAILY  CONTEXT  —  LAYER 9  (EOD  STRUCTURAL  SETUP)", style={
-                "fontSize": "0.58rem", "letterSpacing": "0.14em",
-                "color": "#1e3a5f", "fontWeight": "600",
-            })),
-            dbc.Col(html.Div(
-                "Source: Daily_Cash_Market · 24-signal engine · refreshes post-market",
-                style={"fontSize": "0.52rem", "color": "#1e2d40",
-                       "textAlign": "right"},
-            )),
-        ], className="mb-2 align-items-center"),
-        dbc.Row(cols, className="gx-2"),
-    ]), style={
+    def _sig_row(tag: str, val: str, val_clr: str) -> html.Div:
+        return html.Div([
+            html.Span(tag, style={
+                "color": "#334155", "fontSize": "0.44rem",
+                "letterSpacing": "0.06em", "minWidth": "28px",
+                "display": "inline-block",
+            }),
+            html.Span(val, style={
+                "color": val_clr, "fontSize": "0.54rem",
+                "fontWeight": "700", **MONO,
+            }),
+        ], style={"display": "flex", "alignItems": "center",
+                  "gap": "4px", "marginBottom": "2px"})
+
+    blocks = []
+    for sym in INDEX_SYMBOLS:
+        data    = bridge.get_panel_data(sym)
+        common  = data.get("__common__", {})
+        color   = COLORS[sym]
+        label   = LABELS[sym]
+
+        direction   = data.get("direction", "")
+        raw_score   = data.get("composite_score", 0.0) or 0.0
+        confidence  = data.get("confidence", "?")
+
+        dir_sym = "↑" if direction == "UP" else "↓" if direction == "DOWN" else "↔"
+        dir_clr = ("#22c55e" if direction == "UP" else
+                   "#ef4444" if direction == "DOWN" else "#f59e0b")
+
+        meter = max(0, min(100, int((raw_score + 20) / 40 * 100)))
+
+        # ── FII Futures (B3): FAO net position + 5D flow ──────────────────────
+        fii_net   = data.get("fii_fut_net")    # net contracts from fao_participant
+        fii_5d    = data.get("fii_5d_cr", 0.0) or 0.0
+        fii_today = data.get("fii_today_cr", 0.0) or 0.0
+        fii_ref   = fii_net if fii_net is not None else fii_5d
+        fii_clr   = ("#22c55e" if (fii_ref or 0) > 0 else
+                     "#ef4444" if (fii_ref or 0) < 0 else "#475569")
+        if fii_net is not None:
+            # Show net OI position (contracts) + today's flow direction
+            act    = "A" if fii_today >= 0 else "C"   # ADD / COV — abbreviated
+            fii_val = f"{_fmt_contracts(fii_net)} ({act}{_fmt_cr(abs(fii_today))})"
+        else:
+            fii_val = f"{_fmt_cr(fii_5d)}Cr 5D" if fii_5d else "—"
+
+        # ── EOD Option Chain (B6): PCR + OI change direction ──────────────────
+        # feat_pcr = near-expiry PCR from prediction_log (what DCM used for signals)
+        # eod_pcr  = all-expiry aggregate PCR from nightly_sync (different scope)
+        # Use feat_pcr first to stay consistent with DCM's prediction calculation.
+        pcr      = data.get("feat_pcr") or data.get("eod_pcr") or 0.0
+        ce_chg   = data.get("eod_call_chg", 0) or 0
+        pe_chg   = data.get("eod_put_chg",  0) or 0
+        pcr_clr  = ("#22c55e" if pcr > 1.1 else
+                    "#ef4444" if 0 < pcr < 0.85 else "#475569")
+        if pcr:
+            oi_dir = ""
+            if abs(ce_chg) > 200_000 or abs(pe_chg) > 200_000:
+                oi_dir = " P↑" if pe_chg > ce_chg else " C↑"
+            pcr_val = f"{pcr:.2f}{oi_dir}"
+        else:
+            pcr_val = "—"
+
+        # ── FPI Equity (B7): 5D + today's flow ────────────────────────────────
+        fpi_5d    = data.get("fpi_equity_5d_cr", 0.0) or 0.0
+        fpi_today = data.get("fpi_equity_today_cr", 0.0) or 0.0
+        fpi_clr   = ("#22c55e" if fpi_5d > 1500 else
+                     "#ef4444" if fpi_5d < -1500 else "#475569")
+        fpi_val   = f"{_fmt_cr(fpi_5d)} 5D" if fpi_5d else "—"
+
+        # ── India VIX (B5): level + 5D absolute change ────────────────────────
+        vix     = common.get("india_vix")
+        vix_5d  = common.get("india_vix_5d_chg", 0.0) or 0.0
+        vix_clr = ("#ef4444" if (vix or 0) > 20 else
+                   "#f59e0b" if (vix or 0) > 16 else "#22c55e")
+        if vix:
+            vdir    = "↑" if vix_5d > 0 else "↓"
+            vix_val = f"{vix:.1f} {vdir}{abs(vix_5d):.1f}"
+        else:
+            vix_val = "—"
+
+        # ── Market Breadth (B4): % advancing + heavy sector ───────────────────
+        breadth = common.get("breadth_pct")
+        heavy   = common.get("heavy_breadth_pct")
+        brd_clr = ("#22c55e" if (breadth or 0) > 65 else
+                   "#ef4444" if (breadth or 0) < 35 else "#475569")
+        if breadth is not None:
+            brd_val = f"{breadth:.0f}%"
+            if heavy is not None:
+                brd_val += f" H:{heavy:.0f}%"
+        else:
+            brd_val = "—"
+
+        # ── Futures Carry (feat_carry = raw annualised %) ──────────────────────
+        carry   = data.get("feat_carry")
+        cry_clr = ("#22c55e" if (carry or 0) >= 4 else
+                   "#ef4444" if (carry or 0) < 0 else "#475569")
+        cry_val = f"{carry:+.1f}%A" if carry is not None else "—"
+
+        # ── HMM Statistical Regime (B2): state + Hurst context ────────────────
+        hmm     = data.get("hmm_state") or "?"
+        hurst   = data.get("feat_hurst")
+        entropy = data.get("feat_entropy")
+        hmm_clr = ("#22c55e" if hmm == "Bull" else
+                   "#ef4444" if hmm == "Bear" else "#f59e0b")
+        if hurst is not None:
+            h_lbl   = "T" if hurst > 0.58 else "R" if hurst < 0.42 else "N"
+            hmm_val = f"{hmm} H:{hurst:.2f}{h_lbl}"
+        else:
+            hmm_val = hmm
+
+        # ── Max pain distance ─────────────────────────────────────────────────
+        mp_dist = data.get("max_pain_dist_pct")
+        mp_val  = f"{mp_dist:+.1f}%" if mp_dist is not None else "—"
+        mp_clr  = ("#22c55e" if (mp_dist or 0) < -0.5 else
+                   "#ef4444" if (mp_dist or 0) > 0.5 else "#475569")
+
+        blocks.append(html.Div([
+            # Index name + direction arrow
+            html.Div([
+                html.Span(label, style={
+                    "color": color, "fontSize": "0.52rem",
+                    "fontWeight": "800", "letterSpacing": "0.06em",
+                }),
+                html.Span(f" {dir_sym}", style={
+                    "color": dir_clr, "fontSize": "0.78rem", "fontWeight": "900",
+                }),
+            ], style={"display": "flex", "justifyContent": "space-between",
+                      "alignItems": "center", "marginBottom": "3px"}),
+
+            # Score label + confidence
+            html.Div([
+                html.Span("BULL " if raw_score >= 0 else "BEAR ", style={
+                    "color": "#22c55e" if raw_score >= 0 else "#ef4444",
+                    "fontSize": "0.44rem", "fontWeight": "700",
+                    "letterSpacing": "0.06em", **MONO,
+                }),
+                html.Span(f"{raw_score:+.1f}", style={
+                    "color": "#334155", "fontSize": "0.48rem", **MONO,
+                }),
+                html.Span(f"  {confidence}", style={
+                    "color": "#1e2d40", "fontSize": "0.42rem",
+                }),
+            ], style={"marginBottom": "4px"}),
+
+            # Mini meter
+            html.Div(html.Div(style={
+                "width": f"{meter}%", "height": "100%",
+                "background": "#22c55e" if meter > 50 else "#ef4444",
+                "borderRadius": "2px",
+            }), style={
+                "height": "3px", "background": "rgba(255,255,255,.05)",
+                "borderRadius": "2px", "marginBottom": "5px", "overflow": "hidden",
+            }),
+
+            # Signal breakdown rows
+            _sig_row("FUT",   fii_val, fii_clr),
+            _sig_row("OPT",   pcr_val, pcr_clr),
+            _sig_row("FPI",   fpi_val, fpi_clr),
+            _sig_row("VIX",   vix_val, vix_clr),
+            _sig_row("BRD",   brd_val, brd_clr),
+            _sig_row("CARRY", cry_val, cry_clr),
+            _sig_row("HMM",   hmm_val, hmm_clr),
+            _sig_row("MP",    mp_val,  mp_clr),
+        ], style={
+            "padding": "7px 8px 5px",
+            "marginBottom": "6px",
+            "borderRadius": "7px",
+            "background": f"linear-gradient(135deg,#0a1020 0%,{color}07 100%)",
+            "border": f"1px solid {color}22",
+            "borderLeft": f"3px solid {dir_clr}",
+        }))
+
+    # Pull the pred_date for the header
+    pred_date = bridge.get_panel_data(INDEX_SYMBOLS[0]).get("pred_date")
+    date_str  = (pred_date.strftime("%d %b")
+                 if pred_date and hasattr(pred_date, "strftime")
+                 else "—")
+
+    return html.Div([
+        # Section header
+        html.Div([
+            html.Span("PREDICTION", style={
+                "letterSpacing": "0.18em", "color": "#334155", "fontWeight": "700",
+            }),
+            html.Span(f"  {date_str}", style={
+                "color": "#475569", "fontSize": "0.5rem",
+            }),
+        ], style={
+            "fontSize": "0.5rem", "marginBottom": "8px",
+            "borderTop": "1px solid #1e3a5f", "paddingTop": "12px",
+        }),
+        # Signal legend (column headers)
+        html.Div([
+            html.Span("TAG = signal category verdict (EOD)", style={
+                "color": "#334155", "fontSize": "0.42rem", "letterSpacing": "0.02em",
+            }),
+        ], style={"marginBottom": "6px"}),
+        *blocks,
+    ])
+
+
+# ── DCM Index Prediction replica ─────────────────────────────────────────────
+# Source: dcm_prediction.py → market_data.duckdb (SAME DB as Daily_Cash_Market)
+# Refreshes every 30 min; picks up new data automatically after DCM ingests.
+
+def _rp_badge(text: str, color: str, bg: str) -> html.Span:
+    """Direction / confidence badge."""
+    return html.Span(text, style={
+        "fontSize": "0.58rem", "fontWeight": "700", "color": color,
+        "padding": "2px 9px", "borderRadius": "4px",
+        "background": bg, "border": f"1px solid {color}55",
+        "letterSpacing": "0.05em", "whiteSpace": "nowrap",
+    })
+
+
+def _rp_kv(label: str, value: str, val_clr: str = "#94a3b8") -> html.Div:
+    """Metric tile (PCR / Carry / DTE / VIX)."""
+    return html.Div([
+        html.Span(label, style={
+            "color": "#475569", "fontSize": "0.48rem",
+            "letterSpacing": "0.08em", "display": "block", "marginBottom": "2px",
+        }),
+        html.Span(value, style={
+            "color": val_clr, "fontSize": "0.64rem", "fontWeight": "700", **MONO,
+        }),
+    ], style={
+        "flex": "1", "minWidth": "0", "padding": "5px 8px",
+        "borderRadius": "5px",
+        "background": "rgba(255,255,255,0.03)",
+        "border": "1px solid rgba(255,255,255,0.055)",
+    })
+
+
+def _rp_regime(label: str, value: str, clr: str) -> html.Span:
+    """Statistical regime badge (HURST / HMM / ENTROPY)."""
+    return html.Span([
+        html.Span(label + "  ", style={"color": "#475569", "fontSize": "0.44rem"}),
+        html.Span(value, style={"color": clr, "fontSize": "0.58rem",
+                                "fontWeight": "700", **MONO}),
+    ], style={
+        "display": "inline-block", "padding": "3px 8px", "borderRadius": "4px",
+        "background": "#060e1a", "border": "1px solid #1a2535",
+        "marginRight": "4px", "marginBottom": "3px",
+    })
+
+
+def _rp_card(sym: str, d: dict) -> dbc.Col:
+    """One pure-replica prediction card. `d` is from dcm_prediction.get()."""
+    color = COLORS[sym]
+    label = LABELS[sym]
+
+    direction  = d.get("direction", "")
+    confidence = d.get("confidence", "?")
+    raw_score  = d.get("composite_score", 0.0) or 0.0
+    acc        = d.get("pred_acc_30d")
+    pred_date  = d.get("pred_date")
+
+    spot_close = d.get("spot_close")
+    prev_close = d.get("prev_close")
+    day_pct    = ((spot_close - prev_close) / prev_close * 100
+                  if spot_close and prev_close and prev_close > 0 else 0.0)
+
+    # Meter: composite_score -20..+20 → 0..100
+    meter    = max(0, min(100, int((raw_score + 20) / 40 * 100)))
+    bb_label = "BULL" if raw_score >= 0 else "BEAR"
+    bb_clr   = "#22c55e" if raw_score >= 0 else "#ef4444"
+    meter_bg = ("linear-gradient(90deg,#ef4444,#f59e0b)" if meter <= 50 else
+                "linear-gradient(90deg,#f59e0b,#22c55e)")
+
+    # Direction badge
+    _DIR = {
+        "UP":       ("↑ UP",       "#22c55e", "rgba(34,197,94,.14)"),
+        "DOWN":     ("↓ DOWN",     "#ef4444", "rgba(239,68,68,.14)"),
+        "SIDEWAYS": ("↔ SIDEWAYS", "#f59e0b", "rgba(245,158,11,.14)"),
+    }
+    dir_txt, dir_clr, dir_bg = _DIR.get(direction, ("—", "#64748b", "rgba(100,116,139,.1)"))
+
+    # Confidence badge
+    _CONF = {
+        "HIGH":   ("#22c55e", "rgba(34,197,94,.1)"),
+        "MEDIUM": ("#f59e0b", "rgba(245,158,11,.1)"),
+        "LOW":    ("#64748b", "rgba(100,116,139,.1)"),
+    }
+    conf_clr, conf_bg = _CONF.get(confidence, ("#64748b", "rgba(100,116,139,.1)"))
+
+    # PCR (from fno_bhavcopy at near expiry, same as DCM)
+    pcr     = d.get("eod_pcr") or d.get("feat_pcr") or 0.0
+    pcr_str = f"{pcr:.2f}" if pcr else "—"
+    pcr_clr = "#22c55e" if pcr > 1.15 else "#ef4444" if 0 < pcr < 0.85 else "#94a3b8"
+
+    # Carry (feat_carry = raw annualised %, from prediction_log)
+    carry     = d.get("feat_carry")
+    carry_str = f"{carry:.1f}% ann" if carry is not None else "—"
+    carry_clr = "#22c55e" if (carry or 0) >= 4 else "#ef4444" if (carry or 0) < 0 else "#94a3b8"
+
+    # DTE = (nearest_expiry − pred_date).days  [at prediction time, not today]
+    dte_str = d.get("dte", None)
+    dte_str = f"{dte_str}d" if dte_str is not None else "—"
+
+    # VIX: feat_vix (raw level) + feat_vix_5d_chg (absolute pts change, not %)
+    vix     = d.get("feat_vix") or d.get("india_vix")
+    vix_5d  = d.get("feat_vix_5d_chg") or 0.0
+    vix_str = f"{vix:.1f} ({vix_5d:+.1f}pt)" if vix else "—"
+    vix_clr = "#ef4444" if (vix or 0) > 20 else "#f59e0b" if (vix or 0) > 16 else "#94a3b8"
+
+    # FII: fao net contracts + COV/ADD delta (DCM exact logic)
+    fii_net   = d.get("fii_fut_net")
+    fii_delta = d.get("fii_net_change_1d") or 0
+    fii_clr   = "#94a3b8"
+    fii_main  = "—"
+    fii_chg   = None
+    if fii_net is not None:
+        fii_clr   = "#22c55e" if fii_net >= 0 else "#ef4444"
+        emoji     = "🐂" if fii_net > 80_000 else "🐻" if fii_net < -80_000 else "⚪"
+        fii_main  = f"{emoji} {fii_net:+,}"
+        if fii_delta:
+            lbl   = "COV" if fii_delta > 0 else "ADD"
+            dclr  = "#22c55e" if fii_delta > 0 else "#ef4444"
+            fii_chg = html.Span(f" ({lbl} {abs(fii_delta):,})",
+                                 style={"color": dclr, "fontSize": "0.58rem", **MONO})
+
+    # Key levels (DCM exact field names)
+    s_val  = d.get("top_put_strike")    # support  (max PE OI within band)
+    mp_val = d.get("max_pain_price")    # max pain
+    r_val  = d.get("top_call_strike")   # resistance (max CE OI within band)
+
+    # Expected move
+    range_lo = d.get("range_low")
+    range_hi = d.get("range_high")
+    exp_pts  = d.get("expected_move_pts")
+    target   = d.get("target_close")
+    tgt_pts  = (target - spot_close) if (target and spot_close) else None
+
+    # Breakout scenarios (pre-computed by compute_breakout_scenarios)
+    bk = d.get("breakout") or {}
+
+    # Statistical regime
+    hurst   = d.get("feat_hurst")
+    entropy = d.get("feat_entropy")
+    hmm     = d.get("hmm_state") or "?"
+    h_lbl   = "TREND" if (hurst or 0) > 0.58 else "M-REV" if (hurst or 0) < 0.42 else "RND"
+    e_lbl   = "ORD" if (entropy or 0) < 0.50 else "CHAOS" if (entropy or 0) > 0.72 else "MOD"
+    hmm_clr = "#22c55e" if hmm == "Bull" else "#ef4444" if hmm == "Bear" else "#f59e0b"
+    e_clr   = "#22c55e" if e_lbl == "ORD" else "#ef4444" if e_lbl == "CHAOS" else "#f59e0b"
+
+    date_str = (pred_date.strftime("%d %b")
+                if pred_date and hasattr(pred_date, "strftime")
+                else str(pred_date or "—"))
+    glow_cls = "sig-bull" if raw_score > 2.5 else "sig-bear" if raw_score < -2.5 else ""
+
+    body = [
+        # Index name + direction badge
+        html.Div([
+            html.Span(label, style={"color": color, "fontSize": "0.68rem",
+                                     "fontWeight": "800", "letterSpacing": "0.1em"}),
+            _rp_badge(dir_txt, dir_clr, dir_bg),
+        ], style={"display": "flex", "justifyContent": "space-between",
+                  "alignItems": "center", "marginBottom": "10px"}),
+
+        # Spot close — hero price from prediction_log.spot_close
+        html.Div(f"{spot_close:,.0f}" if spot_close else "—", style={
+            **MONO, "fontSize": "2.0rem", "fontWeight": "900",
+            "color": "#f1f5f9", "letterSpacing": "-0.02em",
+            "lineHeight": "1", "marginBottom": "5px",
+        }),
+
+        # Day change % + confidence badge
+        html.Div([
+            html.Span(f"{'▲' if day_pct >= 0 else '▼'} {abs(day_pct):.2f}%",
+                      style={"color": "#22c55e" if day_pct >= 0 else "#ef4444",
+                             "fontSize": "0.72rem", "fontWeight": "600", **MONO}),
+            html.Span(f"  {confidence} CONF", style={
+                "color": conf_clr, "fontSize": "0.48rem",
+                "padding": "2px 7px", "borderRadius": "3px",
+                "background": conf_bg, "border": f"1px solid {conf_clr}44",
+                "marginLeft": "8px",
+            }),
+        ], style={"marginBottom": "10px"}),
+
+        # Bull/Bear score + gradient meter bar
+        html.Div([
+            html.Div([
+                html.Span(f"{bb_label} {meter}/100",
+                          style={"color": bb_clr, "fontSize": "0.58rem",
+                                 "fontWeight": "700", **MONO}),
+                html.Span(f" ({raw_score:+.1f})",
+                          style={"color": "#475569", "fontSize": "0.56rem", **MONO}),
+            ], style={"marginBottom": "5px"}),
+            html.Div(html.Div(className="pred-meter-fill",
+                              style={"width": f"{meter}%", "background": meter_bg}),
+                     className="pred-meter-track"),
+        ]),
+
+        # Divider
+        html.Div(style={"height": "1px",
+                        "background": f"linear-gradient(90deg,{color}55,transparent)",
+                        "marginBottom": "10px"}),
+
+        # Metrics: PCR | Carry | DTE
+        html.Div([_rp_kv("PCR", pcr_str, pcr_clr),
+                  _rp_kv("Carry", carry_str, carry_clr),
+                  _rp_kv("DTE", dte_str, "#64748b")],
+                 style={"display": "flex", "gap": "5px", "marginBottom": "5px"}),
+
+        # Metrics: VIX
+        html.Div([_rp_kv("VIX", vix_str, vix_clr)],
+                 style={"display": "flex", "gap": "5px", "marginBottom": "5px"}),
+
+        # FII full row (net position + ADD/COV delta)
+        html.Div([
+            html.Span("FII  ", style={"color": "#475569", "fontSize": "0.48rem"}),
+            html.Span(fii_main, style={"color": fii_clr, "fontSize": "0.64rem",
+                                        "fontWeight": "700", **MONO}),
+            fii_chg or html.Span(),
+        ], style={"marginBottom": "12px", "padding": "5px 8px", "borderRadius": "5px",
+                  "background": "rgba(255,255,255,0.03)",
+                  "border": "1px solid rgba(255,255,255,0.055)"}),
+
+        # Key levels: S | MP | R
+        html.Div([
+            html.Span("S  ", style={"color": "#475569", "fontSize": "0.52rem"}),
+            html.Span(f"{s_val:,.0f}" if s_val else "—",
+                      style={"color": "#22c55e", "fontWeight": "700",
+                             "fontSize": "0.76rem", **MONO}),
+            html.Span("  MP  ", style={"color": "#475569", "fontSize": "0.52rem"}),
+            html.Span(f"{mp_val:,.0f}" if mp_val else "—",
+                      style={"color": "#fbbf24", "fontWeight": "700",
+                             "fontSize": "0.76rem", **MONO}),
+            html.Span("  R  ", style={"color": "#475569", "fontSize": "0.52rem"}),
+            html.Span(f"{r_val:,.0f}" if r_val else "—",
+                      style={"color": "#ef4444", "fontWeight": "700",
+                             "fontSize": "0.76rem", **MONO}),
+        ], style={"marginBottom": "7px"}),
+
+        # Expected move range + target
+        html.Div([
+            html.Span("Range  ", style={"color": "#475569", "fontSize": "0.5rem"}),
+            html.Span(f"{range_lo:,.0f}–{range_hi:,.0f}"
+                      if (range_lo and range_hi) else "—",
+                      style={"color": "#94a3b8", "fontSize": "0.6rem", **MONO}),
+            html.Span(f"  (±{exp_pts:.0f})" if exp_pts else "",
+                      style={"color": "#475569", "fontSize": "0.56rem", **MONO}),
+            html.Span(
+                f"  Tgt {'▲' if (tgt_pts or 0) >= 0 else '▼'}{abs(tgt_pts):.0f}"
+                if tgt_pts is not None else "",
+                style={"color": "#fbbf24", "fontWeight": "600",
+                       "fontSize": "0.62rem", **MONO}),
+        ], style={"padding": "5px 8px", "borderRadius": "4px",
+                  "background": "rgba(255,255,255,0.02)", "marginBottom": "10px"}),
+
+        # ── Breakout scenarios ─────────────────────────────────────────────────
+        # Consistent 2.4σ + DTE gravity for both directions. Three-tier downside.
+        *([html.Div([
+            html.Div("BREAKOUT SCENARIOS", style={
+                "fontSize": "0.44rem", "letterSpacing": "0.14em",
+                "color": "#1e3a5f", "marginBottom": "4px", "fontWeight": "700",
+            }),
+            # Upside row
+            html.Div([
+                html.Span("▲ IF >", style={"color": "#334155", "fontSize": "0.46rem"}),
+                html.Span(f"{bk['u_trigger']:,}",
+                          style={"color": "#22c55e", "fontWeight": "700",
+                                 "fontSize": "0.58rem", **MONO}),
+                html.Span("  →  ", style={"color": "#1e3a5f", "fontSize": "0.44rem"}),
+                html.Span(f"{bk['u_trigger']:,}–{bk['u_corrected']:,}",
+                          style={"color": "#4ade80", "fontWeight": "700",
+                                 "fontSize": "0.6rem", **MONO}),
+                html.Span(
+                    f"  +{bk['u_ext_pts']} pts"
+                    + ("  [SQUEEZE→{:,}]".format(bk['u_stat']) if bk.get("squeeze") else ""),
+                    style={"color": "#22c55e", "fontSize": "0.5rem", **MONO}),
+            ], style={"marginBottom": "3px"}),
+            # Downside row — tier 1 + tier 2 + tier 3
+            html.Div([
+                html.Span("▼ IF <", style={"color": "#334155", "fontSize": "0.46rem"}),
+                html.Span(f"{bk['d_trigger']:,}",
+                          style={"color": "#ef4444", "fontWeight": "700",
+                                 "fontSize": "0.58rem", **MONO}),
+                html.Span("  →  ", style={"color": "#1e3a5f", "fontSize": "0.44rem"}),
+                # Tier 1 (put wall) shown if present
+                *(
+                    [html.Span(f"wall {bk['d_tier1']:,}",
+                               style={"color": "#f59e0b", "fontSize": "0.5rem",
+                                      "fontWeight": "700", **MONO}),
+                     html.Span(" / ", style={"color": "#1e3a5f", "fontSize": "0.44rem"})]
+                    if bk.get("d_tier1") else []
+                ),
+                html.Span(f"{bk['d_tier2']:,}",
+                          style={"color": "#f87171", "fontWeight": "700",
+                                 "fontSize": "0.6rem", **MONO}),
+                html.Span(f"  −{bk['d_ext_pts']} pts",
+                          style={"color": "#ef4444", "fontSize": "0.5rem", **MONO}),
+                html.Span(f"  [stat {bk['d_tier3']:,}]",
+                          style={"color": "#334155", "fontSize": "0.46rem", **MONO}),
+            ], style={"marginBottom": "3px"}),
+            # Gravity note
+            html.Div(
+                f"MP {bk['mp']:,} · gravity {int(bk['gravity']*100)}% · {bk['dte']}DTE",
+                style={"color": "#1e3a5f", "fontSize": "0.44rem", **MONO},
+            ),
+        ], style={
+            "padding": "5px 8px", "borderRadius": "4px",
+            "background": "rgba(0,0,0,0.25)", "border": "1px solid #111d2e",
+            "marginBottom": "8px",
+        })] if bk else []),
+
+        # Statistical regime badges
+        html.Div([
+            html.Div("STATISTICAL REGIME", style={
+                "fontSize": "0.46rem", "letterSpacing": "0.16em",
+                "color": "#334155", "marginBottom": "5px",
+            }),
+            html.Div([
+                _rp_regime("HURST",   f"{hurst:.3f} {h_lbl}" if hurst else "—", "#475569"),
+                _rp_regime("HMM",     hmm,                                       hmm_clr),
+                _rp_regime("ENTROPY", e_lbl,                                     e_clr),
+            ]),
+        ]),
+
+        # Footer: accuracy + date
+        html.Div([
+            html.Span(f"30D acc {acc:.0f}%  " if acc is not None else "",
+                      style={"color": ("#22c55e" if (acc or 0) >= 65 else
+                                       "#f59e0b" if (acc or 0) >= 50 else "#ef4444"),
+                             "fontSize": "0.5rem", **MONO}),
+            html.Span(f"·  {date_str}", style={"color": "#1e2d40", "fontSize": "0.5rem"}),
+        ], style={"marginTop": "8px", "paddingTop": "6px",
+                  "borderTop": "1px solid #111d2e"}),
+    ]
+
+    return dbc.Col(
+        html.Div(body, className=f"pred-card {glow_cls}", style={
+            "padding": "14px 15px", "height": "100%",
+            "background": f"linear-gradient(155deg,#0c1826 0%,{color}09 100%)",
+            "border": f"1px solid {color}28",
+            "borderTop": f"3px solid {dir_clr}",
+            "borderRadius": "10px",
+        }),
+        md=3, xs=12, className="mb-3 px-2",
+    )
+
+
+# ── context-panel callback target ─────────────────────────────────────────────
+def _render_context_panel() -> html.Div:
+    """
+    Pure replica of Daily_Cash_Market's Index Prediction page.
+    Reads from market_data.duckdb directly (same DB, same data).
+    30-minute cache; auto-picks up new data after DCM ingests.
+    """
+    if not _DCM_OK:
+        return html.Div()
+
+    reader = _get_dcm_reader()
+
+    if not reader.is_available():
+        return html.Div([
+            html.Span("◉  ", style={"color": "#334155"}),
+            html.Span(
+                "Index Prediction: market_data.duckdb not reachable — "
+                "start Daily_Cash_Market or wait for next retry",
+                style={"color": "#475569", "fontSize": "0.62rem", **MONO},
+            ),
+        ], style={"padding": "14px 18px", "marginBottom": "12px",
+                  "background": "#080f1c", "border": "1px solid #1a2535",
+                  "borderRadius": "8px"})
+
+    all_data = reader.get_all()
+
+    # EOD date from first available record
+    d0       = all_data.get(INDEX_SYMBOLS[0], {})
+    pred_dt  = d0.get("pred_date")
+    eod_str  = (pred_dt.strftime("%d %b %Y")
+                if pred_dt and hasattr(pred_dt, "strftime") else str(pred_dt or "—"))
+
+    return html.Div([
+        # Section header — matches DCM page
+        html.Div([
+            html.Div([
+                html.Span("Index Prediction  ", style={
+                    "color": "#e2e8f0", "fontSize": "0.9rem", "fontWeight": "700",
+                }),
+                html.Span("—  Tomorrow's Directional Forecast", style={
+                    "color": "#475569", "fontSize": "0.78rem", "fontWeight": "400",
+                }),
+            ], style={"marginBottom": "5px"}),
+            html.Div(
+                "24-signal quant engine: OI-Price Matrix · Carry · Max Pain · PCR · "
+                "OI-Premium Matrix · Wyckoff Range · Price Mean-Reversion · "
+                "FII Institutional · FII Options Delta · FII Flow · FII 5D Cumulative · "
+                "FII OI Buildup · FII Position Change · Short Squeeze Setup · India VIX · "
+                "Sector Breadth · Cyclical/Defensive Rotation · PE Valuation · "
+                "Multi-Expiry PCR · Dual Max Pain · Gamma Wall · Hurst · HMM · Entropy",
+                style={"fontSize": "0.48rem", "color": "#334155",
+                       "letterSpacing": "0.01em", "lineHeight": "1.7",
+                       "marginBottom": "4px"},
+            ),
+            html.Div(f"EOD: {eod_str}  ·  Source: Daily_Cash_Market (market_data.duckdb)",
+                     style={"fontSize": "0.46rem", "color": "#1e3a5f"}),
+        ], style={"marginBottom": "16px"}),
+
+        # 4 prediction cards
+        dbc.Row(
+            [_rp_card(sym, all_data.get(sym, {})) for sym in INDEX_SYMBOLS],
+            className="gx-2",
+        ),
+    ], style={
         "background": "#080f1c",
         "border":     "1px solid #111d2e",
-        "borderTop":  "2px solid #1e3a5f",
-        "borderRadius": "8px",
-        "marginBottom": "12px",
+        "borderTop":  "2px solid #1a2d42",
+        "borderRadius": "10px",
+        "padding": "18px 20px 10px",
+        "marginBottom": "14px",
     })
 
 
 # ── Velocity monitor renderer ────────────────────────────────────────────────
 def _render_velocity_panel(sym: str) -> html.Div:
-    """
-    Compact session-memory card: OI flow, wall shift, IV regime, PCR slope.
-    Shows 'building' state when < 3 snapshots (first ~9 min of session).
-    """
     vel = oi_store.velocity(sym)
     color = COLORS.get(sym, "#00d4ff")
 
-    def _row(label: str, value: str, clr: str = "#475569"):
-        return dbc.Row([
-            dbc.Col(html.Span(label, style={"color": "#334155", "fontSize": "0.58rem",
-                                             "letterSpacing": "0.08em"}), width=4),
-            dbc.Col(html.Span(value, style={"color": clr, "fontWeight": "600",
-                                             "fontSize": "0.68rem", **MONO}), width=8),
-        ], className="mb-1")
-
     if not vel.get("has_data"):
         n = vel.get("snap_count", 0)
-        body = html.Div(
-            f"Building session history — {n}/3 snapshots collected...",
-            style={"color": "#334155", "fontSize": "0.65rem", "padding": "4px 0", **MONO},
-        )
+        body = html.Div([
+            html.Div([
+                html.Span(className="live-dot live-dot-amber", style={"marginRight": "8px"}),
+                html.Span(f"Building session data — {n} / 3 snapshots",
+                          style={"color": "#475569", "fontSize": "0.64rem", **MONO}),
+            ], style={"display": "flex", "alignItems": "center", "padding": "4px 0"}),
+        ])
     else:
-        oi   = vel["oi"]
-        iv   = vel["iv"]
-        wal  = vel["walls"]
-        pcr  = vel["pcr"]
+        oi  = vel["oi"]
+        iv  = vel["iv"]
+        wal = vel["walls"]
+        pcr = vel["pcr"]
 
-        def _oi_str(v):
-            if v is None or v == 0: return "—"
-            # _fmt_oi already includes the "-" sign for negative values.
-            # Prepend "+" only for positives so display is "+2.3M / -1.1M".
+        # OI flow dual bar
+        c1 = oi.get("call_1hr") or 0
+        p1 = oi.get("put_1hr") or 0
+        total_flow = abs(c1) + abs(p1) or 1
+        c_pct = abs(c1) / total_flow * 100
+        p_pct = abs(p1) / total_flow * 100
+        net_lbl = "PUT DOM" if p1 > c1 else "CALL DOM" if c1 > p1 else "BALANCED"
+        net_clr = "#22c55e" if p1 > c1 else "#ef4444" if c1 > p1 else "#475569"
+
+        def _ff(v):
+            if not v: return "—"
             return f"{'+' if v > 0 else ''}{_fmt_oi(v)}"
 
-        def _oi_clr(v):
-            if v is None: return "#475569"
-            return "#22c55e" if v > 0 else "#ef4444" if v < 0 else "#475569"
-
-        # OI flow
-        c1 = oi.get("call_1hr"); p1 = oi.get("put_1hr")
-        oi_clr = "#22c55e" if (p1 or 0) > (c1 or 0) else "#ef4444" if (c1 or 0) > (p1 or 0) else "#475569"
-        oi_str = f"Call {_oi_str(c1)}  │  Put {_oi_str(p1)}"
-
-        # wall shift
-        cws = wal.get("call_shift_1hr"); pws = wal.get("put_shift_1hr")
-        cn  = wal.get("call_now", 0);   pn  = wal.get("put_now", 0)
-        cwa = wal.get("call_1hr_ago") or cn; pwa = wal.get("put_1hr_ago") or pn
-        def _wall_str(old, now, shift):
-            if shift is None: return f"{now:,.0f}"
-            arrow = "↑" if shift > 0 else "↓" if shift < 0 else "→"
-            return f"{old:,.0f} → {now:,.0f}  {arrow}{abs(shift):.0f}"
-        def _wall_clr(shift):
-            if shift is None: return "#475569"
-            return "#22c55e" if shift > 0 else "#ef4444" if shift < 0 else "#475569"
-
-        # IV regime
+        # IV
         regime = iv.get("regime", "stable")
-        iv_now = iv.get("now", 0)
+        iv_now = iv.get("now") or 0
         iv_ch  = iv.get("change_1hr") or 0
-        iv_clr = "#f59e0b" if regime == "expanding" else "#22c55e" if regime == "contracting" else "#475569"
-        iv_str = f"{iv_now:.1f}%  {'+' if iv_ch>=0 else ''}{iv_ch:.1f}% (1hr)  [{regime.upper()}]"
+        iv_clr = "#f59e0b" if regime == "expanding" else "#22c55e" if regime == "contracting" else "#64748b"
+        iv_pct = min(iv_now / 30 * 100, 100)
 
-        # PCR trend
-        pcr_n  = pcr.get("now", 0); pcr_30 = pcr.get("30m_ago") or pcr_n
+        # PCR
+        pcr_n  = pcr.get("now") or 0
+        pcr_30 = pcr.get("30m_ago") or pcr_n
         pcr_ch = pcr.get("change_30m") or 0
         trend  = pcr.get("trend", "stable")
-        pcr_clr = "#22c55e" if trend == "rising" else "#ef4444" if trend == "falling" else "#475569"
-        pcr_str = f"{pcr_30:.2f} → {pcr_n:.2f}  ({'+' if pcr_ch>=0 else ''}{pcr_ch:.2f}/30m)  {trend.upper()}"
+        pcr_clr = "#22c55e" if trend == "rising" else "#ef4444" if trend == "falling" else "#64748b"
+        pcr_pct = min(pcr_n / 2.0 * 100, 100)
+
+        # Walls
+        cws = wal.get("call_shift_1hr") or 0
+        pws = wal.get("put_shift_1hr") or 0
+        cn  = wal.get("call_now") or 0
+        pn  = wal.get("put_now") or 0
+
+        def _warr(shift):
+            if not shift: return "→"
+            return f"↑ +{shift:.0f}" if shift > 0 else f"↓ {shift:.0f}"
 
         snaps = vel.get("snap_count", 0)
         body = html.Div([
-            _row("OI FLOW  1hr",   oi_str,                    oi_clr),
-            _row("CALL WALL  1hr", _wall_str(cwa, cn, cws),   _wall_clr(cws)),
-            _row("PUT WALL  1hr",  _wall_str(pwa, pn, pws),   _wall_clr(pws)),
-            _row("IV REGIME",      iv_str,                    iv_clr),
-            _row("PCR TREND  30m", pcr_str,                   pcr_clr),
-            html.Div(f"{snaps} snapshots in session history",
-                     style={"color": "#1e2d40", "fontSize": "0.55rem",
-                            "marginTop": "6px", **MONO}),
+            # ── OI Flow dual bar ──────────────────────────────────────────
+            html.Div([
+                html.Div([
+                    html.Span("OI FLOW  1HR", style={"color": "#334155", "fontSize": "0.57rem",
+                                                      "letterSpacing": "0.08em"}),
+                    html.Span(net_lbl, style={"color": net_clr, "fontSize": "0.58rem",
+                                              "fontWeight": "700", **MONO}),
+                ], style={"display": "flex", "justifyContent": "space-between", "marginBottom": "4px"}),
+                html.Div([
+                    html.Div(style={"width": f"{c_pct:.1f}%", "height": "100%",
+                                    "background": "#ef4444", "borderRadius": "3px 0 0 3px",
+                                    "transition": "width .6s ease"}),
+                    html.Div(style={"width": f"{p_pct:.1f}%", "height": "100%",
+                                    "background": "#22c55e", "borderRadius": "0 3px 3px 0",
+                                    "transition": "width .6s ease"}),
+                ], style={"display": "flex", "height": "6px", "overflow": "hidden",
+                          "background": "rgba(255,255,255,.04)", "borderRadius": "3px",
+                          "marginBottom": "4px"}),
+                html.Div([
+                    html.Span(f"Call  {_ff(c1)}", style={"color": "#f87171", "fontSize": "0.6rem", **MONO}),
+                    html.Span(f"Put  {_ff(p1)}", style={"color": "#4ade80", "fontSize": "0.6rem", **MONO}),
+                ], style={"display": "flex", "justifyContent": "space-between"}),
+            ], style={"marginBottom": "10px"}),
+
+            # ── IV Regime bar ─────────────────────────────────────────────
+            html.Div([
+                html.Div([
+                    html.Span("IV REGIME", style={"color": "#334155", "fontSize": "0.57rem",
+                                                   "letterSpacing": "0.08em"}),
+                    html.Span(regime.upper(), style={"color": iv_clr, "fontSize": "0.58rem",
+                                                     "fontWeight": "700", **MONO}),
+                ], style={"display": "flex", "justifyContent": "space-between", "marginBottom": "4px"}),
+                html.Div(html.Div(style={"width": f"{iv_pct:.1f}%", "height": "100%",
+                                         "background": iv_clr, "borderRadius": "3px",
+                                         "transition": "width .6s ease"}),
+                         className="vbar-track", style={"marginBottom": "4px"}),
+                html.Span(f"{iv_now:.1f}%  ({'+' if iv_ch >= 0 else ''}{iv_ch:.1f}% / 1hr)",
+                          style={"color": "#475569", "fontSize": "0.6rem", **MONO}),
+            ], style={"marginBottom": "10px"}),
+
+            # ── PCR Trend bar ─────────────────────────────────────────────
+            html.Div([
+                html.Div([
+                    html.Span("PCR TREND  30M", style={"color": "#334155", "fontSize": "0.57rem",
+                                                        "letterSpacing": "0.08em"}),
+                    html.Span(trend.upper(), style={"color": pcr_clr, "fontSize": "0.58rem",
+                                                    "fontWeight": "700", **MONO}),
+                ], style={"display": "flex", "justifyContent": "space-between", "marginBottom": "4px"}),
+                html.Div(html.Div(style={"width": f"{pcr_pct:.1f}%", "height": "100%",
+                                         "background": pcr_clr, "borderRadius": "3px",
+                                         "transition": "width .6s ease"}),
+                         className="vbar-track", style={"marginBottom": "4px"}),
+                html.Span(f"{pcr_30:.2f}  →  {pcr_n:.2f}  ({'+' if pcr_ch >= 0 else ''}{pcr_ch:.2f})",
+                          style={"color": "#475569", "fontSize": "0.6rem", **MONO}),
+            ], style={"marginBottom": "10px"}),
+
+            # ── Wall shifts ───────────────────────────────────────────────
+            html.Div([
+                html.Span("WALLS  1HR", style={"color": "#334155", "fontSize": "0.57rem",
+                                                "letterSpacing": "0.08em", "display": "block",
+                                                "marginBottom": "4px"}),
+                html.Div([
+                    html.Span(f"Call  {cn:,.0f}  {_warr(cws)}",
+                              style={"color": "#4ade80" if cws >= 0 else "#f87171",
+                                     "fontSize": "0.62rem", **MONO, "marginRight": "16px"}),
+                    html.Span(f"Put  {pn:,.0f}  {_warr(pws)}",
+                              style={"color": "#4ade80" if pws >= 0 else "#f87171",
+                                     "fontSize": "0.62rem", **MONO}),
+                ]),
+            ], style={"marginBottom": "6px"}),
+
+            html.Div(f"{snaps} session snapshots", style={
+                "color": "#1e2d40", "fontSize": "0.53rem", "marginTop": "2px", **MONO,
+            }),
         ])
 
     return dbc.Card(dbc.CardBody([
-        html.Div("INTRADAY  VELOCITY  MONITOR", style={
-            "fontSize": "0.58rem", "letterSpacing": "0.18em",
-            "color": "#1e3a5f", "marginBottom": "8px",
-        }),
+        html.Div([
+            html.Span("INTRADAY  VELOCITY", style={"fontSize": "0.56rem", "letterSpacing": "0.2em",
+                                                    "color": "#1e3a5f", "fontWeight": "700"}),
+            html.Span("  MONITOR", style={"fontSize": "0.52rem", "letterSpacing": "0.12em",
+                                           "color": "#0f1e30"}),
+        ], style={"marginBottom": "10px"}),
         body,
     ]), style={
         "background": "#080f1c",
@@ -1063,150 +1950,352 @@ def _render_velocity_panel(sym: str) -> html.Div:
 
 # ── Signal panel renderer ─────────────────────────────────────────────────────
 def _render_signal_panel(results: dict, updated: str) -> html.Div:
-    MONO_XS = {**MONO, "fontSize": "0.65rem"}
+    """
+    4-index × 4-timeframe signal matrix + per-index verdict cards.
+    Always shows all 4 index cards — degrades to 'building' state when data is unavailable.
+    Adds session phase context and safeguards all key accesses.
+    """
+    phase_name, _phase_mult, phase_caution = session_phase()
+    TF_KEYS  = [("5min","5M"), ("15min","15M"), ("60min","1H"), ("daily","D")]
+    IDX_SHORT = {
+        "NSE:NIFTY50-INDEX":    "N50",
+        "NSE:NIFTYBANK-INDEX":  "BNK",
+        "NSE:FINNIFTY-INDEX":   "FIN",
+        "NSE:MIDCPNIFTY-INDEX": "MID",
+    }
 
-    def _sig_cell(t: dict) -> html.Td:
-        sig = t.get("signal", "—")
-        clr = t.get("color", "#475569")
-        con = t.get("confidence", 0)
-        return html.Td([
-            html.Div(sig,  style={"color": clr, "fontWeight": "700", **MONO_XS}),
-            html.Div(f"{con:.0f}%", style={"color": "#334155", "fontSize": "0.58rem", **MONO}),
-        ], style={"padding": "5px 8px", "textAlign": "center"})
+    def _s_cls(score, sig=""):
+        if sig == "INSUFFICIENT DATA": return "tf-neut"
+        if score > 0.5:  return "tf-bull"
+        if score < -0.5: return "tf-bear"
+        return "tf-neut"
 
-    TH = {"padding": "5px 8px", "fontSize": "0.58rem", "letterSpacing": "0.1em",
-          "color": "#1e3a5f", "fontWeight": "600", "background": "#060c14",
-          "textAlign": "center", "whiteSpace": "nowrap"}
+    def _s_lbl(score, sig=""):
+        if sig in ("INSUFFICIENT DATA", ""): return "—"
+        if score > 0.5:  return "BUY"
+        if score < -0.5: return "SELL"
+        return "NEU"
 
-    header = html.Tr([
-        html.Th("INDEX",   style={**TH, "textAlign": "left"}),
-        html.Th("5 MIN",   style=TH),
-        html.Th("15 MIN",  style=TH),
-        html.Th("1 HOUR",  style=TH),
-        html.Th("DAILY",   style=TH),
-        html.Th("OVERALL", style={**TH, "color": "#475569"}),
-    ])
+    # ── 4 × 4 Signal Matrix ───────────────────────────────────────────────────
+    TH_S = {"padding":"5px 12px","fontSize":"0.56rem","fontWeight":"800",
+             "letterSpacing":"0.08em","textAlign":"center",
+             "borderBottom":"2px solid #111d2e","background":"#060c14"}
+    matrix_rows = [html.Tr([
+        html.Th("", style={**TH_S,"textAlign":"left","color":"#334155","minWidth":"42px"}),
+        *[html.Th(IDX_SHORT[s], style={**TH_S,"color":COLORS[s]}) for s in INDEX_SYMBOLS],
+    ])]
+    for tf_key, tf_lbl in TF_KEYS:
+        cells = [html.Td(tf_lbl, style={
+            "padding":"5px 8px","fontSize":"0.56rem","color":"#334155",
+            "fontWeight":"700","letterSpacing":"0.08em",
+            "borderRight":"1px solid #0d1a2a","background":"#060c14","whiteSpace":"nowrap",
+        })]
+        for sym in INDEX_SYMBOLS:
+            t   = results.get(sym, {}).get("timeframes", {}).get(tf_key, {})
+            s   = t.get("score", 0)
+            sig = t.get("signal", "")
+            lbl = _s_lbl(s, sig)
+            cls = _s_cls(s, sig)
+            cells.append(html.Td(
+                html.Span(lbl, className=f"tf-pill {cls}",
+                          style={"fontSize":"0.52rem","padding":"2px 7px","margin":"0"}),
+                style={"textAlign":"center","padding":"4px 6px",
+                       "borderBottom":"1px solid #0d1a2a","background":"rgba(0,0,0,.1)"},
+            ))
+        matrix_rows.append(html.Tr(cells))
 
-    rows = [header]
-    recs = []  # collect recommendations
+    signal_matrix = dbc.Card(dbc.CardBody([
+        html.Div([
+            html.Span("SIGNAL MATRIX", style={"fontSize":"0.55rem","letterSpacing":"0.2em",
+                                               "color":"#1e3a5f","fontWeight":"700"}),
+            html.Span("  4 INDICES × 4 TIMEFRAMES",
+                      style={"fontSize":"0.5rem","color":"#0f1e30"}),
+        ], style={"marginBottom":"8px"}),
+        html.Div(
+            html.Table(matrix_rows, style={"width":"100%","borderCollapse":"collapse"}),
+            style={"overflowX":"auto"},
+        ),
+    ]), style={"background":"#080f1c","border":"1px solid #111d2e",
+               "borderRadius":"8px","marginBottom":"12px"})
+
+    # ── 4 Index verdict cards (always all 4) ──────────────────────────────────
+    def _sbar(ws):
+        pct = max(0, min(abs(ws) / 4.0 * 100, 100))
+        clr = ("#22c55e" if ws > 1.5 else "#4ade80" if ws > 0.3
+               else "#ef4444" if ws < -1.5 else "#f87171" if ws < -0.3 else "#1e2d40")
+        return html.Div(
+            html.Div(className="sbar-fill", style={"width":f"{pct:.0f}%","background":clr}),
+            className="sbar-track",
+        )
+
+    sig_cards, recs = [], []
 
     for sym in INDEX_SYMBOLS:
-        r = results.get(sym, {})
-        if not r or "timeframes" not in r:
-            continue
-        tfs   = r["timeframes"]
-        ov, ov_clr = r.get("overall", ("—", "#475569"))
-        ws    = r.get("weighted_score", 0)
-        label = r.get("label", sym)
+        r     = results.get(sym, {})
         color = COLORS[sym]
+        label = LABELS[sym]
+        tfs   = r.get("timeframes", {})
 
-        rows.append(html.Tr([
-            html.Td(html.Span(label, style={"color": color, "fontWeight": "700",
-                                             "fontSize": "0.65rem", **MONO}),
-                    style={"padding": "5px 10px"}),
-            _sig_cell(tfs.get("5min",  {})),
-            _sig_cell(tfs.get("15min", {})),
-            _sig_cell(tfs.get("60min", {})),
-            _sig_cell(tfs.get("daily", {})),
-            html.Td([
-                html.Div(ov, style={"color": ov_clr, "fontWeight": "800",
-                                     "fontSize": "0.68rem", **MONO}),
-                html.Div(f"score {ws:+.1f}", style={"color": "#334155",
-                                                      "fontSize": "0.58rem", **MONO}),
-            ], style={"padding": "5px 8px", "textAlign": "center"}),
-        ]))
+        # Always show a card — loading/error state when no real data
+        if not tfs or "error" in r or all(t.get("signal","") == "INSUFFICIENT DATA"
+                                          for t in tfs.values()):
+            err = r.get("error", "")
+            sig_cards.append(dbc.Col(
+                html.Div([
+                    html.Div([
+                        html.Span(className="live-dot live-dot-amber",
+                                  style={"marginRight":"5px"}),
+                        html.Span(label, style={"color":color,"fontSize":"0.58rem",
+                                                "fontWeight":"800","letterSpacing":"0.14em"}),
+                    ], style={"display":"flex","alignItems":"center","marginBottom":"10px"}),
+                    html.Div("BUILDING...", style={"color":"#334155","fontWeight":"700",
+                                                    "fontSize":"0.88rem",**MONO}),
+                    html.Div(err[:48] if err else "Collecting candle data...",
+                             style={"color":"#1e2d40","fontSize":"0.55rem",
+                                    **MONO,"marginTop":"6px"}),
+                    html.Div(html.Div(className="sbar-fill",
+                                      style={"width":"15%","background":"#1e2d40"}),
+                             className="sbar-track"),
+                ], className="sig-card", style={
+                    "padding":"14px 16px","height":"100%","background":"#0c1522",
+                    "borderRadius":"12px","border":f"1px solid {color}18",
+                    "borderTop":f"2px solid {color}40",
+                }),
+                md=3, xs=6, className="mb-2 px-1",
+            ))
+            continue
 
-        # Collect for recommendations if signal is meaningful
+        ov, _ov_clr = r.get("overall", ("NEUTRAL", "#94a3b8"))
+        ws           = r.get("weighted_score", 0)
+        bull_c       = sum(1 for t in tfs.values() if t.get("score", 0) > 0.5)
+        bear_c       = sum(1 for t in tfs.values() if t.get("score", 0) < -0.5)
+        glow         = ("sig-card sig-bull" if ws > 0.8 else
+                        "sig-card sig-bear" if ws < -0.8 else "sig-card")
+        score_cls    = "score-bull" if ws > 0.3 else "score-bear" if ws < -0.3 else "score-neut"
+        vclass       = ("verdict-bull" if ws > 0.3 else
+                        "verdict-bear" if ws < -0.3 else "verdict-neut")
+
+        sig_cards.append(dbc.Col(
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.Span(className="live-dot", style={"marginRight":"5px"}),
+                        html.Span(label, style={"color":color,"fontSize":"0.58rem",
+                                                "fontWeight":"800","letterSpacing":"0.14em"}),
+                    ], style={"display":"flex","alignItems":"center"}),
+                    html.Span(f"{ws:+.1f}", className=f"score-badge {score_cls}"),
+                ], style={"display":"flex","justifyContent":"space-between",
+                          "alignItems":"center","marginBottom":"10px"}),
+
+                html.Div(ov, className=vclass, style={
+                    "fontWeight":"900","fontSize":"1.05rem",
+                    **MONO,"letterSpacing":"0.04em","lineHeight":"1",
+                }),
+
+                _sbar(ws),
+
+                html.Div([
+                    html.Span(f"{bull_c}× bull",
+                              style={"color":"#22c55e" if bull_c >= 3 else "#1e2d40",
+                                     "fontSize":"0.54rem",**MONO,"marginRight":"8px"}),
+                    html.Span(f"{bear_c}× bear",
+                              style={"color":"#ef4444" if bear_c >= 3 else "#1e2d40",
+                                     "fontSize":"0.54rem",**MONO}),
+                ], style={"marginBottom":"4px"}),
+
+                html.Div([
+                    html.Span(
+                        f"{lbl} {_s_lbl(tfs.get(k,{}).get('score',0), tfs.get(k,{}).get('signal',''))}",
+                        className=f"tf-pill {_s_cls(tfs.get(k,{}).get('score',0), tfs.get(k,{}).get('signal',''))}",
+                    )
+                    for k, lbl in TF_KEYS
+                ], style={"marginTop":"8px","lineHeight":"2.2"}),
+            ], className=glow, style={
+                "padding":"14px 16px","height":"100%",
+                "background":f"linear-gradient(155deg, #0c1522 0%, {color}0d 100%)",
+                "borderRadius":"12px","border":f"1px solid {color}20",
+                "borderTop":f"2px solid {color}",
+            }),
+            md=3, xs=6, className="mb-2 px-1",
+        ))
         if abs(ws) >= 0.8:
             recs.append((abs(ws), sym, r))
 
-    grid = html.Table(rows, style={"width": "100%", "borderCollapse": "collapse"})
-
-    # Top recommendations (sorted by conviction)
+    # ── Opportunity rec cards ─────────────────────────────────────────────────
     recs.sort(key=lambda x: x[0], reverse=True)
     rec_cards = []
     for _, sym, r in recs[:3]:
-        ws  = r["weighted_score"]
-        ov, ov_clr = r.get("overall", ("—", "#475569"))
-        color = COLORS[sym]
-        label = r["label"]
-        tfs   = r["timeframes"]
-
-        # Best timeframe details
-        bull_tfs = [k for k, t in tfs.items() if t.get("score", 0) > 0.5]
-        bear_tfs = [k for k, t in tfs.items() if t.get("score", 0) < -0.5]
-        active_tfs = bull_tfs if ws > 0 else bear_tfs
-        tf_labels  = [tfs[k]["label"] for k in active_tfs]
-
-        direction = "CE (CALL)" if ws > 0 else "PE (PUT)"
-        dir_clr   = "#4ade80" if ws > 0 else "#f87171"
-
-        # Top reasons from most aligned timeframe
-        best_tf = max(tfs.items(), key=lambda x: abs(x[1].get("score", 0)))[1]
-        top_rsns = best_tf.get("reasons", [])[:3]
-
-        trade_hint = "INTRADAY" if len(active_tfs) <= 2 else "BTST / POSITIONAL"
+        ws          = r["weighted_score"]
+        ov, ov_clr  = r.get("overall", ("—", "#475569"))
+        color       = COLORS[sym]
+        label       = r["label"]
+        tfs         = r["timeframes"]
+        bull_tfs    = [k for k, t in tfs.items() if t.get("score", 0) > 0.5]
+        bear_tfs    = [k for k, t in tfs.items() if t.get("score", 0) < -0.5]
+        active_tfs  = bull_tfs if ws > 0 else bear_tfs
+        # Guard: use .get("label", k) to avoid KeyError on incomplete TF dicts
+        tf_lbls     = [tfs[k].get("label", k) for k in active_tfs if k in tfs]
+        direction   = "BUY CALL (CE)" if ws > 0 else "BUY PUT (PE)"
+        dir_clr     = "#4ade80" if ws > 0 else "#f87171"
+        trade_type  = "INTRADAY" if len(active_tfs) <= 2 else "BTST / POSITIONAL"
+        conf        = min(abs(ws) / 5 * 100, 95)
+        # Guard: use max on values directly, not items, to avoid label KeyError
+        best_tf_val = max(tfs.values(), key=lambda x: abs(x.get("score", 0)), default={})
+        top_rsns    = best_tf_val.get("reasons", [])[:2]
 
         rec_cards.append(dbc.Col(
-            dbc.Card(dbc.CardBody([
+            html.Div([
                 html.Div([
-                    html.Span(label, style={"color": color, "fontWeight": "800",
-                                            "fontSize": "0.72rem", **MONO}),
-                    html.Span(f"  {ov}", style={"color": ov_clr, "fontSize": "0.65rem", **MONO}),
-                ], style={"marginBottom": "4px"}),
+                    html.Span(label, style={"color":color,"fontWeight":"800",
+                                            "fontSize":"0.68rem",**MONO}),
+                    html.Span(f"  {conf:.0f}% conf",
+                              style={"color":"#475569","fontSize":"0.55rem",**MONO}),
+                ], style={"marginBottom":"5px"}),
+                html.Div(direction, style={
+                    "color":dir_clr,"fontWeight":"900","fontSize":"0.9rem",
+                    **MONO,"letterSpacing":"0.04em","marginBottom":"3px",
+                }),
+                html.Div(ov, style={"color":ov_clr,"fontSize":"0.62rem",
+                                     "fontWeight":"600",**MONO,"marginBottom":"6px"}),
+                html.Div(
+                    html.Div(className="conf-fill",
+                             style={"width":f"{conf:.0f}%",
+                                    "background":f"linear-gradient(90deg,{color},{dir_clr})"}),
+                    className="conf-track", style={"marginBottom":"6px"},
+                ),
                 html.Div([
-                    html.Span("TRADE: BUY ", style={"color": "#94a3b8", "fontSize": "0.62rem"}),
-                    html.Span(direction, style={"color": dir_clr, "fontWeight": "700",
-                                                "fontSize": "0.72rem", **MONO}),
-                ], style={"marginBottom": "4px"}),
-                html.Div(f"Type: {trade_hint}  |  TFs aligned: {' + '.join(tf_labels)}",
-                         style={"color": "#334155", "fontSize": "0.6rem", "marginBottom": "6px"}),
-                html.Div([
-                    html.Div([html.Span(icon + "  ", style={"fontSize": "0.65rem"}),
-                              html.Span(txt, style={"color": "#4a5568"})],
-                             style={"fontSize": "0.62rem", **MONO, "marginBottom": "2px"})
-                    for icon, txt in [("🟢" if b == "bull" else "🔴" if b == "bear" else "⚪", t)
-                                      for b, t in top_rsns]
-                ]),
-                html.Div(f"Confidence: {min(abs(ws)/5*100, 95):.0f}%  |  "
-                         f"Click {label} in left pane for exact strike",
-                         style={"color": "#1e3a5f", "fontSize": "0.6rem",
-                                "marginTop": "6px", "borderTop": "1px solid #111d2e",
-                                "paddingTop": "4px"}),
-            ]), style={
-                "background": "#080f1c",
-                "border":    f"1px solid {color}33",
-                "borderTop": f"2px solid {color}",
-                "borderRadius": "8px",
+                    html.Span(trade_type, style={"color":"#334155","fontSize":"0.54rem"}),
+                    html.Span(f"  ·  {' + '.join(tf_lbls)}" if tf_lbls else "",
+                              style={"color":"#1e3a5f","fontSize":"0.54rem"}),
+                ], style={"marginBottom":"5px"}),
+                *[html.Div([
+                    html.Span("▸ ", style={"color":color,"fontSize":"0.55rem"}),
+                    html.Span(txt, style={"color":"#334155","fontSize":"0.56rem",**MONO}),
+                ], style={"overflow":"hidden","textOverflow":"ellipsis","whiteSpace":"nowrap"})
+                  for _, txt in top_rsns],
+                html.Div(f"← click {label} in sidebar for exact strike",
+                         style={"color":"#1e2d40","fontSize":"0.5rem",
+                                "borderTop":f"1px solid {color}18",
+                                "marginTop":"7px","paddingTop":"4px"}),
+            ], className="rec-card", style={
+                "padding":"13px 15px","height":"100%",
+                "background":f"linear-gradient(140deg, #0a1020 0%, {color}0a 100%)",
+                "borderRadius":"10px","border":f"1px solid {color}22",
+                "borderLeft":f"3px solid {color}",
+                "boxShadow":"0 4px 20px rgba(0,0,0,.4)",
             }),
             md=4, className="mb-2 px-1",
         ))
 
+    # ── Session phase chip ────────────────────────────────────────────────────
+    PHASE_CLR = {"MORNING":"#22c55e","AFTERNOON":"#22c55e","OPENING":"#f59e0b",
+                 "LUNCH":"#f59e0b","PRE-CLOSE":"#f59e0b","CLOSE":"#ef4444"}
+    phase_clr      = PHASE_CLR.get(phase_name, "#64748b")
+    phase_dot_cls  = ("live-dot" if phase_name in ("MORNING","AFTERNOON")
+                      else "live-dot live-dot-amber" if phase_name in ("OPENING","LUNCH","PRE-CLOSE")
+                      else "live-dot live-dot-dead")
+
     return html.Div([
-        # Section header
+        # Header
         dbc.Row([
-            dbc.Col(html.Div("TRADE SIGNALS  —  MULTI-TIMEFRAME ANALYSIS", style={
-                "fontSize": "0.6rem", "letterSpacing": "0.15em",
-                "color": "#1e3a5f", "fontWeight": "600",
-            })),
-            dbc.Col(html.Div(f"Updated {updated}", style={
-                "fontSize": "0.58rem", "color": "#1e2d40",
-                "textAlign": "right",
-            })),
+            dbc.Col(html.Div([
+                html.Span("TRADE SIGNALS", style={"letterSpacing":"0.22em","color":"#1e3a5f",
+                                                    "fontWeight":"700","fontSize":"0.56rem"}),
+                html.Span("  ·  4-INDEX  MULTI-TIMEFRAME",
+                          style={"color":"#0f1e30","fontSize":"0.52rem"}),
+            ])),
+            dbc.Col(html.Div([
+                html.Span([
+                    html.Span(className=phase_dot_cls, style={"marginRight":"5px"}),
+                    html.Span(phase_name, style={"color":phase_clr,"fontWeight":"700",
+                                                  "fontSize":"0.58rem",**MONO}),
+                ], style={"marginRight":"14px"}),
+                html.Span(className="live-dot", style={"marginRight":"6px"}),
+                html.Span(f"Updated {updated}",
+                          style={"color":"#1e2d40","fontSize":"0.54rem",**MONO}),
+            ], style={"textAlign":"right","display":"flex",
+                      "alignItems":"center","justifyContent":"flex-end"})),
         ], className="mb-2 align-items-center"),
 
-        # Signal grid
-        dbc.Card(dbc.CardBody(grid),
-                 style={"background": "#0a1020", "border": "1px solid #111d2e",
-                        "borderRadius": "8px", "marginBottom": "10px"}),
+        # Phase caution message
+        html.Div([
+            html.Span(phase_caution, style={"color":"#f59e0b","fontSize":"0.58rem",**MONO}),
+        ], style={"marginBottom":"10px","paddingLeft":"2px"}) if phase_caution else html.Div(),
 
-        # Disclaimer
-        html.Div("* Algorithmic signals only. Not financial advice. Always use stop-loss.",
-                 style={"fontSize": "0.55rem", "color": "#1e2d40",
-                        "textAlign": "center", "marginBottom": "8px"}),
+        # 4×4 Signal matrix (primary data view)
+        signal_matrix,
 
-        # Recommendation cards
+        # 4 index verdict cards (always all 4)
+        dbc.Row(sig_cards, className="gx-2 mb-2"),
+
+        html.Div("Algorithmic signals only — not financial advice — always use a stop-loss.",
+                 style={"fontSize":"0.5rem","color":"#1e2d40",
+                        "textAlign":"center","marginBottom":"12px"}),
+
+        # Opportunity cards (only when strong signals exist)
         dbc.Row(rec_cards, className="gx-2") if rec_cards else html.Div(),
+    ], style={"animation":"slide-up .35s ease-out"})
+
+
+# ── 9-layer alignment strip (used inside trade ticket) ───────────────────────
+def _render_layer_alignment(rec: dict) -> html.Div:
+    """
+    Renders a compact 9-chip row showing each layer's score + direction.
+    Returns empty Div if rec has no layer_summary (neutral case).
+    """
+    ls = rec.get("layer_summary")
+    if not ls:
+        return html.Div()
+
+    LAYERS = [
+        ("tech",     "TECH"),
+        ("oi",       "OI"),
+        ("velocity", "VEL"),
+        ("inst",     "INST"),
+        ("futures",  "FUT"),
+        ("iv",       "IV"),
+        ("pcr",      "PCR"),
+        ("mp",       "MP"),
+        ("context",  "CTX"),
+    ]
+
+    chips = []
+    for key, short in LAYERS:
+        info  = ls.get(key, {})
+        score = info.get("score", 0) or 0
+        lbl   = info.get("label", short)
+        clr   = "#22c55e" if score > 0.15 else "#ef4444" if score < -0.15 else "#475569"
+        cls   = "tf-bull" if score > 0.15 else "tf-bear" if score < -0.15 else "tf-neut"
+        chips.append(html.Div([
+            html.Div(short, style={"fontSize":"0.5rem","color":"#334155",
+                                    "letterSpacing":"0.06em","marginBottom":"2px",
+                                    "textAlign":"center"}),
+            html.Span(f"{score:+.1f}" if score != 0 else "0.0",
+                      className=f"tf-pill {cls}",
+                      style={"fontSize":"0.52rem","padding":"1px 6px","display":"block",
+                             "textAlign":"center"},
+                      title=lbl),
+        ], style={"flex":"1","minWidth":"38px","textAlign":"center"}))
+
+    agree = ls.get("agree", "")
+    phase = ls.get("phase", "")
+    n_aligned = int(agree.split("/")[0]) if "/" in agree else 0
+    agree_pct = n_aligned / 9 * 100
+
+    return html.Div([
+        html.Div([
+            html.Span("9-LAYER ALIGNMENT", style={"color":"#1e3a5f","fontSize":"0.53rem",
+                                                    "letterSpacing":"0.14em","fontWeight":"700"}),
+            html.Span(f"  {agree}", style={"color":"#475569","fontSize":"0.55rem",**MONO}),
+            html.Span(f"  {phase}", style={"color":"#334155","fontSize":"0.52rem",**MONO}),
+            # Alignment progress bar
+            html.Div(html.Div(className="conf-fill",
+                              style={"width":f"{agree_pct:.0f}%","background":"#00d4ff"}),
+                     className="conf-track",
+                     style={"display":"inline-block","width":"80px",
+                            "verticalAlign":"middle","marginLeft":"10px"}),
+        ], style={"marginBottom":"6px"}),
+        html.Div(chips, style={"display":"flex","gap":"4px","flexWrap":"wrap"}),
     ])
 
 
@@ -1216,122 +2305,212 @@ def _render_trade_rec(rec: dict, sym: str) -> html.Div:
         return html.Div()
 
     color = COLORS.get(sym, "#00d4ff")
-    MONO_S = {**MONO, "fontSize": "0.7rem"}
 
     if rec.get("neutral"):
         return dbc.Card(dbc.CardBody([
-            html.Div(rec["tf_label"], style={"color":"#334155","fontSize":"0.6rem","marginBottom":"4px"}),
-            html.Div(rec["signal"], style={"color":rec["color"],"fontWeight":"700",**MONO_S}),
-            html.Div("No trade recommended — signal too weak or mixed.",
-                     style={"color":"#475569","fontSize":"0.65rem","marginTop":"4px"}),
+            html.Div([
+                html.Span(rec["tf_label"], style={"color":"#334155","fontSize":"0.6rem","marginRight":"8px"}),
+                html.Span(rec["signal"], style={"color":rec["color"],"fontWeight":"700",
+                                                 **MONO,"fontSize":"0.7rem"}),
+            ], style={"marginBottom":"6px"}),
+            html.Div("No trade setup — signal too weak or conflicting timeframes.",
+                     style={"color":"#475569","fontSize":"0.65rem"}),
+            html.Div(html.Div(style={"width":"18%","height":"100%","background":"#334155",
+                                      "borderRadius":"3px"}),
+                     className="conf-track", style={"marginTop":"10px"}),
         ]), style={"background":"#080f1c","border":f"1px solid {color}22",
                    "borderLeft":f"3px solid {color}","borderRadius":"8px","marginBottom":"10px"})
 
     dir_clr  = rec["dir_clr"]
+    conf     = rec.get("confidence", 0)
     warn_clr = "#f59e0b" if "CAUTION" in rec.get("warning","") else "#22c55e"
+    conf_clr = "#22c55e" if conf >= 70 else "#f59e0b" if conf >= 45 else "#ef4444"
 
-    def _row(label, value, val_clr="#e2e8f0"):
-        return dbc.Row([
-            dbc.Col(html.Span(label, style={"color":"#334155","fontSize":"0.6rem"}), width=4),
-            dbc.Col(html.Span(value, style={"color":val_clr,"fontWeight":"600",**MONO_S}), width=8),
-        ], className="mb-1")
+    def _metric(label, value, val_clr="#94a3b8", big=False):
+        return html.Div([
+            html.Div(label, style={"color":"#334155","fontSize":"0.53rem",
+                                    "letterSpacing":"0.08em","marginBottom":"1px"}),
+            html.Div(value, style={"color":val_clr,
+                                    "fontWeight":"700" if big else "600",
+                                    "fontSize":"0.78rem" if big else "0.67rem",**MONO}),
+        ], style={"marginBottom":"8px"})
 
-    # Slot label for the option
-    slot_sym = f"NSE:{LABELS.get(sym,'?').replace(' ','')}{rec['exp_date'][:6].replace('-','').replace(' ','')}{rec['strike']}{rec['direction']}"
+    # ── Price zone visual bar ─────────────────────────────────────────────────
+    sl = rec.get("sl", 0); entry_lo = rec.get("entry_lo", 0)
+    entry_hi = rec.get("entry_hi", 0); t1 = rec.get("t1", 0)
+    t2 = rec.get("t2", 0); ltp = rec.get("ltp", 0) or 1
+    if sl and t2:
+        z_min = min(sl, ltp) * 0.97
+        z_max = max(t2, ltp) * 1.03
+        z_rng = z_max - z_min or 1
+        def _pp(v): return max(0.0, min((v - z_min) / z_rng * 100, 100))
+        sl_p  = _pp(sl);   lo_p = _pp(entry_lo); hi_p = _pp(entry_hi)
+        t1_p  = _pp(t1);   t2_p = _pp(t2)
+        ez_w  = max(hi_p - lo_p, 1)
+        price_zone = html.Div([
+            html.Div("PRICE ZONE", style={"color":"#334155","fontSize":"0.54rem",
+                                           "letterSpacing":"0.12em","marginBottom":"6px",
+                                           "fontWeight":"700"}),
+            html.Div(style={
+                "position":"relative","height":"8px","borderRadius":"4px",
+                "background":"linear-gradient(90deg,rgba(239,68,68,.2) 0%,rgba(251,191,36,.3) 35%,rgba(74,222,128,.35) 70%,rgba(34,197,94,.5) 100%)",
+                "marginBottom":"6px",
+            }, children=[
+                html.Div(style={"position":"absolute","left":f"{sl_p:.1f}%",
+                                 "top":"-3px","width":"2px","height":"14px",
+                                 "background":"#ef4444","borderRadius":"1px"}),
+                html.Div(style={"position":"absolute","left":f"{lo_p:.1f}%",
+                                 "width":f"{ez_w:.1f}%","height":"8px",
+                                 "background":"rgba(251,191,36,.65)","borderRadius":"2px"}),
+                html.Div(style={"position":"absolute","left":f"{t1_p:.1f}%",
+                                 "top":"-3px","width":"2px","height":"14px",
+                                 "background":"#4ade80","borderRadius":"1px"}),
+                html.Div(style={"position":"absolute","left":f"{t2_p:.1f}%",
+                                 "top":"-3px","width":"2px","height":"14px",
+                                 "background":"#22c55e","borderRadius":"1px"}),
+            ]),
+            html.Div([
+                html.Span(f"SL {sl}", style={"color":"#f87171","fontSize":"0.55rem",**MONO}),
+                html.Span(f"Entry {entry_lo}–{entry_hi}",
+                          style={"color":"#fbbf24","fontSize":"0.55rem",**MONO,"margin":"0 10px"}),
+                html.Span(f"T1 {t1}", style={"color":"#4ade80","fontSize":"0.55rem",**MONO,"marginRight":"10px"}),
+                html.Span(f"T2 {t2}", style={"color":"#22c55e","fontSize":"0.55rem",**MONO}),
+            ]),
+        ], style={"marginBottom":"12px"})
+    else:
+        price_zone = html.Div()
 
-    return dbc.Card(dbc.CardBody([
-        # Header
-        dbc.Row([
-            dbc.Col([
-                html.Div(rec["tf_label"], style={"color":"#334155","fontSize":"0.58rem","letterSpacing":"0.1em"}),
-                html.Div([
-                    html.Span(rec["signal"]+"  ", style={"color":rec["color"],"fontWeight":"800","fontSize":"0.9rem",**MONO}),
-                    html.Span(f"Confidence {rec['confidence']:.0f}%  ({rec['conviction']})",
-                              style={"color":"#475569","fontSize":"0.65rem"}),
-                ]),
-            ], md=5),
-            dbc.Col([
-                html.Div([
-                    html.Span("RECOMMENDATION:  ", style={"color":"#334155","fontSize":"0.62rem"}),
-                    html.Span(f"BUY {rec['dir_label']}", style={"color":dir_clr,"fontWeight":"800",
-                              "fontSize":"0.85rem",**MONO}),
-                ]),
-                html.Div(f"Trade type: {rec['trade_type']}",
-                         style={"color":"#334155","fontSize":"0.6rem"}),
-            ], md=7),
-        ], className="mb-2"),
-
-        html.Hr(style={"borderColor":"#111d2e","margin":"6px 0"}),
-
-        dbc.Row([
-            # Left: trade details
-            dbc.Col([
-                html.Div("TRADE DETAILS", style={"color":"#1e3a5f","fontSize":"0.58rem",
-                         "letterSpacing":"0.12em","marginBottom":"6px"}),
-                _row("Option",  f"{rec['strike']:,.0f} {rec['direction']}  ·  Expiry {rec['exp_date']}", dir_clr),
-                _row("Entry",   f"₹ {rec['entry_lo']} – {rec['entry_hi']}", "#e2e8f0"),
-                _row("Stop Loss",f"₹ {rec['sl']}  ({int(TF_PROFILES[list(TF_PROFILES)[0]['sl_pct']*100 if False else 0] if False else rec['sl']/(rec['ltp'] or 1)*100-100):.0f}%)" if False
-                                  else f"₹ {rec['sl']}  (Index SL ≈ {rec['spot_sl']:,.0f})", "#ef4444"),
-                _row("Target 1", f"₹ {rec['t1']}  (+{int((rec['t1']/rec['ltp']-1)*100)}%)"
-                                  f"  →  ₹{rec['profit_t1']:,.0f}/lot", "#4ade80"),
-                _row("Target 2", f"₹ {rec['t2']}  (+{int((rec['t2']/rec['ltp']-1)*100)}%)"
-                                  f"  →  ₹{rec['profit_t2']:,.0f}/lot", "#22c55e"),
-                _row("R : R",    f"1 : {rec['rr']}", "#fbbf24"),
-                _row("Max Loss",  f"₹ {rec['loss_lot']:,.0f} / lot  ({rec['lot_size']} shares)", "#f87171"),
-            ], md=5),
-
-            # Middle: Greeks + OI
-            dbc.Col([
-                html.Div("OPTION DETAILS", style={"color":"#1e3a5f","fontSize":"0.58rem",
-                         "letterSpacing":"0.12em","marginBottom":"6px"}),
-                _row("LTP",    f"₹ {rec['ltp']:.2f}"),
-                _row("IV",     f"{rec['iv']:.1f}%"),
-                _row("Delta",  f"{rec['delta']:.3f}"),
-                _row("Theta",  f"{rec['theta']:.2f}  (daily decay)"),
-                _row("Vega",   f"{rec['vega']:.2f}"),
-                _row("OI",     _fmt_oi(rec["oi"])),
-                _row("Volume", _fmt_oi(rec["volume"])),
-                html.Div(rec["iv_context"], style={"color":"#475569","fontSize":"0.6rem","marginTop":"4px"}),
-            ], md=3),
-
-            # Right: why this trade
-            dbc.Col([
-                html.Div("WHY THIS TRADE?", style={"color":"#1e3a5f","fontSize":"0.58rem",
-                         "letterSpacing":"0.12em","marginBottom":"6px"}),
-                html.Div([
+    return dbc.Card([
+        # ── Colored header band ───────────────────────────────────────────────
+        html.Div([
+            dbc.Row([
+                dbc.Col([
+                    html.Div(rec["tf_label"],
+                             style={"color":"rgba(255,255,255,.4)","fontSize":"0.54rem",
+                                    "letterSpacing":"0.12em"}),
                     html.Div([
-                        html.Span(("✓ " if b == "bull" and rec.get("direction")=="CE"
-                                   else "✓ " if b == "bear" and rec.get("direction")=="PE"
-                                   else "✗ " if b == "bear" else "– "),
-                                  style={"color":"#4ade80" if b in ("bull","neut") else "#f87171"}),
+                        html.Span(rec["signal"] + " ",
+                                  style={"color":"white","fontWeight":"800","fontSize":"0.92rem",**MONO}),
+                        html.Span(f"({rec['conviction']})",
+                                  style={"color":"rgba(255,255,255,.45)","fontSize":"0.62rem"}),
+                    ], style={"marginTop":"2px"}),
+                ], md=5),
+                dbc.Col([
+                    html.Div("RECOMMENDATION",
+                             style={"color":"rgba(255,255,255,.4)","fontSize":"0.52rem",
+                                    "letterSpacing":"0.14em"}),
+                    html.Div(f"BUY {rec['dir_label']}", style={
+                        "color":"white","fontWeight":"900","fontSize":"0.95rem",
+                        **MONO,"letterSpacing":"0.04em","marginTop":"2px",
+                    }),
+                ], md=4),
+                dbc.Col([
+                    html.Div("CONFIDENCE",
+                             style={"color":"rgba(255,255,255,.4)","fontSize":"0.52rem",
+                                    "letterSpacing":"0.1em","textAlign":"right"}),
+                    html.Div(f"{conf:.0f}%", style={
+                        "color":conf_clr,"fontWeight":"900","fontSize":"1.25rem",
+                        **MONO,"textAlign":"right","marginTop":"2px",
+                    }),
+                    html.Div(html.Div(className="conf-fill",
+                                      style={"width":f"{conf:.0f}%","background":conf_clr}),
+                             className="conf-track", style={"marginTop":"5px"}),
+                ], md=3),
+            ], className="align-items-center"),
+        ], style={
+            "background": f"linear-gradient(135deg, {dir_clr}20 0%, {dir_clr}08 100%)",
+            "borderBottom": f"1px solid {dir_clr}28",
+            "padding": "14px 18px",
+        }),
+
+        # ── 9-Layer Alignment Panel ───────────────────────────────────────────
+        html.Div(_render_layer_alignment(rec), style={
+            "borderBottom":"1px solid #0d1a2a",
+            "padding":"10px 18px",
+            "background":"rgba(0,0,0,.25)",
+        }),
+
+        # ── Body ─────────────────────────────────────────────────────────────
+        dbc.CardBody([
+            price_zone,
+            dbc.Row([
+                # Trade details
+                dbc.Col([
+                    html.Div("TRADE DETAILS", style={"color":"#1e3a5f","fontSize":"0.54rem",
+                             "letterSpacing":"0.14em","marginBottom":"8px","fontWeight":"700"}),
+                    _metric("OPTION", f"{rec['strike']:,.0f} {rec['direction']}  ·  {rec['exp_date']}",
+                            dir_clr, big=True),
+                    _metric("ENTRY ZONE",  f"₹ {rec['entry_lo']} — {rec['entry_hi']}", "#fbbf24"),
+                    _metric("STOP LOSS",   f"₹ {rec['sl']}  (Index ≈ {rec['spot_sl']:,.0f})", "#ef4444"),
+                    _metric("TARGET 1",
+                            f"₹ {rec['t1']}  +{int((rec['t1']/ltp-1)*100)}%  →  ₹{rec['profit_t1']:,.0f}/lot",
+                            "#4ade80"),
+                    _metric("TARGET 2",
+                            f"₹ {rec['t2']}  +{int((rec['t2']/ltp-1)*100)}%  →  ₹{rec['profit_t2']:,.0f}/lot",
+                            "#22c55e"),
+                    _metric("RISK : REWARD",  f"1 : {rec['rr']}", "#fbbf24"),
+                    _metric("MAX LOSS / LOT", f"₹ {rec['loss_lot']:,.0f}  ({rec['lot_size']} shares)", "#f87171"),
+                    _metric("TRADE TYPE",     rec.get("trade_type","—"), "#475569"),
+                ], md=5),
+
+                # Greeks + OI
+                dbc.Col([
+                    html.Div("OPTION DETAILS", style={"color":"#1e3a5f","fontSize":"0.54rem",
+                             "letterSpacing":"0.14em","marginBottom":"8px","fontWeight":"700"}),
+                    _metric("LTP",    f"₹ {rec['ltp']:.2f}", "#e2e8f0", big=True),
+                    _metric("IV",     f"{rec['iv']:.1f}%"),
+                    _metric("DELTA",  f"{rec['delta']:.3f}"),
+                    _metric("THETA",  f"{rec['theta']:.2f}  / day"),
+                    _metric("VEGA",   f"{rec['vega']:.2f}"),
+                    _metric("OI",     _fmt_oi(rec["oi"])),
+                    _metric("VOLUME", _fmt_oi(rec["volume"])),
+                    html.Div(rec["iv_context"],
+                             style={"color":"#334155","fontSize":"0.6rem","marginTop":"4px"}),
+                ], md=3),
+
+                # Why this trade
+                dbc.Col([
+                    html.Div("WHY THIS TRADE?", style={"color":"#1e3a5f","fontSize":"0.54rem",
+                             "letterSpacing":"0.14em","marginBottom":"8px","fontWeight":"700"}),
+                    *[html.Div([
+                        html.Span(
+                            ("✓ " if (b=="bull" and rec.get("direction")=="CE")
+                                  or (b=="bear" and rec.get("direction")=="PE")
+                             else "· " if b=="neut"
+                             else "✗ "),
+                            style={"color": (
+                                "#4ade80" if (b=="bull" and rec.get("direction")=="CE")
+                                          or (b=="bear" and rec.get("direction")=="PE")
+                                else "#f87171" if b != "neut"
+                                else "#334155"),
+                                   "fontWeight":"700","marginRight":"4px"}),
                         html.Span(t, style={"color":"#475569","fontSize":"0.62rem"}),
-                    ], style={"marginBottom":"3px"})
-                    for b, t in rec["tech_reasons"][:4]
-                ]),
-                html.Div([
-                    html.Div([
-                        html.Span("▸ ", style={"color":"#334155"}),
+                    ], style={"marginBottom":"4px","display":"flex","alignItems":"flex-start"})
+                      for b, t in rec["tech_reasons"][:4]],
+                    *[html.Div([
+                        html.Span("▸ ", style={"color":"#334155","marginRight":"3px"}),
                         html.Span(t, style={"color":"#334155","fontSize":"0.6rem"}),
                     ], style={"marginBottom":"3px"})
-                    for b, t in rec["opt_signals"]
-                ]),
-                html.Div(rec.get("fut_context",""), style={"color":"#334155","fontSize":"0.6rem","marginTop":"4px"}),
-            ], md=4),
+                      for b, t in rec["opt_signals"]],
+                    html.Div(rec.get("fut_context",""),
+                             style={"color":"#334155","fontSize":"0.6rem","marginTop":"4px"}),
+                ], md=4),
+            ]),
+
+            html.Div([
+                html.Span("⚠  ", style={"fontSize":"0.72rem","marginRight":"4px"}),
+                html.Span(rec["warning"], style={"fontSize":"0.62rem",**MONO}),
+            ], style={
+                "color": warn_clr, "background": "#060d18",
+                "padding": "8px 12px", "borderRadius": "5px",
+                "marginTop": "8px", "border": f"1px solid {warn_clr}22",
+            }) if rec.get("warning") else html.Div(),
         ]),
-
-        # Warning bar
-        html.Div(f"⚠ {rec['warning']}", style={
-            "color": warn_clr, "fontSize": "0.62rem",
-            "background": "#0a1525", "padding": "6px 10px",
-            "borderRadius": "4px", "marginTop": "8px",
-            **MONO,
-        }) if rec.get("warning") else html.Div(),
-
-    ]), style={
+    ], className="trade-ticket", style={
         "background": "#080f1c",
         "border":     f"1px solid {color}33",
-        "borderTop":  f"3px solid {dir_clr}",
         "borderRadius": "8px",
+        "overflow": "hidden",
         "marginBottom": "10px",
     })
 
@@ -1453,11 +2632,29 @@ def update_overview(_, sel):
         o=t.get("open_price",0); h=t.get("high_price",0); l=t.get("low_price",0); pc=t.get("prev_close_price",0)
         up=ch>=0; clr="#22c55e" if up else "#ef4444"; s="+" if up else ""
         ltps.append(f"{ltp:,.2f}")
-        ltp_s.append({**MONO,"fontSize":"2rem","fontWeight":"bold","color":clr,"lineHeight":"1"})
+        ltp_s.append({**MONO,"fontSize":"2.2rem","fontWeight":"900","color":clr,
+                       "lineHeight":"1","letterSpacing":"-0.03em"})
         chgs.append(f"{'▲' if up else '▼'}  {s}{ch:,.2f}   {s}{chp:.2f}%")
-        chg_s.append({**MONO,"fontSize":"0.88rem","marginTop":"5px","color":clr})
-        ohlpcs.append(html.Div([html.Div(f"O   {o:>11,.2f}"),html.Div(f"H   {h:>11,.2f}"),
-                                html.Div(f"L   {l:>11,.2f}"),html.Div(f"PC  {pc:>11,.2f}")]))
+        chg_s.append({**MONO,"fontSize":"0.88rem","marginTop":"5px","color":clr,"fontWeight":"600"})
+        _lbl = {"color":"#1e3a5f","fontSize":"0.62rem"}
+        # Visual H/L range bar: show where current LTP sits between day's High and Low
+        if h and l and h != l:
+            _rng_pct = max(0, min((ltp - l) / (h - l) * 100, 100))
+            _rng_bar = html.Div([
+                html.Div(style={"width":f"{_rng_pct:.1f}%","height":"100%",
+                                "background":clr,"borderRadius":"2px",
+                                "transition":"width .5s ease"}),
+            ], style={"height":"4px","borderRadius":"2px","marginBottom":"8px",
+                      "background":"rgba(255,255,255,.05)","overflow":"hidden"})
+        else:
+            _rng_bar = html.Div()
+        ohlpcs.append(html.Div([
+            _rng_bar,
+            html.Div([html.Span("O  ",style=_lbl), html.Span(f"{o:>10,.2f}",style={"color":"#64748b"})]),
+            html.Div([html.Span("H  ",style=_lbl), html.Span(f"{h:>10,.2f}",style={"color":"#4ade80","fontWeight":"600"})]),
+            html.Div([html.Span("L  ",style=_lbl), html.Span(f"{l:>10,.2f}",style={"color":"#f87171","fontWeight":"600"})]),
+            html.Div([html.Span("PC ",style=_lbl), html.Span(f"{pc:>10,.2f}",style={"color":"#94a3b8"})]),
+        ]))
     fig = go.Figure()
     fig.update_layout(
         paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD,
@@ -1753,6 +2950,16 @@ def update_trade_rec(tf_key, _, expiry, sym):
     )
 
     return _render_trade_rec(rec, sym), _render_velocity_panel(sym)
+
+
+# ── Callback: sidebar prediction block (30-second refresh via setup-tick) ─────
+@app.callback(
+    Output("sidebar-pred", "children"),
+    Input("signal-tick",   "n_intervals"),
+    Input("setup-tick",    "n_intervals"),
+)
+def update_sidebar_pred(*_):
+    return _render_sidebar_pred()
 
 
 # ── Callback: daily context panel (60-second refresh, same interval) ──────────

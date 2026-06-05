@@ -315,7 +315,7 @@ class FyersClient:
                 "date_format": 1,
                 "range_from":  range_from,
                 "range_to":    range_to,
-                "cont_flag":   "",
+                "cont_flag":   "1",
             },
             timeout=25,
         )
@@ -479,7 +479,7 @@ def compute_vwap(df: pd.DataFrame) -> pd.Series:
     grp_date = df["timestamp"].dt.date
     cum_tpv  = tpv.groupby(grp_date).cumsum()
     cum_vol  = df["volume"].groupby(grp_date).cumsum()
-    return cum_tpv / cum_vol
+    return cum_tpv / cum_vol.replace(0, float("nan"))
 
 
 def signal_from_indicators(df: pd.DataFrame) -> dict:

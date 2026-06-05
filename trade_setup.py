@@ -36,6 +36,28 @@ except Exception:
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
+
+# ── DB helper (non-blocking; lazy-import avoids circular deps) ────────────────
+
+def _idb_write_setup(
+    sym: str, tf: str, signal: str,
+    composite: float, confidence: float, direction: str,
+    l1: float, l2: float, l3: float, l4: float, l5: float,
+    l6: float, l7: float, l8: float, l9: float,
+    agreement: int, phase: str, spot: float, atm_iv: float,
+) -> None:
+    try:
+        from intraday_db import idb
+        idb.write_setup(
+            sym, tf, signal,
+            composite, int(confidence), direction,
+            l1, l2, l3, l4, l5, l6, l7, l8, l9,
+            agreement, phase, spot, atm_iv,
+        )
+    except Exception:
+        pass
+
+
 # ── Timeframe profiles ────────────────────────────────────────────────────────
 TF_PROFILES = {
     "5min":  {"label": "5 Min  (Intraday Scalp)",    "trade": "INTRADAY SCALP",
@@ -770,11 +792,25 @@ def build_recommendation(
     raw_conf    = min(abs(composite) / 2.5 * 100, 95)
     align_bonus = (agreement - 5) * 5
     confidence  = min(max(round((raw_conf + align_bonus) * phase_mult, 0), 0), 95)
+    # Hard floor: strong composite magnitude cannot override genuinely split signals.
+    # Only applied when ≤2 layers agree — this is the case where one anomalously
+    # high layer is dragging the composite while 7 others are neutral/opposing.
+    # 3 layers is NOT capped: Layer9 (17%) + Layer1 (25%) + Layer4 (10%) = 52%
+    # of total weight agreeing is a legitimate high-conviction setup.
+    if agreement <= 2:
+        confidence = min(confidence, 35)   # 2/9 agreeing = speculative at best
 
     # Neutral — no clear edge.
     # Threshold matches _composite()'s neutral band (±0.40) exactly,
     # so we never return a trade with signal="NEUTRAL".
     if abs(composite) < 0.40:
+        _idb_write_setup(
+            sym, tf_key, "NEUTRAL",
+            composite, confidence, "",
+            round(tech_score / 2, 2), oi_score, vel_score, inst_score,
+            fut_score, iv_score, pcr_score, mp_score, ctx_score,
+            agreement, phase_name, spot, atm_iv,
+        )
         return {
             "signal":     "NEUTRAL — No Clear Edge",
             "color":      "#94a3b8",
@@ -877,7 +913,7 @@ def build_recommendation(
 
     # Layered signals for "WHY THIS TRADE?" panel (combine all layers)
     all_opt_signals = (
-        ctx_signals[:3] +          # Daily context first — structural EOD setup
+        ctx_signals[:6] +          # Daily context first — structural EOD setup (B1-B8)
         vel_signals[:2] +          # Intraday velocity next
         inst_signals[:2] +
         oi_signals[:2] +
@@ -906,6 +942,21 @@ def build_recommendation(
         "agree":    f"{agreement}/9 layers aligned",
         "phase":    phase_name,
     }
+
+    _idb_write_setup(
+        sym, tf_key, verdict,
+        composite, confidence, direction,
+        layer_summary["tech"]["score"],
+        layer_summary["oi"]["score"],
+        layer_summary["velocity"]["score"],
+        layer_summary["inst"]["score"],
+        layer_summary["futures"]["score"],
+        layer_summary["iv"]["score"],
+        layer_summary["pcr"]["score"],
+        layer_summary["mp"]["score"],
+        layer_summary["context"]["score"],
+        agreement, phase_name, spot, atm_iv,
+    )
 
     return {
         "signal":       verdict,

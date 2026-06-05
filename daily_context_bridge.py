@@ -2,7 +2,7 @@
 daily_context_bridge.py  --  EOD structural context bridge.
 
 Connects Tradebot to Daily_Cash_Market's DuckDB (read-only) and extracts
-the six sub-signals that form Layer 9: Daily Context (17% weight).
+the seven sub-signals that form Layer 9: Daily Context (17% weight).
 
 Sub-signals (each clamped to [-4, +4]):
   B1  Prediction Engine   24-signal EOD directional forecast + accuracy weight
@@ -11,6 +11,13 @@ Sub-signals (each clamped to [-4, +4]):
   B4  Market Breadth       % sectors advancing + NIFTY heavyweight confirmation
   B5  VIX Regime           India VIX level and 5-day change
   B6  EOD OI Positioning   End-of-day PCR and OI change direction
+  B7  FPI Capital Flows    FPI net equity investment 5D/10D (macro driver of NIFTY)
+
+Data source priority (fastest → most authoritative):
+  1. Local SQLite snapshot  data/tradebot_context.db  written by nightly_sync.py
+     at 7:30 PM every weekday — preferred when today's sync is available.
+  2. Live DuckDB read from Daily_Cash_Market's market_data.duckdb — fallback
+     when no local snapshot exists or snapshot is from a prior day.
 
 Key design decisions:
   - Read-only DuckDB access — never blocks or corrupts the source DB
@@ -28,6 +35,7 @@ Usage:
 """
 
 import datetime
+import sqlite3
 import sys
 import threading
 import time
@@ -35,8 +43,9 @@ from pathlib import Path
 from typing import Optional
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-DB_PATH   = Path(r"D:\Python Projects\Daily_Cash_Market\data\market_data.duckdb")
-CACHE_TTL = 4 * 3600   # 4 hours — EOD data, stable during trading hours
+DB_PATH      = Path(r"D:\Python Projects\Daily_Cash_Market\data\market_data.duckdb")
+LOCAL_DB     = Path(__file__).parent / "data" / "tradebot_context.db"
+CACHE_TTL    = 4 * 3600   # 4 hours — EOD data, stable during trading hours
 
 # Symbol mapping: Fyers → Daily_Cash_Market fno_symbol
 _SYM = {
@@ -130,6 +139,9 @@ class DailyContextBridge:
             "pred_range_high":   data.get("range_high"),
             "pred_target":       data.get("target_close"),
             "pred_move_pts":     data.get("expected_move_pts"),
+            "max_pain_price":    data.get("max_pain_price"),
+            "max_pain_dist_pct": data.get("max_pain_dist_pct"),
+            "nearest_expiry":    data.get("nearest_expiry"),
         }
 
     def get_panel_data(self, fyers_sym: str) -> dict:
@@ -154,24 +166,80 @@ class DailyContextBridge:
 
     # ── Cache management ───────────────────────────────────────────────────────
 
+    def _sqlite_has_newer_data(self) -> bool:
+        """
+        Return True if the local SQLite snapshot was written AFTER the current
+        in-memory cache was loaded.
+
+        This lets the bridge detect a fresh nightly_sync run (typically 7:30 PM)
+        without waiting for the 4-hour TTL to expire.  The check is a single
+        lightweight SQLite row fetch — negligible cost at the 60-second callback
+        frequency.
+        """
+        if not LOCAL_DB.exists():
+            return False
+        try:
+            con = sqlite3.connect(str(LOCAL_DB), timeout=5.0)
+            row = con.execute(
+                "SELECT synced_at FROM sync_metadata WHERE status = 'ok' "
+                "ORDER BY sync_date DESC LIMIT 1"
+            ).fetchone()
+            con.close()
+            if not row or not row[0]:
+                return False
+            # synced_at is stored as ISO-8601 string, e.g. "2026-06-03T19:30:05"
+            synced_ts = datetime.datetime.fromisoformat(str(row[0])[:19]).timestamp()
+            with self._lock:
+                loaded = self._loaded_at
+            return synced_ts > loaded
+        except Exception:
+            return False
+
     def _maybe_refresh(self):
         with self._lock:
             age     = time.time() - self._loaded_at
             loading = self._loading
-        # Only launch one refresh thread at a time — prevents thundering herd
-        # when multiple Dash callbacks fire simultaneously on a stale cache.
-        if age > CACHE_TTL and not loading:
-            with self._lock:
-                # Double-check under lock; another thread may have won the race
-                if not self._loading:
-                    self._loading = True
-                else:
-                    return
-            threading.Thread(target=self._load, daemon=True, name="dcb-refresh").start()
+
+        if loading:
+            return  # refresh already in flight
+
+        # Trigger a reload when:
+        #   (a) TTL expired (4 hours, keeps data fresh during long sessions), OR
+        #   (b) nightly_sync wrote new data to SQLite since we last loaded
+        #       — detects the 7:30 PM update within one 60-second callback cycle
+        needs_refresh = (age > CACHE_TTL) or self._sqlite_has_newer_data()
+
+        if not needs_refresh:
+            return
+
+        with self._lock:
+            # Double-check under lock — another thread may have won the race
+            if self._loading:
+                return
+            self._loading = True
+        threading.Thread(target=self._load, daemon=True, name="dcb-refresh").start()
 
     def _load(self):
-        """Fetch all context in a single DuckDB session and update cache atomically."""
+        """
+        Populate cache from the best available data source.
+
+        Preference:
+          1. Local SQLite snapshot (data/tradebot_context.db) — written by
+             nightly_sync.py at 7:30 PM.  Fast, no lock contention with
+             Daily_Cash_Market while it writes.  Used when today's sync is present.
+          2. Live DuckDB read — same queries as before, used as fallback when
+             local snapshot is absent or from a prior trading day.
+        """
         try:
+            local_cache = self._try_load_from_local()
+            if local_cache is not None:
+                with self._lock:
+                    self._cache     = local_cache
+                    self._loaded_at = time.time()
+                    self._available = True
+                return
+
+            # Fallback: live DuckDB read
             if not DB_PATH.exists():
                 with self._lock:
                     self._available = False
@@ -194,13 +262,199 @@ class DailyContextBridge:
                     self._available  = True
 
             except Exception as exc:
-                print(f"[DCBridge] load failed: {exc}", file=sys.stderr)
+                print(f"[DCBridge] live DuckDB load failed: {exc}", file=sys.stderr)
                 with self._lock:
                     self._available = False
         finally:
-            # Always clear the loading flag so future refreshes can proceed
             with self._lock:
                 self._loading = False
+
+    def _try_load_from_local(self) -> "dict | None":
+        """
+        Read today's pre-computed snapshot from data/tradebot_context.db.
+
+        Returns populated cache dict if today's sync exists with status='ok',
+        or None if local DB is absent / stale / failed.
+        """
+        if not LOCAL_DB.exists():
+            return None
+
+        try:
+            con = sqlite3.connect(str(LOCAL_DB), timeout=5.0)
+
+            # Accept the most recent successful sync within the last 3 calendar days.
+            # The nightly sync runs at 7:30 PM and stores sync_date = that calendar
+            # date (e.g., Jun 3).  The dashboard starts the next morning (Jun 4) and
+            # must still pick up Jun 3's snapshot rather than returning None.
+            row = con.execute(
+                "SELECT sync_date FROM sync_metadata WHERE status = 'ok' "
+                "ORDER BY sync_date DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                con.close()
+                return None   # no successful sync at all → fall through to DuckDB
+
+            sync_date = row[0]   # e.g., "2026-06-03"
+            try:
+                age_days = (datetime.date.today() -
+                            datetime.date.fromisoformat(sync_date[:10])).days
+            except Exception:
+                age_days = 99
+            if age_days > 3:
+                con.close()
+                return None   # sync is stale (>3 days) → fall through to DuckDB
+
+            # ── Market-wide context ───────────────────────────────────────────
+            mc_row = con.execute(
+                "SELECT india_vix, india_vix_5d_chg, breadth_pct, heavy_breadth_pct, "
+                "fii_market_5d_cr, fii_market_10d_cr, fii_market_5d_pos, "
+                "nifty50_avg_deliv_pct, nifty50_high_deliv_count "
+                "FROM market_context WHERE sync_date = ?", [sync_date]
+            ).fetchone()
+
+            common: dict = {}
+            if mc_row:
+                common["india_vix"]              = mc_row[0]
+                common["india_vix_5d_chg"]       = mc_row[1]
+                common["breadth_pct"]            = mc_row[2]
+                common["heavy_breadth_pct"]      = mc_row[3]
+                common["fii_market_5d_cr"]       = mc_row[4]
+                common["fii_market_10d_cr"]      = mc_row[5]
+                common["fii_market_5d_pos"]      = mc_row[6]
+                common["avg_deliv_pct"]          = mc_row[7]
+                common["high_deliv_count"]       = mc_row[8]
+                common["latest_date"]            = datetime.date.fromisoformat(sync_date[:10])
+
+            # ── Per-symbol context ────────────────────────────────────────────
+            rows = con.execute("""
+                SELECT
+                    fyers_sym, dcm_sym,
+                    prev_close, eod_close, week_high, week_low, high_20d, low_20d,
+                    pct_5d, up_streak, pe_ratio, pb_ratio,
+                    pred_date, direction, confidence, composite_score, signal_count,
+                    hmm_state, memory_label,
+                    range_low, range_high, target_close, expected_move_pts,
+                    feat_pcr, feat_carry, feat_fii_net, feat_fii_5d,
+                    feat_vix, feat_vix_5d_chg, feat_breadth,
+                    feat_hurst, feat_entropy, feat_oi_score,
+                    pred_acc_30d, pred_hi_conf_acc, pred_sample,
+                    fii_today_cr, fii_5d_cr, fii_10d_cr, fii_5d_pos_days, fii_oi,
+                    fii_fut_net, client_fut_net, fii_call_net, fii_put_net,
+                    eod_call_oi, eod_put_oi, eod_pcr, eod_call_chg, eod_put_chg,
+                    max_pain_price, max_pain_dist_pct, nearest_expiry,
+                    top_call_strike, top_put_strike,
+                    fpi_equity_today_cr, fpi_equity_5d_cr, fpi_equity_10d_cr, fpi_5d_pos_days,
+                    spot_close, fii_today_cts, fii_net_change_1d
+                FROM index_context
+                WHERE sync_date = ?
+            """, [sync_date]).fetchall()
+
+            con.close()
+
+            if not rows:
+                return None
+
+            cache: dict = {"__common__": common}
+            for r in rows:
+                (fyers_sym, dcm_sym,
+                 prev_close, eod_close, week_high, week_low, high_20d, low_20d,
+                 pct_5d, up_streak, pe_ratio, pb_ratio,
+                 pred_date_s, direction, confidence, composite_score, signal_count,
+                 hmm_state, memory_label,
+                 range_low, range_high, target_close, expected_move_pts,
+                 feat_pcr, feat_carry, feat_fii_net, feat_fii_5d,
+                 feat_vix, feat_vix_5d_chg, feat_breadth,
+                 feat_hurst, feat_entropy, feat_oi_score,
+                 pred_acc_30d, pred_hi_conf_acc, pred_sample,
+                 fii_today_cr, fii_5d_cr, fii_10d_cr, fii_5d_pos_days, fii_oi,
+                 fii_fut_net, client_fut_net, fii_call_net, fii_put_net,
+                 eod_call_oi, eod_put_oi, eod_pcr, eod_call_chg, eod_put_chg,
+                 max_pain_price, max_pain_dist_pct, nearest_expiry,
+                 top_call_strike, top_put_strike,
+                 fpi_equity_today_cr, fpi_equity_5d_cr, fpi_equity_10d_cr, fpi_5d_pos_days,
+                 spot_close, fii_today_cts, fii_net_change_1d) = r
+
+                # pred_date is stored as ISO string in SQLite; restore to date object
+                pred_date = None
+                if pred_date_s:
+                    try:
+                        pred_date = datetime.date.fromisoformat(str(pred_date_s)[:10])
+                    except Exception:
+                        pred_date = pred_date_s
+
+                cache[fyers_sym] = {
+                    "symbol":          dcm_sym,
+                    "prev_close":      prev_close,
+                    "eod_close":       eod_close,
+                    "week_high":       week_high,
+                    "week_low":        week_low,
+                    "high_20d":        high_20d,
+                    "low_20d":         low_20d,
+                    "pct_5d":          pct_5d,
+                    "up_streak":       up_streak,
+                    "pe_ratio":        pe_ratio,
+                    "pb_ratio":        pb_ratio,
+                    "pred_date":       pred_date,
+                    "direction":       direction,
+                    "confidence":      confidence,
+                    "composite_score": float(composite_score) if composite_score is not None else 0.0,
+                    "signal_count":    signal_count,
+                    "hmm_state":       hmm_state,
+                    "memory_label":    memory_label,
+                    "range_low":       range_low,
+                    "range_high":      range_high,
+                    "target_close":    target_close,
+                    "expected_move_pts": expected_move_pts,
+                    "feat_pcr":        feat_pcr,
+                    "feat_carry":      feat_carry,
+                    "feat_fii_net":    feat_fii_net,
+                    "feat_fii_5d":     feat_fii_5d,
+                    "feat_vix":        feat_vix,
+                    "feat_vix_5d_chg": feat_vix_5d_chg,
+                    "feat_breadth":    feat_breadth,
+                    "feat_hurst":      feat_hurst,
+                    "feat_entropy":    feat_entropy,
+                    "feat_oi_score":   feat_oi_score,
+                    "pred_acc_30d":    pred_acc_30d,
+                    "pred_hi_conf_acc": pred_hi_conf_acc,
+                    "pred_sample":     pred_sample,
+                    "fii_today_cr":    fii_today_cr,
+                    "fii_5d_cr":       fii_5d_cr,
+                    "fii_10d_cr":      fii_10d_cr,
+                    "fii_5d_pos_days": fii_5d_pos_days,
+                    "fii_oi":          fii_oi,
+                    # FAO participant net OI positions (from fao_participant table)
+                    "fii_fut_net":     fii_fut_net,
+                    "client_fut_net":  client_fut_net,
+                    "fii_call_net":    fii_call_net,
+                    "fii_put_net":     fii_put_net,
+                    "eod_call_oi":     eod_call_oi,
+                    "eod_put_oi":      eod_put_oi,
+                    "eod_pcr":         eod_pcr,
+                    "eod_call_chg":    eod_call_chg,
+                    "eod_put_chg":     eod_put_chg,
+                    "max_pain_price":    max_pain_price,
+                    "max_pain_dist_pct": max_pain_dist_pct,
+                    "nearest_expiry":    nearest_expiry,
+                    # Key OI levels — exact DCM replica fields
+                    "top_call_strike":   top_call_strike,   # Resistance (R)
+                    "top_put_strike":    top_put_strike,    # Support (S)
+                    # Exact replica fields
+                    "spot_close":        spot_close,         # hero price (from prediction_log)
+                    "fii_today_cts":     fii_today_cts,     # daily net contracts ADD/COV
+                    "fii_net_change_1d": fii_net_change_1d, # FAO delta: COV>0, ADD<0
+                    # B7 FPI fields
+                    "fpi_equity_today_cr": fpi_equity_today_cr,
+                    "fpi_equity_5d_cr":    fpi_equity_5d_cr,
+                    "fpi_equity_10d_cr":   fpi_equity_10d_cr,
+                    "fpi_5d_pos_days":     fpi_5d_pos_days,
+                }
+
+            return cache
+
+        except Exception as exc:
+            print(f"[DCBridge] local snapshot read failed: {exc}", file=sys.stderr)
+            return None
 
     # ── Data fetchers ──────────────────────────────────────────────────────────
 
@@ -230,7 +484,7 @@ class DailyContextBridge:
                 r["india_vix"]       = float(df["close_val"].iloc[0])
                 r["india_vix_5d_chg"] = round(
                     float(df["close_val"].iloc[0]) -
-                    float(df["close_val"].iloc[min(4, len(df) - 1)]), 2
+                    float(df["close_val"].iloc[min(5, len(df) - 1)]), 2
                 )
         except Exception:
             pass
@@ -284,13 +538,32 @@ class DailyContextBridge:
         except Exception:
             pass
 
+        # Large-cap delivery quality (institutional conviction indicator)
+        try:
+            df = con.execute("""
+                SELECT dd.deliv_per
+                FROM daily_data dd
+                JOIN sector_master sm ON dd.symbol = sm.symbol
+                WHERE dd.trade_date         = (SELECT MAX(trade_date) FROM daily_data)
+                  AND dd.series             = 'EQ'
+                  AND dd.deliv_per          IS NOT NULL
+                  AND dd.deliv_per          > 0
+                  AND dd.turnover_lacs      >= 100
+                  AND LOWER(sm.market_cap_category) IN ('large cap','largecap','large-cap')
+            """).df()
+            if not df.empty:
+                r["avg_deliv_pct"]    = round(float(df["deliv_per"].mean()), 1)
+                r["high_deliv_count"] = int((df["deliv_per"] > 60).sum())
+        except Exception:
+            pass
+
         return r
 
     def _fetch_symbol(self, con, dcm_sym: str) -> dict:
         """Per-index context from prediction_log, FII stats, index_data, fno_bhavcopy."""
         r: dict = {"symbol": dcm_sym}
 
-        # ── prediction_log: latest prediction + 12-dim fingerprint ───────────
+        # ── prediction_log: latest prediction + 12-dim fingerprint + spot_close ─
         try:
             row = con.execute("""
                 SELECT
@@ -300,7 +573,8 @@ class DailyContextBridge:
                     feat_vix, feat_vix_5d_chg, feat_breadth,
                     feat_hurst, feat_entropy, feat_oi_score,
                     hmm_state, memory_label,
-                    range_low, range_high, target_close, expected_move_pts
+                    range_low, range_high, target_close, expected_move_pts,
+                    spot_close
                 FROM prediction_log
                 WHERE fno_symbol = ?
                 ORDER BY trade_date DESC
@@ -313,7 +587,8 @@ class DailyContextBridge:
                  vix_f, vix_chg, breadth_f,
                  hurst, entropy, oi_score,
                  hmm, mem_label,
-                 rng_lo, rng_hi, target, move_pts) = row
+                 rng_lo, rng_hi, target, move_pts,
+                 spot_cl) = row
                 r.update({
                     "pred_date":        pred_date,
                     "direction":        direction,
@@ -332,10 +607,11 @@ class DailyContextBridge:
                     "feat_oi_score":    oi_score,
                     "hmm_state":        hmm,
                     "memory_label":     mem_label,
-                    "range_low":        float(rng_lo)  if rng_lo  else None,
-                    "range_high":       float(rng_hi)  if rng_hi  else None,
-                    "target_close":     float(target)  if target  else None,
+                    "range_low":        float(rng_lo)   if rng_lo   else None,
+                    "range_high":       float(rng_hi)   if rng_hi   else None,
+                    "target_close":     float(target)   if target   else None,
                     "expected_move_pts": float(move_pts) if move_pts else None,
+                    "spot_close":       float(spot_cl)  if spot_cl  else None,
                 })
         except Exception:
             pass
@@ -372,30 +648,102 @@ class DailyContextBridge:
         if idx_name:
             try:
                 df = con.execute("""
-                    SELECT trade_date, high_val, low_val, close_val, pct_chg
+                    SELECT trade_date, high_val, low_val, close_val,
+                           prev_close, pct_chg, pe_ratio, pb_ratio
                     FROM index_data
                     WHERE index_name = ?
                     ORDER BY trade_date DESC
                     LIMIT 22
                 """, [idx_name]).df()
                 if not df.empty:
-                    r["prev_close"] = float(df["close_val"].iloc[0])
+                    # eod_close  = last session's closing price (the "hero" price displayed)
+                    # prev_close = the session before that (used for day-change % computation)
+                    r["eod_close"]  = float(df["close_val"].iloc[0])
+                    raw_prev = df["prev_close"].iloc[0]
+                    r["prev_close"] = (float(raw_prev) if raw_prev is not None
+                                       else float(df["close_val"].iloc[1])
+                                            if len(df) > 1
+                                       else r["eod_close"])
                     r["high_20d"]   = float(df["high_val"].max())
                     r["low_20d"]    = float(df["low_val"].min())
                     r["week_high"]  = float(df["high_val"].head(5).max())
                     r["week_low"]   = float(df["low_val"].head(5).min())
                     if len(df) >= 5:
                         r["pct_5d"] = round(float(df["pct_chg"].head(5).sum()), 2)
+                    pe = df["pe_ratio"].iloc[0]
+                    pb = df["pb_ratio"].iloc[0]
+                    r["pe_ratio"] = float(pe) if pe is not None else None
+                    r["pb_ratio"] = float(pb) if pb is not None else None
                     # Consecutive up days (momentum streak)
                     streak = 0
                     for chg in df["pct_chg"]:
-                        if chg > 0:
+                        if chg and chg > 0:
                             streak += 1
                         else:
                             break
                     r["up_streak"] = streak
             except Exception:
                 pass
+
+        # ── fno_bhavcopy (max pain) — inline computation for DuckDB live path ──
+        # nightly_sync pre-computes this; in the DuckDB live fallback we do it here.
+        try:
+            exp_row = con.execute("""
+                SELECT MIN(expiry_date)
+                FROM fno_bhavcopy
+                WHERE symbol = ? AND instrument = 'OPTIDX'
+                  AND trade_date = (SELECT MAX(trade_date) FROM fno_bhavcopy WHERE symbol = ?)
+                  AND expiry_date >= (SELECT MAX(trade_date) FROM fno_bhavcopy WHERE symbol = ?)
+            """, [dcm_sym, dcm_sym, dcm_sym]).fetchone()
+
+            if exp_row and exp_row[0]:
+                expiry = exp_row[0]
+                mp_df  = con.execute("""
+                    SELECT strike_price, option_type, open_interest
+                    FROM fno_bhavcopy
+                    WHERE symbol = ? AND instrument = 'OPTIDX'
+                      AND trade_date = (SELECT MAX(trade_date) FROM fno_bhavcopy WHERE symbol = ?)
+                      AND expiry_date = ? AND option_type IN ('CE','PE')
+                      AND open_interest > 0
+                """, [dcm_sym, dcm_sym, expiry]).df()
+
+                if not mp_df.empty:
+                    ce_rows_mp = mp_df[mp_df["option_type"] == "CE"].copy()
+                    pe_rows_mp = mp_df[mp_df["option_type"] == "PE"].copy()
+                    ce_oi = dict(zip(ce_rows_mp["strike_price"], ce_rows_mp["open_interest"]))
+                    pe_oi = dict(zip(pe_rows_mp["strike_price"], pe_rows_mp["open_interest"]))
+                    strikes = sorted(set(ce_oi) | set(pe_oi))
+                    if strikes:
+                        min_pain = float("inf")
+                        mp_price = strikes[len(strikes) // 2]
+                        for price in strikes:
+                            pain = (
+                                sum((price - k) * oi for k, oi in ce_oi.items() if k < price) +
+                                sum((k - price) * oi for k, oi in pe_oi.items() if k > price)
+                            )
+                            if pain < min_pain:
+                                min_pain, mp_price = pain, price
+                        r["max_pain_price"] = float(mp_price)
+                        r["nearest_expiry"] = str(expiry)
+                        spot = r.get("eod_close") or r.get("prev_close") or 0.0
+                        if spot > 0:
+                            r["max_pain_dist_pct"] = round((mp_price - spot) / spot * 100, 3)
+                        # Top OI strikes with DCM band filtering
+                        band = float(spot) * 0.05 if spot else 0.0
+                        if not ce_rows_mp.empty and spot:
+                            nc = ce_rows_mp[(ce_rows_mp["strike_price"] >= spot - band) &
+                                            (ce_rows_mp["strike_price"] <= spot + band * 3)]
+                            if nc.empty: nc = ce_rows_mp
+                            r["top_call_strike"] = float(
+                                nc.loc[nc["open_interest"].idxmax(), "strike_price"])
+                        if not pe_rows_mp.empty and spot:
+                            np_ = pe_rows_mp[(pe_rows_mp["strike_price"] >= spot - band * 3) &
+                                             (pe_rows_mp["strike_price"] <= spot + band)]
+                            if np_.empty: np_ = pe_rows_mp
+                            r["top_put_strike"] = float(
+                                np_.loc[np_["open_interest"].idxmax(), "strike_price"])
+        except Exception:
+            pass
 
         # ── fii_derivatives_stats: per-symbol FII futures flow ────────────────
         fii_cat = _FII_CAT.get(dcm_sym)
@@ -420,29 +768,106 @@ class DailyContextBridge:
             except Exception:
                 pass
 
-        # ── fno_bhavcopy: EOD option chain OI + OI change ─────────────────────
+        # ── fao_participant: FII net + 1D change for ADD/COV display ─────────────
+        try:
+            rows = con.execute("""
+                SELECT trade_date, client_type,
+                       fut_idx_long,      fut_idx_short,
+                       opt_idx_call_long, opt_idx_call_short,
+                       opt_idx_put_long,  opt_idx_put_short
+                FROM fao_participant
+                WHERE data_type = 'OI'
+                  AND trade_date IN (
+                      SELECT DISTINCT trade_date FROM fao_participant
+                      WHERE data_type = 'OI'
+                      ORDER BY trade_date DESC LIMIT 2
+                  )
+                ORDER BY trade_date DESC, client_type
+            """).fetchall()
+            by_date: dict = {}
+            for row in rows:
+                dt, ct = row[0], row[1]
+                if dt not in by_date:
+                    by_date[dt] = {}
+                by_date[dt][ct] = {
+                    "fut_net":  (row[2] or 0) - (row[3] or 0),
+                    "call_net": (row[4] or 0) - (row[5] or 0),
+                    "put_net":  (row[6] or 0) - (row[7] or 0),
+                }
+            dates = sorted(by_date.keys(), reverse=True)
+            if dates:
+                latest = by_date[dates[0]]
+                fii_p = latest.get("FII", {})
+                r["fii_fut_net"]  = fii_p.get("fut_net",  0)
+                r["fii_call_net"] = fii_p.get("call_net", 0)
+                r["fii_put_net"]  = fii_p.get("put_net",  0)
+                r["client_fut_net"] = latest.get("Client", {}).get("fut_net", 0)
+            if len(dates) >= 2:
+                net_today = by_date[dates[0]].get("FII", {}).get("fut_net", 0)
+                net_prev  = by_date[dates[1]].get("FII", {}).get("fut_net", 0)
+                r["fii_net_change_1d"] = net_today - net_prev
+        except Exception:
+            pass
+
+        # ── fpi_nsdl_flows: FPI equity flows (macro B7 signal) ───────────────────
         try:
             df = con.execute("""
-                SELECT option_type,
-                       SUM(open_interest) AS oi,
-                       SUM(chg_in_oi)     AS oi_chg
+                SELECT net_investment_cr
+                FROM fpi_nsdl_flows
+                WHERE LOWER(category) = 'equity'
+                ORDER BY trade_date DESC
+                LIMIT 10
+            """).df()
+            if not df.empty:
+                r["fpi_equity_today_cr"] = round(float(df["net_investment_cr"].iloc[0]), 1)
+                r["fpi_equity_5d_cr"]    = round(float(df["net_investment_cr"].head(5).sum()), 1)
+                r["fpi_equity_10d_cr"]   = round(float(df["net_investment_cr"].head(10).sum()), 1)
+                r["fpi_5d_pos_days"]     = int((df["net_investment_cr"].head(5) > 0).sum())
+        except Exception:
+            pass
+
+        # ── fii_derivatives_stats: add fii_today_cts (daily net contracts) ───
+        # (already computed in the fii_5d block above — refetch for today only)
+        fii_cat = _FII_CAT.get(dcm_sym)
+        if fii_cat and "fii_today_cts" not in r:
+            try:
+                row_cts = con.execute("""
+                    SELECT buy_contracts - sell_contracts AS net_cts
+                    FROM fii_derivatives_stats
+                    WHERE category = ?
+                    ORDER BY trade_date DESC LIMIT 1
+                """, [fii_cat]).fetchone()
+                if row_cts and row_cts[0] is not None:
+                    r["fii_today_cts"] = int(row_cts[0])
+            except Exception:
+                pass
+
+        # ── fno_bhavcopy: EOD option chain OI + OI change (2-day delta) ─────────
+        # NSE bhavcopy chg_in_oi column is often 0; compute change by diffing
+        # the two most recent dates so the OI direction signal fires reliably.
+        try:
+            df = con.execute("""
+                SELECT trade_date, option_type, SUM(open_interest) AS oi
                 FROM fno_bhavcopy
                 WHERE symbol     = ?
                   AND instrument  = 'OPTIDX'
-                  AND trade_date  = (
-                      SELECT MAX(trade_date) FROM fno_bhavcopy WHERE symbol = ?
+                  AND trade_date IN (
+                      SELECT DISTINCT trade_date FROM fno_bhavcopy
+                      WHERE symbol = ? ORDER BY trade_date DESC LIMIT 2
                   )
                   AND option_type IN ('CE','PE')
-                GROUP BY option_type
+                GROUP BY trade_date, option_type
+                ORDER BY trade_date DESC
             """, [dcm_sym, dcm_sym]).df()
             if not df.empty:
-                ce  = df[df["option_type"] == "CE"]
-                pe  = df[df["option_type"] == "PE"]
-                # fillna(0): new contracts on first trading day have NULL chg_in_oi
-                c_oi  = int(ce["oi"].fillna(0).iloc[0])     if not ce.empty else 0
-                p_oi  = int(pe["oi"].fillna(0).iloc[0])     if not pe.empty else 0
-                c_chg = int(ce["oi_chg"].fillna(0).iloc[0]) if not ce.empty else 0
-                p_chg = int(pe["oi_chg"].fillna(0).iloc[0]) if not pe.empty else 0
+                dates = sorted(df["trade_date"].unique(), reverse=True)
+                today_df = df[df["trade_date"] == dates[0]]
+                prev_df  = df[df["trade_date"] == dates[1]] if len(dates) > 1 else None
+                def _oi(sub, opt): return int(sub[sub["option_type"] == opt]["oi"].sum()) if not sub[sub["option_type"] == opt].empty else 0
+                c_oi  = _oi(today_df, "CE")
+                p_oi  = _oi(today_df, "PE")
+                c_chg = c_oi - _oi(prev_df, "CE") if prev_df is not None else 0
+                p_chg = p_oi - _oi(prev_df, "PE") if prev_df is not None else 0
                 r["eod_call_oi"]  = c_oi
                 r["eod_put_oi"]   = p_oi
                 r["eod_pcr"]      = round(p_oi / c_oi, 3) if c_oi else 0.0
@@ -465,6 +890,14 @@ class DailyContextBridge:
         score += self._b4_breadth(common, signals)
         score += self._b5_vix(data, common, signals)
         score += self._b6_eod_oi(data, signals)
+        # B7: FPI equity flows — aggregate NSDL data; full weight for NIFTY only.
+        # BANKNIFTY/FINNIFTY/MIDCAP sectors can diverge from aggregate FPI flow,
+        # so apply 30% weight for non-NIFTY indices (macro hint, not conviction).
+        fpi_score = self._b7_fpi(data, signals)
+        if data.get("symbol") != "NIFTY":
+            fpi_score = round(fpi_score * 0.3, 2)
+        score += fpi_score
+        score += self._b8_delivery(common, signals)
 
         return round(min(max(score, -4.0), 4.0), 2), signals
 
@@ -482,8 +915,13 @@ class DailyContextBridge:
                 "Prediction engine: no forecast found — run daily ingestion"))
             return 0.0
 
-        # Staleness: prediction older than 3 calendar days is unreliable
+        # Staleness: prediction older than 3 calendar days is unreliable.
+        # pred_date may be a datetime.date (DuckDB path) or already parsed (SQLite path).
         try:
+            if isinstance(pred_date, str):
+                pred_date = datetime.date.fromisoformat(pred_date[:10])
+            elif isinstance(pred_date, datetime.datetime):
+                pred_date = pred_date.date()
             age_days = (datetime.date.today() - pred_date).days
         except Exception:
             age_days = 0
@@ -562,50 +1000,60 @@ class DailyContextBridge:
             f"HMM regime: {hmm.upper()} · {hurst_note} · {ent_note}{mem_s}"))
         return base
 
-    # ── B3: FII Flow Trend ────────────────────────────────────────────────────
+    # ── B3: FII Flow Trend (prior 4D + 9D, today excluded) ───────────────────
+    # Layer 4 (market_data_bridge, 10% weight) already scores TODAY's FII flow.
+    # B3 owns the multi-day structural trend by stripping today out, so each
+    # layer measures a distinct time window with no double-count.
 
     def _b3_fii(self, data: dict, signals: list) -> float:
-        fii_5d   = data.get("fii_5d_cr",       0.0) or 0.0
-        fii_10d  = data.get("fii_10d_cr",      0.0) or 0.0
-        pos_days = data.get("fii_5d_pos_days", 0)   or 0
+        today_cr = data.get("fii_today_cr",    0.0) or 0.0
+        raw_5d   = data.get("fii_5d_cr",       0.0) or 0.0
+        raw_10d  = data.get("fii_10d_cr",      0.0) or 0.0
+        raw_pos  = data.get("fii_5d_pos_days", 0)   or 0
 
-        if not (fii_5d or fii_10d):
+        # Exclude today so B3 covers prior 4 trading days (5D window minus today)
+        fii_4d  = raw_5d  - today_cr
+        fii_9d  = raw_10d - today_cr
+        # If today was a buying day reduce the positive-day count by 1
+        pos_days = max(0, raw_pos - (1 if today_cr > 0 else 0))
+
+        if not (fii_4d or fii_9d):
             return 0.0
 
         score = 0.0
 
-        # 5-day net flow — threshold ±₹1000Cr = significant institutional activity
-        if fii_5d > 2500:
+        # Prior-4D net flow — ±₹2000Cr over 4 days = meaningful structural trend
+        if fii_4d > 2000:
             score += 1.5
             signals.append(("bull",
-                f"FII futures 5D: +{fii_5d:,.0f}Cr ({pos_days}/5 buying days) "
-                f"— sustained institutional accumulation"))
-        elif fii_5d > 800:
+                f"FII futures prior 4D: +{fii_4d:,.0f}Cr ({pos_days}/4 buying days) "
+                f"— sustained multi-day accumulation"))
+        elif fii_4d > 650:
             score += 0.75
             signals.append(("bull",
-                f"FII futures 5D: +{fii_5d:,.0f}Cr ({pos_days}/5 buying days) "
-                f"— consistent FII buying"))
-        elif fii_5d < -2500:
+                f"FII futures prior 4D: +{fii_4d:,.0f}Cr ({pos_days}/4 buying days) "
+                f"— consistent structural buying"))
+        elif fii_4d < -2000:
             score -= 1.5
             signals.append(("bear",
-                f"FII futures 5D: {fii_5d:,.0f}Cr ({pos_days}/5 buying days) "
-                f"— sustained institutional distribution"))
-        elif fii_5d < -800:
+                f"FII futures prior 4D: {fii_4d:,.0f}Cr ({pos_days}/4 buying days) "
+                f"— sustained multi-day distribution"))
+        elif fii_4d < -650:
             score -= 0.75
             signals.append(("bear",
-                f"FII futures 5D: {fii_5d:,.0f}Cr ({pos_days}/5 buying days) "
-                f"— consistent FII selling"))
+                f"FII futures prior 4D: {fii_4d:,.0f}Cr ({pos_days}/4 buying days) "
+                f"— consistent structural selling"))
         else:
             signals.append(("neut",
-                f"FII futures 5D: {fii_5d:+,.0f}Cr — neutral institutional stance"))
+                f"FII futures prior 4D: {fii_4d:+,.0f}Cr — neutral structural stance"))
 
-        # 10-day structural context (confirms or contradicts 5D)
-        if abs(fii_10d) > 6000:
-            structural_bias = "bull" if fii_10d > 0 else "bear"
-            direction_word  = "accumulation" if fii_10d > 0 else "distribution"
-            score += 0.5 if fii_10d > 0 else -0.5
+        # Prior-9D structural context
+        if abs(fii_9d) > 5000:
+            structural_bias = "bull" if fii_9d > 0 else "bear"
+            direction_word  = "accumulation" if fii_9d > 0 else "distribution"
+            score += 0.5 if fii_9d > 0 else -0.5
             signals.append((structural_bias,
-                f"FII 10D structural: {fii_10d:+,.0f}Cr — "
+                f"FII 9D structural: {fii_9d:+,.0f}Cr — "
                 f"sustained {direction_word} in progress"))
 
         return round(min(max(score, -2.0), 2.0), 2)
@@ -754,6 +1202,115 @@ class DailyContextBridge:
                     f"— fresh call writing, structural ceiling from yesterday's close"))
 
         return round(min(max(score, -1.0), 1.0), 2)
+
+    # ── B7: FPI Capital Flows ─────────────────────────────────────────────────
+
+    def _b7_fpi(self, data: dict, signals: list) -> float:
+        """
+        FPI (Foreign Portfolio Investors) net equity investment is the single
+        largest driver of sustained NIFTY directional moves.
+
+        FPI is broader than FII futures flow (B3): it captures ALL foreign money
+        entering/exiting Indian equities — ETFs, QFIs, institutional investors.
+        When FPI equity 5D and FII futures 5D align → extremely high conviction.
+
+        Thresholds calibrated to NSE historical FPI equity flow data:
+          ±₹5000Cr in 5 days = strong directional flow
+          ±₹2000Cr in 5 days = moderate flow
+        """
+        fpi_5d   = data.get("fpi_equity_5d_cr",    0.0) or 0.0
+        fpi_10d  = data.get("fpi_equity_10d_cr",   0.0) or 0.0
+        fpi_pos  = data.get("fpi_5d_pos_days",     0)   or 0
+        today_cr = data.get("fpi_equity_today_cr", 0.0) or 0.0
+
+        if not (fpi_5d or fpi_10d):
+            return 0.0
+
+        score = 0.0
+
+        # 5D flow — primary signal
+        if fpi_5d > 5000:
+            score += 1.5
+            signals.append(("bull",
+                f"FPI equity 5D: +{fpi_5d:,.0f}Cr ({fpi_pos}/5 buying days) "
+                f"— heavy foreign capital inflow, structural tailwind"))
+        elif fpi_5d > 2000:
+            score += 0.75
+            signals.append(("bull",
+                f"FPI equity 5D: +{fpi_5d:,.0f}Cr ({fpi_pos}/5 buying days) "
+                f"— consistent FPI buying in cash market"))
+        elif fpi_5d < -5000:
+            score -= 1.5
+            signals.append(("bear",
+                f"FPI equity 5D: {fpi_5d:,.0f}Cr ({fpi_pos}/5 buying days) "
+                f"— heavy foreign capital outflow, structural headwind"))
+        elif fpi_5d < -2000:
+            score -= 0.75
+            signals.append(("bear",
+                f"FPI equity 5D: {fpi_5d:,.0f}Cr ({fpi_pos}/5 buying days) "
+                f"— sustained FPI selling in cash market"))
+        else:
+            signals.append(("neut",
+                f"FPI equity 5D: {fpi_5d:+,.0f}Cr — neutral foreign flow"))
+
+        # 10D structural context — confirms or contradicts the 5D trend
+        if abs(fpi_10d) > 12000:
+            structural_bias = "bull" if fpi_10d > 0 else "bear"
+            direction_word  = "accumulation" if fpi_10d > 0 else "distribution"
+            score += 0.5 if fpi_10d > 0 else -0.5
+            signals.append((structural_bias,
+                f"FPI equity 10D structural: {fpi_10d:+,.0f}Cr — "
+                f"sustained {direction_word} by foreign investors"))
+
+        return round(min(max(score, -2.0), 2.0), 2)
+
+    # ── B8: Large-cap Delivery Quality ────────────────────────────────────────
+
+    def _b8_delivery(self, common: dict, signals: list) -> float:
+        """
+        Large-cap delivery % distinguishes institutional accumulation vs distribution.
+
+        High delivery (>60%) in large-caps = institutions holding/accumulating → bullish.
+        Low delivery (<35%) = high-velocity exits, intraday-only activity → bearish.
+
+        Threshold calibration (NSE large-cap typical):
+          avg_deliv_pct > 60  = strong institutional conviction
+          avg_deliv_pct 50-60 = mild accumulation bias
+          avg_deliv_pct 35-50 = neutral
+          avg_deliv_pct < 35  = distribution phase
+          high_deliv_count    = # of large-cap stocks with >60% delivery (breadth)
+        """
+        avg   = common.get("avg_deliv_pct")
+        count = common.get("high_deliv_count")
+
+        if avg is None:
+            return 0.0
+
+        score = 0.0
+
+        if avg > 60:
+            score += 0.75
+            signals.append(("bull",
+                f"Large-cap delivery {avg:.0f}% avg ({count} stocks >60%) "
+                f"— institutional accumulation, conviction buying"))
+        elif avg > 50:
+            score += 0.3
+            signals.append(("bull",
+                f"Large-cap delivery {avg:.0f}% avg — moderate institutional buying interest"))
+        elif avg < 35:
+            score -= 0.75
+            signals.append(("bear",
+                f"Large-cap delivery {avg:.0f}% avg ({count} stocks >60%) "
+                f"— distribution phase, institutions exiting intraday"))
+        elif avg < 45:
+            score -= 0.3
+            signals.append(("bear",
+                f"Large-cap delivery {avg:.0f}% avg — low institutional conviction, churn"))
+        else:
+            signals.append(("neut",
+                f"Large-cap delivery {avg:.0f}% avg — neutral institutional activity"))
+
+        return round(min(max(score, -0.75), 0.75), 2)
 
 
 # ── Module singleton ──────────────────────────────────────────────────────────

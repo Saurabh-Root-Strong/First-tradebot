@@ -17,11 +17,13 @@ Exposed API (all functions return {} / [] on any failure — never crash the das
 """
 
 import datetime
+import sqlite3
 import threading
 import time
 from pathlib import Path
 
-DB_PATH = Path(r"D:\Python Projects\Daily_Cash_Market\data\market_data.duckdb")
+DB_PATH   = Path(r"D:\Python Projects\Daily_Cash_Market\data\market_data.duckdb")
+_LOCAL_DB = Path(__file__).parent / "data" / "tradebot_context.db"
 
 # Map Tradebot symbol → names used in the DB
 INDEX_NAMES = {
@@ -33,7 +35,11 @@ INDEX_NAMES = {
 
 _lock  = threading.Lock()
 _cache: dict = {}
-_CACHE_TTL = 300   # refresh every 5 minutes (EOD data, no point hitting faster)
+# EOD data (FII, FAO, OI) is published once after market close and never updated
+# intraday.  30-min TTL matches daily_context_bridge's 4-hr TTL direction:
+# both layers read from the same DuckDB, so keeping them on similar cadence
+# prevents them from seeing different snapshots of the same underlying data.
+_CACHE_TTL = 1800
 
 
 def _db():
@@ -303,7 +309,26 @@ def get_institutional_bias(index_sym: str, live_spot: float = 0) -> tuple[float,
             score -= 0.5
             signals.append(("bear", f"FII futures trend: DISTRIBUTING for 3+ days — sustained institutional selling"))
 
-    # ── FAO smart-money vs retail divergence ──────────────────────────────────
+    # ── FAO smart-money vs retail divergence ─────────────────────────────────
+    # NSE publishes FAO participant data as ONE aggregate row covering ALL index
+    # futures (NIFTY + BANKNIFTY + FINNIFTY + MIDCAP combined).  It cannot be
+    # disaggregated per index.  Apply index-specific weights:
+    #   NIFTY      → full weight  (NIFTY ≈ 70% of total index futures volume)
+    #   BANKNIFTY  → 50% weight   (significant but not dominant share)
+    #   FINNIFTY / MIDCAP → 30%   (minority share; aggregate can mislead)
+    # FAO participant data = ALL index futures combined (NSE doesn't break it down).
+    # NIFTY ~70% of index futures volume → aggregate is a close proxy.
+    # BANKNIFTY ~25% → banking stocks strongly tracked by FII → 80% weight still valid.
+    # FINNIFTY / MIDCAP → smaller share, less direct proxy → 50%.
+    _FAO_WEIGHT = {
+        "NSE:NIFTY50-INDEX":    1.0,
+        "NSE:NIFTYBANK-INDEX":  0.8,
+        "NSE:FINNIFTY-INDEX":   0.5,
+        "NSE:MIDCPNIFTY-INDEX": 0.5,
+    }
+    fao_w   = _FAO_WEIGHT.get(index_sym, 0.7)
+    agg_tag = "" if index_sym == "NSE:NIFTY50-INDEX" else " [All Index Futures — aggregate]"
+
     fao = get_fao_snapshot()
     parts = fao.get("participants", {})
     fii_p   = parts.get("FII",    {})
@@ -313,35 +338,35 @@ def get_institutional_bias(index_sym: str, live_spot: float = 0) -> tuple[float,
     client_fut_net = client.get("fut_idx_net",   0)
 
     if fii_fut_net > 0 and client_fut_net < 0:
-        score += 1.5
+        score += round(1.5 * fao_w, 2)
         signals.append(("bull",
-            f"Smart-money DIVERGENCE: FII net LONG {fii_fut_net:,} futures + Retail net SHORT {client_fut_net:,} "
-            f"— classic bullish setup, institutions vs retail"))
+            f"Smart-money DIVERGENCE: FII net LONG {fii_fut_net:,} + Retail SHORT {client_fut_net:,}"
+            f"{agg_tag} — bullish setup"))
     elif fii_fut_net < 0 and client_fut_net > 0:
-        score -= 1.5
+        score -= round(1.5 * fao_w, 2)
         signals.append(("bear",
-            f"Smart-money DIVERGENCE: FII net SHORT {fii_fut_net:,} futures + Retail net LONG {client_fut_net:,} "
-            f"— classic bearish setup, institutions distributing to retail"))
+            f"Smart-money DIVERGENCE: FII net SHORT {fii_fut_net:,} + Retail LONG {client_fut_net:,}"
+            f"{agg_tag} — bearish setup"))
     elif fii_fut_net > 0 and client_fut_net > 0:
-        score += 0.5
+        score += round(0.5 * fao_w, 2)
         signals.append(("bull",
-            f"FII and Retail both net long in index futures — broad bullish consensus"))
+            f"FII and Retail both net long in index futures{agg_tag} — broad bullish consensus"))
     elif fii_fut_net < 0 and client_fut_net < 0:
-        score -= 0.5
+        score -= round(0.5 * fao_w, 2)
         signals.append(("bear",
-            f"FII and Retail both net short in index futures — broad bearish consensus"))
+            f"FII and Retail both net short in index futures{agg_tag} — broad bearish consensus"))
 
-    # FII options: are FIIs buying puts (hedging = cautious) or calls (directional)?
+    # FII options positioning (aggregate — same weight logic applies)
     fii_put_net  = fii_p.get("put_idx_net",  0)
     fii_call_net = fii_p.get("call_idx_net", 0)
     if fii_put_net > 100_000:
-        score -= 0.5
+        score -= round(0.5 * fao_w, 2)
         signals.append(("bear",
-            f"FII holding {fii_put_net:,} net PUT contracts in index — heavy hedging, expect volatility or downside"))
+            f"FII holding {fii_put_net:,} net PUT contracts{agg_tag} — heavy hedging, downside risk"))
     elif fii_call_net > 100_000:
-        score += 0.5
+        score += round(0.5 * fao_w, 2)
         signals.append(("bull",
-            f"FII holding {fii_call_net:,} net CALL contracts in index — institutional upside bets"))
+            f"FII holding {fii_call_net:,} net CALL contracts{agg_tag} — institutional upside bets"))
 
     # ── Index valuation context ───────────────────────────────────────────────
     ctx = get_index_context(index_sym, live_spot)
@@ -362,4 +387,47 @@ def get_institutional_bias(index_sym: str, live_spot: float = 0) -> tuple[float,
         if ctx.get("gap_label"):
             signals.append(("neut", f"Today vs prev close: {ctx['gap_label']}"))
 
+    # ── Large-cap delivery quality (from nightly sync local snapshot) ─────────
+    deliv = _get_delivery_context()
+    avg_deliv  = deliv.get("avg_deliv_pct")
+    high_count = deliv.get("high_deliv_count", 0) or 0
+    if avg_deliv is not None:
+        if avg_deliv > 65:
+            score += 0.5
+            signals.append(("bull",
+                f"Large-cap delivery: {avg_deliv:.0f}% avg ({high_count} stocks >60%) "
+                f"— institutional accumulation, holding positions overnight"))
+        elif avg_deliv < 35:
+            score -= 0.3
+            signals.append(("bear",
+                f"Large-cap delivery: {avg_deliv:.0f}% avg — "
+                f"low conviction, intraday-heavy activity (no overnight holding)"))
+        else:
+            signals.append(("neut",
+                f"Large-cap delivery: {avg_deliv:.0f}% avg — normal delivery quality"))
+
     return round(min(max(score, -4), 4), 2), signals
+
+
+def _get_delivery_context() -> dict:
+    """
+    Read large-cap delivery quality from the nightly sync local snapshot.
+    Returns {} when no local DB or today's sync not available.
+    """
+    today = datetime.date.today().isoformat()
+    if not _LOCAL_DB.exists():
+        return {}
+    try:
+        con = sqlite3.connect(str(_LOCAL_DB))
+        row = con.execute("""
+            SELECT mc.nifty50_avg_deliv_pct, mc.nifty50_high_deliv_count
+            FROM market_context mc
+            JOIN sync_metadata sm ON mc.sync_date = sm.sync_date
+            WHERE mc.sync_date = ? AND sm.status = 'ok'
+        """, [today]).fetchone()
+        con.close()
+        if row and row[0] is not None:
+            return {"avg_deliv_pct": row[0], "high_deliv_count": row[1]}
+    except Exception:
+        pass
+    return {}
