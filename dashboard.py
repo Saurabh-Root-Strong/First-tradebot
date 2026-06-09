@@ -3469,4 +3469,8 @@ if __name__ == "__main__":
     print(f"  Open  →  http://127.0.0.1:8050")
     print(SEP)
 
+    # Auto-open the dashboard in the default browser once the server is up.
+    import webbrowser
+    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
+
     app.run(debug=False, host="127.0.0.1", port=8050)
