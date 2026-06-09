@@ -974,6 +974,8 @@ def build_recommendation(
         "tf_label":     profile["label"],
 
         "strike":       best_sp,
+        "option_sym":   best_opt.get("symbol"),
+        "spot":         spot,
         "exp_date":     exp_date,
         "ltp":          ltp,
         "entry_lo":     entry_lo,

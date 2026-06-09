@@ -19,6 +19,8 @@ from fyers_apiv3.FyersWebsocket import data_ws
 from signals import run_full_analysis, recommend_option
 from trade_setup import build_recommendation, TF_PROFILES
 from intraday_store import candle_store, oi_store, build_oi_snapshot, session_phase, record_tick
+import intraday_oi_intel
+import intraday_trades
 try:
     from dcm_prediction import get_dcm_reader as _get_dcm_reader
     _DCM_OK = True
@@ -652,6 +654,57 @@ def _oi_background_poller():
         time.sleep(POLL)
 
 
+def _fetch_quotes(symbols: list[str]) -> dict:
+    """Fetch last price (lp) for a list of Fyers symbols via /data/quotes."""
+    if not symbols:
+        return {}
+    out: dict = {}
+    try:
+        resp = requests.get(
+            "https://api-t1.fyers.in/data/quotes",
+            headers={"Authorization": _get_auth(), "version": "3"},
+            params={"symbols": ",".join(symbols)},
+            timeout=8,
+        )
+        for item in (resp.json().get("d") or []):
+            n = item.get("n")
+            lp = (item.get("v") or {}).get("lp")
+            if n and lp is not None:
+                out[n] = float(lp)
+    except Exception:
+        pass
+    return out
+
+
+def _trade_tracker_poller():
+    """
+    Component C: follow each open paper trade's option LTP to resolution.
+
+    Every ~20s during market hours: fetch quotes for all open trades' option
+    symbols, update MFE/MAE and resolve on SL/T1/T2. After 15:31 IST, close any
+    still-open trades at last price (mark-to-close).
+    """
+    led = intraday_trades.get_ledger()
+    eod_done_for: str = ""
+    while True:
+        try:
+            now = datetime.datetime.now(tz=IST)
+            opens = led.open_trades()
+            syms  = [t["option_sym"] for t in opens if t.get("option_sym")]
+            if syms and datetime.time(9, 14) <= now.time() <= datetime.time(15, 45):
+                prices = _fetch_quotes(syms)
+                if prices:
+                    led.update_open_trades(prices)
+            # End-of-session mark-to-close (once per day)
+            if now.time() >= datetime.time(15, 31) and eod_done_for != now.date().isoformat():
+                still = [t["option_sym"] for t in led.open_trades() if t.get("option_sym")]
+                led.close_eod(_fetch_quotes(still) if still else {})
+                eod_done_for = now.date().isoformat()
+        except Exception:
+            pass
+        time.sleep(20)
+
+
 # ── Style constants ────────────────────────────────────────────────────────────
 BG      = "#080d14"
 BG_CARD = "#0f1623"
@@ -1093,6 +1146,12 @@ app.layout = dbc.Container([
 
                 # Prediction section
                 html.Div(id="oc-prediction"),
+
+                # Component A: live per-strike OI-Dynamics map
+                html.Div(id="oi-intel-panel"),
+
+                # Component C: intraday paper-trade track record
+                html.Div(id="track-record"),
 
                 # Option chain table in a scrollable container
                 dcc.Loading(
@@ -2884,9 +2943,135 @@ def update_oc(_, expiry, sym):
 
 
 # ── Callback: trade recommendation + velocity panel ───────────────────────────
+_OII_CLR = {"bull": "#4ade80", "bear": "#f87171", "neut": "#94a3b8"}
+_OII_HEAD = {"fontSize": "0.6rem", "letterSpacing": "1px", "color": "#64748b"}
+_OII_BOX  = {"padding": "8px 10px", "background": "rgba(255,255,255,0.02)",
+             "borderRadius": "6px", "marginTop": "8px",
+             "border": "1px solid rgba(255,255,255,0.05)"}
+
+
+def _render_continuity(c) -> "html.Div":
+    """Component B — overnight→morning continuity block."""
+    lines = intraday_oi_intel.continuity_lines(c)
+    if not c.has_data:
+        return html.Div([
+            html.Div("🌙→☀️ OVERNIGHT CONTINUITY", style={**_OII_HEAD, "marginBottom": "4px"}),
+            html.Div(lines[0][1], style={"fontSize": "0.64rem", "color": "#64748b", **MONO}),
+        ], style=_OII_BOX)
+    hdr_clr = _OII_CLR["bull"] if c.score > 0 else _OII_CLR["bear"] if c.score < 0 else _OII_CLR["neut"]
+    rows = [html.Div(text, style={"fontSize": "0.66rem", "color": _OII_CLR.get(bias, "#94a3b8"),
+                                  "padding": "2px 0", **MONO})
+            for bias, text in lines[1:]]
+    return html.Div([
+        html.Div([
+            html.Span("🌙→☀️ OVERNIGHT CONTINUITY   ", style=_OII_HEAD),
+            html.Span(c.verdict, style={"fontSize": "0.62rem", "fontWeight": "700", "color": hdr_clr}),
+        ], style={"marginBottom": "4px"}),
+        html.Div(rows),
+    ], style=_OII_BOX)
+
+
+def _render_oi_intel(d, cont=None) -> "html.Div":
+    """Per-strike OI-Dynamics map (Component A) + overnight continuity (Component B)."""
+    blocks = []
+    if cont is not None:
+        blocks.append(_render_continuity(cont))
+
+    lines = intraday_oi_intel.summary_lines(d)
+    if not d.has_data:
+        blocks.append(html.Div([
+            html.Div("⚡ LIVE OI DYNAMICS", style={**_OII_HEAD, "marginBottom": "4px"}),
+            html.Div(lines[0][1], style={"fontSize": "0.65rem", "color": "#64748b", **MONO}),
+        ], style=_OII_BOX))
+        return html.Div(blocks)
+
+    hdr_clr = _OII_CLR["bull"] if d.net_bias_score > 0 else _OII_CLR["bear"] if d.net_bias_score < 0 else _OII_CLR["neut"]
+    chips = []
+    if d.ceiling_strike is not None:
+        chips.append(html.Span(f"⛔ Ceiling {d.ceiling_strike:,.0f}",
+                               style={"color": "#f87171", "marginRight": "12px", "fontSize": "0.62rem"}))
+    if d.floor_strike is not None:
+        chips.append(html.Span(f"🛡 Floor {d.floor_strike:,.0f}",
+                               style={"color": "#4ade80", "fontSize": "0.62rem"}))
+    rows = [html.Div(text, style={"fontSize": "0.66rem", "color": _OII_CLR.get(bias, "#94a3b8"),
+                                  "padding": "2px 0", **MONO})
+            for bias, text in lines[1:]]
+    blocks.append(html.Div([
+        html.Div([
+            html.Span("⚡ LIVE OI DYNAMICS   ", style=_OII_HEAD),
+            html.Span(f"{d.verdict}  ({d.net_bias_score:+.1f})",
+                      style={"fontSize": "0.62rem", "fontWeight": "700", "color": hdr_clr}),
+        ], style={"marginBottom": "4px"}),
+        html.Div(chips, style={"marginBottom": "5px"}) if chips else html.Div(),
+        html.Div(rows),
+    ], style=_OII_BOX))
+    return html.Div(blocks)
+
+
+def _render_track_record() -> "html.Div":
+    """Component C — today's intraday paper-trade track record + honest stats."""
+    led    = intraday_trades.get_ledger()
+    today  = datetime.datetime.now(tz=IST).date().isoformat()
+    s      = led.stats(today)
+    recent = led.recent(12, today)
+    if not recent:
+        return html.Div([
+            html.Div("📒 TRACK RECORD (today)", style={**_OII_HEAD, "marginBottom": "4px"}),
+            html.Div("No signals fired yet today.", style={"fontSize": "0.64rem", "color": "#64748b", **MONO}),
+        ], style=_OII_BOX)
+
+    hit = s.get("hit_rate")
+    avg_r = s.get("avg_r")
+    hit_clr = "#4ade80" if (hit or 0) >= 50 else "#f87171"
+    stat_line = []
+    if s.get("n"):
+        stat_line.append(html.Span(f"{s['wins']}W / {s['losses']}L  ", style={"color": "#94a3b8"}))
+        if hit is not None:
+            stat_line.append(html.Span(f"{hit:.0f}% hit  ", style={"color": hit_clr, "fontWeight": "700"}))
+        if avg_r is not None:
+            stat_line.append(html.Span(f"avg {avg_r:+.2f}R", style={"color": "#4ade80" if avg_r >= 0 else "#f87171"}))
+
+    _ST = {"OPEN": "#fbbf24", "T1": "#4ade80", "T2": "#22c55e", "SL": "#f87171", "EOD": "#94a3b8"}
+    rows = []
+    for t in recent:
+        oc = t.get("outcome") or "OPEN"
+        st = t.get("status") or "OPEN"
+        r  = t.get("r_multiple")
+        rtxt = f"{r:+.2f}R" if r is not None else "live"
+        clr = _ST.get(st, "#94a3b8")
+        idx = (t.get("index_sym") or "").replace("NSE:", "").replace("-INDEX", "")
+        tm  = (t.get("opened_ts") or "")[11:16]
+        rows.append(html.Div([
+            html.Span(f"{tm} ", style={"color": "#475569"}),
+            html.Span(f"{idx} {t.get('direction')} {t.get('strike'):,.0f}  ", style={"color": "#cbd5e1"}),
+            html.Span(f"{st} ", style={"color": clr, "fontWeight": "700"}),
+            html.Span(rtxt, style={"color": "#4ade80" if (r or 0) > 0 else "#f87171" if (r or 0) < 0 else "#fbbf24"}),
+        ], style={"fontSize": "0.64rem", "padding": "1px 0", **MONO}))
+
+    return html.Div([
+        html.Div([
+            html.Span("📒 TRACK RECORD (today)   ", style=_OII_HEAD),
+            html.Span(stat_line),
+        ], style={"marginBottom": "5px"}),
+        html.Div(rows),
+    ], style=_OII_BOX)
+
+
+@app.callback(
+    Output("track-record", "children"),
+    Input("setup-tick",    "n_intervals"),
+    State("sel-sym",       "data"),
+)
+def update_track_record(_, sel):
+    if not sel:
+        return html.Div()
+    return _render_track_record()
+
+
 @app.callback(
     Output("trade-rec",      "children"),
     Output("velocity-panel", "children"),
+    Output("oi-intel-panel", "children"),
     Input("tf-dd",           "value"),
     Input("setup-tick",      "n_intervals"),
     Input("expiry-dd",       "value"),
@@ -2895,7 +3080,7 @@ def update_oc(_, expiry, sym):
 )
 def update_trade_rec(tf_key, _, expiry, sym):
     if not sym or not tf_key:
-        return html.Div(), html.Div()
+        return html.Div(), html.Div(), html.Div()
 
     with _lock:
         spot = (_latest.get(sym) or {}).get("ltp", 0)
@@ -2905,7 +3090,7 @@ def update_trade_rec(tf_key, _, expiry, sym):
     if oc_data.get("s") != "ok":
         return (html.Div("Option chain unavailable",
                          style={"color": "#475569", "fontSize": "0.65rem", **MONO}),
-                html.Div())
+                html.Div(), html.Div())
 
     d   = oc_data.get("data", {})
     raw = d.get("optionsChain", [])
@@ -2949,7 +3134,25 @@ def update_trade_rec(tf_key, _, expiry, sym):
         total_c_oi=tot_c_oi, total_p_oi=tot_p_oi,
     )
 
-    return _render_trade_rec(rec, sym), _render_velocity_panel(sym)
+    # Component A: per-strike live OI-Dynamics map
+    oi_dyn = intraday_oi_intel.analyze_oi_dynamics(strike_map, spot)
+
+    # Component B: overnight->morning continuity vs last night's DCM walls
+    _levels = {}
+    try:
+        from daily_context_bridge import get_bridge
+        _levels = get_bridge().get_panel_data(sym) or {}
+    except Exception:
+        _levels = {}
+    cont = intraday_oi_intel.analyze_continuity(strike_map, spot, _levels)
+
+    # Component C: log a tracked paper trade when the engine fires an actionable setup
+    try:
+        intraday_trades.get_ledger().maybe_open(sym, rec)
+    except Exception:
+        pass
+
+    return _render_trade_rec(rec, sym), _render_velocity_panel(sym), _render_oi_intel(oi_dyn, cont)
 
 
 # ── Callback: sidebar prediction block (30-second refresh via setup-tick) ─────
@@ -3012,6 +3215,12 @@ if __name__ == "__main__":
         daemon=True, name="oi-poller",
     ).start()
     print("  OI snapshot poller started — 3-min intervals")
+
+    threading.Thread(
+        target=_trade_tracker_poller,
+        daemon=True, name="trade-tracker",
+    ).start()
+    print("  Trade tracker started — paper-trade outcomes every 20s")
 
     print(f"  Open  →  http://127.0.0.1:8050")
     print(SEP)
