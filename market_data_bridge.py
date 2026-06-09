@@ -30,7 +30,7 @@ INDEX_NAMES = {
     "NSE:NIFTY50-INDEX":    {"fii_cat": "NIFTY FUTURES",    "idx_name": "Nifty 50"},
     "NSE:NIFTYBANK-INDEX":  {"fii_cat": "BANKNIFTY FUTURES","idx_name": "Nifty Bank"},
     "NSE:FINNIFTY-INDEX":   {"fii_cat": "FINNIFTY FUTURES", "idx_name": "Nifty Financial Services"},
-    "NSE:MIDCPNIFTY-INDEX": {"fii_cat": "MIDCPNIFTY FUTURES","idx_name": "Nifty Midcap 50"},
+    "NSE:MIDCPNIFTY-INDEX": {"fii_cat": "MIDCPNIFTY FUTURES","idx_name": "Nifty Midcap Select"},
 }
 
 _lock  = threading.Lock()
@@ -412,22 +412,35 @@ def get_institutional_bias(index_sym: str, live_spot: float = 0) -> tuple[float,
 def _get_delivery_context() -> dict:
     """
     Read large-cap delivery quality from the nightly sync local snapshot.
-    Returns {} when no local DB or today's sync not available.
+
+    Accepts the most recent successful sync within the last 3 calendar days —
+    NOT an exact today() match.  The sync runs at ~8:30 PM (sync_date = that
+    evening's date); the live trading session is the NEXT morning, so an exact
+    today() match would always miss and silently drop this sub-signal.  This
+    mirrors daily_context_bridge._try_load_from_local's 3-day acceptance window.
+    Returns {} when no local DB or no recent successful sync.
     """
-    today = datetime.date.today().isoformat()
     if not _LOCAL_DB.exists():
         return {}
     try:
         con = sqlite3.connect(str(_LOCAL_DB))
         row = con.execute("""
-            SELECT mc.nifty50_avg_deliv_pct, mc.nifty50_high_deliv_count
+            SELECT mc.nifty50_avg_deliv_pct, mc.nifty50_high_deliv_count, mc.sync_date
             FROM market_context mc
             JOIN sync_metadata sm ON mc.sync_date = sm.sync_date
-            WHERE mc.sync_date = ? AND sm.status = 'ok'
-        """, [today]).fetchone()
+            WHERE sm.status = 'ok'
+            ORDER BY mc.sync_date DESC
+            LIMIT 1
+        """).fetchone()
         con.close()
         if row and row[0] is not None:
-            return {"avg_deliv_pct": row[0], "high_deliv_count": row[1]}
+            try:
+                age_days = (datetime.date.today() -
+                            datetime.date.fromisoformat(str(row[2])[:10])).days
+            except Exception:
+                age_days = 99
+            if age_days <= 3:
+                return {"avg_deliv_pct": row[0], "high_deliv_count": row[1]}
     except Exception:
         pass
     return {}

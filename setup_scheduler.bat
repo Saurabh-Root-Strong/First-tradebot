@@ -2,11 +2,16 @@
 REM ─────────────────────────────────────────────────────────────────────────────
 REM  setup_scheduler.bat  --  Register Tradebot Nightly Sync with Windows Task Scheduler
 REM
-REM  Run this script ONCE (as Administrator) to set up the scheduled task.
-REM  The task will run nightly_sync.py every weekday (Mon-Fri) at 7:30 PM.
+REM  Run this script ONCE to set up the scheduled task (single trigger fallback).
+REM  The task runs run_sync.bat every weekday (Mon-Fri) at 8:30 PM.
 REM
-REM  Daily_Cash_Market updates its DuckDB at ~6:30 PM.  7:30 PM gives it a
-REM  comfortable 60-minute window to complete before Tradebot pulls a snapshot.
+REM  Daily_Cash_Market's NSE ingestion task runs at 7:30 PM (with a 11:30 PM
+REM  retry).  Tradebot must run AFTER it -- 8:30 PM gives the 7:30 PM ingestion
+REM  a 60-minute window.  (Do NOT schedule at 7:30 PM -- that races DCM.)
+REM
+REM  NOTE: the live task registered via PowerShell adds a second 11:55 PM trigger
+REM  to recover days when DCM's 7:30 PM run failed and only the 11:30 PM retry
+REM  succeeded.  schtasks below registers a single 8:30 PM trigger only.
 REM
 REM  To check task status:   schtasks /Query /TN "TradebotNightlySync" /FO LIST
 REM  To run manually:        schtasks /Run   /TN "TradebotNightlySync"
@@ -20,30 +25,22 @@ set TASK_NAME=TradebotNightlySync
 set SCRIPT_DIR=%~dp0
 set SCRIPT_DIR=%SCRIPT_DIR:~0,-1%
 
-REM Use the venv python if available, else fall back to system python
-if exist "%SCRIPT_DIR%\.venv\Scripts\python.exe" (
-    set PYTHON=%SCRIPT_DIR%\.venv\Scripts\python.exe
-) else (
-    set PYTHON=python
-)
-
-set SCRIPT=%SCRIPT_DIR%\nightly_sync.py
+set LAUNCHER=%SCRIPT_DIR%\run_sync.bat
 set LOG_FILE=%SCRIPT_DIR%\data\nightly_sync.log
 
-REM Verify the script exists before registering
-if not exist "%SCRIPT%" (
-    echo ERROR: nightly_sync.py not found at %SCRIPT%
+REM Verify the launcher exists before registering
+if not exist "%LAUNCHER%" (
+    echo ERROR: run_sync.bat not found at %LAUNCHER%
     pause
     exit /b 1
 )
 
 echo.
-echo ─── Tradebot Nightly Sync — Task Scheduler Setup ───────────────────────────
+echo --- Tradebot Nightly Sync -- Task Scheduler Setup --------------------------
 echo.
-echo   Python : %PYTHON%
-echo   Script : %SCRIPT%
-echo   Log    : %LOG_FILE%
-echo   Schedule: Mon-Fri at 19:30 (7:30 PM)
+echo   Launcher : %LAUNCHER%
+echo   Log      : %LOG_FILE%
+echo   Schedule : Mon-Fri at 20:30 (8:30 PM)
 echo.
 
 REM Delete existing task if present (idempotent re-registration)
@@ -51,16 +48,16 @@ schtasks /Delete /TN "%TASK_NAME%" /F >nul 2>&1
 
 REM Register the task
 REM  /SC WEEKLY  /D  = weekdays only
-REM  /ST 19:30   = 7:30 PM
-REM  /RL HIGHEST = run with highest available privileges (avoids UAC blocking)
+REM  /ST 20:30   = 8:30 PM (after DCM's 7:30 PM ingestion)
 REM  /F          = force overwrite
+REM  (No /RL HIGHEST: the sync needs no elevation, and HIGHEST requires running
+REM   this script as Administrator. run_sync.bat handles the log redirect.)
 schtasks /Create ^
   /TN "%TASK_NAME%" ^
-  /TR "\"%PYTHON%\" \"%SCRIPT%\" >> \"%LOG_FILE%\" 2>&1" ^
+  /TR "cmd /c \"%LAUNCHER%\"" ^
   /SC WEEKLY ^
   /D MON,TUE,WED,THU,FRI ^
-  /ST 19:30 ^
-  /RL HIGHEST ^
+  /ST 20:30 ^
   /F
 
 if %ERRORLEVEL% neq 0 (
@@ -72,13 +69,13 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo.
-echo ─── Task registered successfully ───────────────────────────────────────────
+echo --- Task registered successfully ------------------------------------------
 echo.
 echo   Task name : %TASK_NAME%
-echo   Runs at   : 7:30 PM  Mon-Fri
+echo   Runs at   : 8:30 PM  Mon-Fri
 echo.
 echo   To verify : schtasks /Query /TN "%TASK_NAME%" /FO LIST
-echo   To test   : python nightly_sync.py --force
+echo   To test   : schtasks /Run /TN "%TASK_NAME%"
 echo   To check  : python nightly_sync.py --status
 echo.
 
@@ -87,9 +84,10 @@ set /p RUNNOW="Run first sync now? (y/n): "
 if /i "%RUNNOW%"=="y" (
     echo.
     echo Running first sync...
-    "%PYTHON%" "%SCRIPT%" --force
+    call "%LAUNCHER%"
     echo.
-    "%PYTHON%" "%SCRIPT%" --status
+    set PYTHONUTF8=1
+    python "%SCRIPT_DIR%\nightly_sync.py" --status
 )
 
 echo.
