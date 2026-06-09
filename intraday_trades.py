@@ -101,8 +101,14 @@ class TradeLedger:
 
     # ── Open ──────────────────────────────────────────────────────────────────
     def maybe_open(self, index_sym: str, rec: dict,
+                   oi_dyn=None, cont=None,
                    ts: Optional[datetime.datetime] = None) -> Optional[str]:
-        """Open a tracked trade from an actionable rec. Returns trade_id or None."""
+        """Open a tracked trade from an actionable rec. Returns trade_id or None.
+
+        oi_dyn / cont are the live OI-Dynamics (A) and overnight-continuity (B)
+        reads at signal time — woven into the trade's `reason` for the cockpit so
+        the 'why' carries the real intraday edge, not just the 9-layer signal.
+        """
         if not rec or rec.get("neutral") or rec.get("direction") not in ("CE", "PE"):
             return None
         if int(rec.get("confidence") or 0) < _MIN_CONFIDENCE:
@@ -141,9 +147,23 @@ class TradeLedger:
                     except Exception:
                         pass
 
-                # Capture the edge: top 2 signal reasons (or the warning) for the card.
-                _sigs  = rec.get("opt_signals") or []
-                reason = " · ".join(str(t) for _, t in _sigs[:2])[:200] if _sigs else str(rec.get("warning") or "")[:200]
+                # Capture the edge: live OI-Dynamics (A) + overnight continuity (B)
+                # + the top 9-layer signal, so the cockpit 'why' shows the real read.
+                bits: list = []
+                try:
+                    if oi_dyn is not None and getattr(oi_dyn, "has_data", False):
+                        bits.append("OI▸ " + str(oi_dyn.headline))
+                except Exception:
+                    pass
+                try:
+                    if cont is not None and getattr(cont, "has_data", False):
+                        bits.append("Overnight▸ " + str(cont.verdict))
+                except Exception:
+                    pass
+                _sigs = rec.get("opt_signals") or []
+                if _sigs:
+                    bits.append(str(_sigs[0][1]))
+                reason = " | ".join(bits)[:280] if bits else str(rec.get("warning") or "")[:280]
 
                 tid = uuid.uuid4().hex[:12]
                 con.execute(

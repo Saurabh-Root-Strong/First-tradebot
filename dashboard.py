@@ -750,7 +750,16 @@ def _auto_signal_poller():
                             expiry_data=expiry_data, futures=fetch_futures(sym),
                             pcr=pcr, mp=mp, total_c_oi=tot_c, total_p_oi=tot_p,
                         )
-                        led.maybe_open(sym, rec)
+                        # A/B intelligence for the trade's edge reason
+                        oi_dyn = intraday_oi_intel.analyze_oi_dynamics(sm, spot)
+                        _lv = {}
+                        try:
+                            from daily_context_bridge import get_bridge
+                            _lv = get_bridge().get_panel_data(sym) or {}
+                        except Exception:
+                            _lv = {}
+                        cont = intraday_oi_intel.analyze_continuity(sm, spot, _lv)
+                        led.maybe_open(sym, rec, oi_dyn=oi_dyn, cont=cont)
                     except Exception:
                         pass
         except Exception:
@@ -3227,8 +3236,9 @@ def _trade_card(t) -> "html.Div":
         ]),
         html.Div(f"peak {mfe:.1f} / low {mae:.1f}" if mfe and mae else "",
                  style={"color": "#334155", "fontSize": "0.5rem", "marginTop": "2px"}),
-        html.Div((t.get("reason") or "")[:96],
-                 style={"color": "#52708f", "fontSize": "0.52rem", "marginTop": "3px", "lineHeight": "1.35"}),
+        html.Div((t.get("reason") or "")[:180],
+                 style={"color": "#52708f", "fontSize": "0.52rem", "marginTop": "3px",
+                        "lineHeight": "1.4", "whiteSpace": "normal"}),
     ], style={"padding": "9px 0", "borderBottom": "1px solid #111d2e", **MONO})
 
 
@@ -3386,7 +3396,7 @@ def update_trade_rec(tf_key, _, expiry, sym):
 
     # Component C: log a tracked paper trade when the engine fires an actionable setup
     try:
-        intraday_trades.get_ledger().maybe_open(sym, rec)
+        intraday_trades.get_ledger().maybe_open(sym, rec, oi_dyn=oi_dyn, cont=cont)
     except Exception:
         pass
 
