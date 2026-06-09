@@ -35,8 +35,10 @@ _DB = Path(__file__).parent / "data" / "intraday_trades.db"
 
 # Don't re-enter the same (index, direction) within this window after a close.
 _REENTRY_COOLDOWN_MIN = 10
-# Minimum confidence to log a trade (skip the weakest flickers).
-_MIN_CONFIDENCE = 40
+# Minimum confidence to log a trade. 0 = track every directional (non-NEUTRAL)
+# call and tag its conviction (LOW/MODERATE/HIGH) — the dedup + cooldown prevent
+# spam, and this builds the full validation dataset (do LOW setups lose, HIGH win?).
+_MIN_CONFIDENCE = 0
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS paper_trades (
@@ -66,7 +68,8 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     exit_ltp     REAL,
     exit_ts      TEXT,
     r_multiple   REAL,
-    outcome      TEXT
+    outcome      TEXT,
+    reason       TEXT
 );
 """
 
@@ -85,6 +88,10 @@ class TradeLedger:
         _DB.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.execute(_DDL)
+            try:
+                con.execute("ALTER TABLE paper_trades ADD COLUMN reason TEXT")
+            except Exception:
+                pass   # column already exists
             con.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -134,19 +141,23 @@ class TradeLedger:
                     except Exception:
                         pass
 
+                # Capture the edge: top 2 signal reasons (or the warning) for the card.
+                _sigs  = rec.get("opt_signals") or []
+                reason = " · ".join(str(t) for _, t in _sigs[:2])[:200] if _sigs else str(rec.get("warning") or "")[:200]
+
                 tid = uuid.uuid4().hex[:12]
                 con.execute(
                     "INSERT INTO paper_trades (trade_id, opened_ts, date, index_sym, "
                     "option_sym, direction, strike, expiry, tf, conviction, confidence, "
                     "composite, spot_entry, entry_ltp, sl, t1, t2, risk, mfe, mae, last_ltp, "
-                    "updated_ts, status, outcome) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "updated_ts, status, outcome, reason) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     [tid, ts.isoformat(), day, index_sym,
                      rec.get("option_sym"), direction, rec.get("strike"), str(rec.get("exp_date") or ""),
                      rec.get("tf_label"), rec.get("conviction"), int(rec.get("confidence") or 0),
                      float(rec.get("score") or 0), rec.get("spot"),
                      entry, sl, float(rec.get("t1") or 0), float(rec.get("t2") or 0), risk,
-                     entry, entry, entry, ts.isoformat(), "OPEN", "OPEN"],
+                     entry, entry, entry, ts.isoformat(), "OPEN", "OPEN", reason],
                 )
                 con.commit()
                 return tid

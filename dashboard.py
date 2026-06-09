@@ -705,6 +705,59 @@ def _trade_tracker_poller():
         time.sleep(20)
 
 
+def _auto_signal_poller():
+    """
+    Autonomous signal eval for ALL 4 indices (Component C — track-record coverage).
+
+    The UI callback only logs trades for the index you're viewing; this evaluates
+    every index every 60s during market hours and opens tracked trades, so the
+    Today's-Trades section reflects the whole book, not just the active panel.
+    Uses the 15-min intraday profile (same as the UI default).
+    """
+    led = intraday_trades.get_ledger()
+    while True:
+        try:
+            now = datetime.datetime.now(tz=IST)
+            if datetime.time(9, 16) <= now.time() <= datetime.time(15, 25):
+                for sym in INDEX_SYMBOLS:
+                    try:
+                        with _lock:
+                            spot = (_latest.get(sym) or {}).get("ltp", 0)
+                        if not spot:
+                            continue
+                        oc = fetch_option_chain(sym)
+                        if oc.get("s") != "ok":
+                            continue
+                        d   = oc.get("data", {})
+                        raw = d.get("optionsChain", [])
+                        if not raw:
+                            continue
+                        expiry_data = d.get("expiryData", [])
+                        sm: dict = {}
+                        for e in raw:
+                            sp = e.get("strike_price", -1)
+                            if sp > 0 and e.get("option_type") in ("CE", "PE"):
+                                sm.setdefault(sp, {})[e["option_type"]] = e
+                        tot_c = d.get("callOi", 0); tot_p = d.get("putOi", 0)
+                        pcr   = tot_p / tot_c if tot_c else 0
+                        mp_ch = [{"strike_price": sp,
+                                  "call_options": {"oi": sm[sp].get("CE", {}).get("oi", 0)},
+                                  "put_options":  {"oi": sm[sp].get("PE", {}).get("oi", 0)}}
+                                 for sp in sorted(sm)]
+                        mp  = compute_max_pain(mp_ch) if mp_ch else 0
+                        rec = build_recommendation(
+                            sym=sym, tf_key="15min", spot=spot, strike_map=sm,
+                            expiry_data=expiry_data, futures=fetch_futures(sym),
+                            pcr=pcr, mp=mp, total_c_oi=tot_c, total_p_oi=tot_p,
+                        )
+                        led.maybe_open(sym, rec)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(60)
+
+
 # ── Style constants ────────────────────────────────────────────────────────────
 BG      = "#080d14"
 BG_CARD = "#0f1623"
@@ -1067,8 +1120,18 @@ app.layout = dbc.Container([
                 html.Span("click to open chain", style={"color": "#1e2d40",
                                                           "fontSize": "0.52rem", "letterSpacing": "0.04em"}),
             ], style={"textAlign": "center", "marginTop": "14px"}),
-            # ── EOD Prediction signal breakdown (always visible) ──────────────
-            html.Div(id="sidebar-pred"),
+            # ── Clickable: Today's Trades → opens the Trade Book view ─────────
+            html.Div(id="nav-tradebook", n_clicks=0, children=[
+                html.Div("📒 TODAY'S TRADES", style={
+                    "letterSpacing": "0.14em", "color": "#cbd5e1", "fontWeight": "700",
+                    "fontSize": "0.6rem", "marginBottom": "4px"}),
+                html.Div(id="sidebar-trades"),
+                html.Div("click to view ▸", style={
+                    "color": "#475569", "fontSize": "0.5rem", "marginTop": "4px"}),
+            ], style={
+                "marginTop": "18px", "padding": "10px 12px", "borderRadius": "8px",
+                "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #fbbf24",
+                "background": BG_CARD, "cursor": "pointer"}),
         ], md=2, style={
             "background": BG_SIDE, "padding": "16px 10px",
             "borderRight": "1px solid #111d2e",
@@ -1162,6 +1225,9 @@ app.layout = dbc.Container([
                                              "maxHeight": "calc(100vh - 300px)"}),
                 ),
             ]),
+
+            # TRADE BOOK PANEL (hidden until 'Today's Trades' is clicked)
+            html.Div(id="trade-book-panel", style={"display": "none"}),
         ], md=10, style={"padding": "12px 16px"}),
     ], className="gx-0"),
 
@@ -2579,15 +2645,18 @@ def _render_trade_rec(rec: dict, sym: str) -> html.Div:
     Output("sel-sym",    "data"),
     Output("sel-expiry", "data"),
     [Input(f"nav-{_slug(s)}", "n_clicks") for s in INDEX_SYMBOLS],
+    Input("nav-tradebook", "n_clicks"),
     State("sel-sym", "data"),
     prevent_initial_call=True,
 )
 def on_nav_click(*args):
-    *_, current = args
+    *_, _tradebook_clicks, current = args
     from dash import callback_context as ctx
     if not ctx.triggered:
         return current, ""
     tid = ctx.triggered[0]["prop_id"].split(".")[0]
+    if tid == "nav-tradebook":
+        return (None, "") if current == "TRADES" else ("TRADES", "")
     for sym in INDEX_SYMBOLS:
         if tid == f"nav-{_slug(sym)}":
             return (None, "") if current == sym else (sym, "")
@@ -2596,17 +2665,22 @@ def on_nav_click(*args):
 
 # ── Callback 2: toggle panels + highlight selected nav card ───────────────────
 @app.callback(
-    Output("overview-panel", "style"),
-    Output("oc-panel",       "style"),
-    Output("oc-title",       "children"),
+    Output("overview-panel",  "style"),
+    Output("oc-panel",        "style"),
+    Output("trade-book-panel", "style"),
+    Output("oc-title",        "children"),
     *[Output(f"nav-{_slug(s)}", "style") for s in INDEX_SYMBOLS],
     Input("sel-sym", "data"),
 )
 def toggle_view(sym):
-    ov_style = {"display": "none"} if sym else {"display": "block"}
-    oc_style = {"display": "block"} if sym else {"display": "none"}
+    is_trades = (sym == "TRADES")
+    is_index  = bool(sym) and not is_trades
 
-    if sym:
+    ov_style = {"display": "block"} if not sym else {"display": "none"}
+    oc_style = {"display": "block"} if is_index else {"display": "none"}
+    tb_style = {"display": "block"} if is_trades else {"display": "none"}
+
+    if is_index:
         color = COLORS[sym]
         title = html.Div([
             html.Span(LABELS[sym], style={
@@ -2629,7 +2703,7 @@ def toggle_view(sym):
             "background": f"{c}18" if selected else BG_CARD,
             "cursor": "pointer", "transition": "background 0.15s",
         })
-    return (ov_style, oc_style, title, *nav_styles)
+    return (ov_style, oc_style, tb_style, title, *nav_styles)
 
 
 # ── Callback 3: sidebar live prices + status ───────────────────────────────────
@@ -3068,6 +3142,170 @@ def update_track_record(_, sel):
     return _render_track_record()
 
 
+_IDX_ABBR = {"NSE:NIFTY50-INDEX": "NIFTY", "NSE:NIFTYBANK-INDEX": "BANK",
+             "NSE:FINNIFTY-INDEX": "FIN", "NSE:MIDCPNIFTY-INDEX": "MIDCP"}
+_TRADE_ST_CLR = {"OPEN": "#fbbf24", "T1": "#4ade80", "T2": "#22c55e", "SL": "#f87171", "EOD": "#94a3b8"}
+
+
+def _render_sidebar_trades() -> "html.Div":
+    """Compact stat line shown inside the clickable 'Today's Trades' nav button."""
+    led   = intraday_trades.get_ledger()
+    today = datetime.datetime.now(tz=IST).date().isoformat()
+    s     = led.stats(today)
+    n_open = len(led.open_trades())
+    if not s.get("n") and n_open == 0:
+        return html.Div("no trades yet", style={"color": "#475569", "fontSize": "0.54rem", **MONO})
+    parts = []
+    if s.get("n"):
+        hit = s.get("hit_rate"); avgr = s.get("avg_r")
+        parts.append(html.Span(f"{s['wins']}W/{s['losses']}L ",
+                               style={"color": "#94a3b8", "fontSize": "0.55rem"}))
+        if hit is not None:
+            parts.append(html.Span(f"{hit:.0f}% ",
+                         style={"color": "#4ade80" if hit >= 50 else "#f87171",
+                                "fontWeight": "700", "fontSize": "0.55rem"}))
+        if avgr is not None:
+            parts.append(html.Span(f"{avgr:+.1f}R ",
+                         style={"color": "#4ade80" if avgr >= 0 else "#f87171", "fontSize": "0.55rem"}))
+    if n_open:
+        parts.append(html.Span(f"· {n_open} open", style={"color": "#fbbf24", "fontSize": "0.55rem"}))
+    return html.Div(parts, style=MONO)
+
+
+def _trade_levels_bar(t) -> "html.Div":
+    """SL → entry → current → T1 → T2 progress bar for a single trade."""
+    sl = t.get("sl"); t1 = t.get("t1"); t2 = t.get("t2")
+    entry = t.get("entry_ltp"); r = t.get("r_multiple")
+    cur = t.get("exit_ltp") if (t.get("status") or "OPEN") != "OPEN" else t.get("last_ltp")
+    if not (sl and t2 and t2 > sl):
+        return html.Div()
+    span = t2 - sl
+    def pct(x):
+        return 0 if x is None else max(2, min(98, (x - sl) / span * 100))
+    cur_clr = "#4ade80" if (r or 0) > 0 else "#f87171" if (r or 0) < 0 else "#fbbf24"
+    return html.Div([
+        html.Div(style={"position": "absolute", "left": f"{pct(entry)}%", "top": "-1px",
+                        "width": "2px", "height": "9px", "background": "#cbd5e1"}),
+        html.Div(style={"position": "absolute", "left": f"{pct(t1)}%", "top": "-1px",
+                        "width": "2px", "height": "9px", "background": "#22c55e"}),
+        html.Div(style={"position": "absolute", "left": f"{pct(cur)}%", "top": "-3px",
+                        "width": "9px", "height": "9px", "borderRadius": "50%",
+                        "background": cur_clr, "transform": "translateX(-4px)",
+                        "boxShadow": f"0 0 5px {cur_clr}"}),
+    ], style={"position": "relative", "height": "6px", "borderRadius": "3px",
+              "background": "linear-gradient(90deg,#7f1d1d 0%,#3f3f46 42%,#14532d 100%)",
+              "margin": "11px 3px 7px 3px"})
+
+
+def _trade_card(t) -> "html.Div":
+    st = t.get("status") or "OPEN"
+    r  = t.get("r_multiple")
+    clr = _TRADE_ST_CLR.get(st, "#94a3b8")
+    dirn = t.get("direction"); strike = t.get("strike") or 0
+    entry = t.get("entry_ltp"); sl = t.get("sl"); t1 = t.get("t1"); t2 = t.get("t2")
+    cur = t.get("exit_ltp") if st != "OPEN" else t.get("last_ltp")
+    mfe = t.get("mfe"); mae = t.get("mae")
+    tm = (t.get("opened_ts") or "")[11:16]
+    dir_clr = "#4ade80" if dirn == "CE" else "#f87171"
+    rtxt = f"{r:+.2f}R" if r is not None else "live"
+    r_clr = "#4ade80" if (r or 0) > 0 else "#f87171" if (r or 0) < 0 else "#fbbf24"
+    lvl = lambda lab, v, c: html.Span([html.Span(lab, style={"color": "#475569"}),
+                                       html.Span(f"{v:.1f}", style={"color": c, "fontWeight": "600"})],
+                                      style={"fontSize": "0.55rem", "marginRight": "6px"})
+    return html.Div([
+        html.Div([
+            html.Span(f"{tm} ", style={"color": "#475569", "fontSize": "0.58rem"}),
+            html.Span(f"{dirn} {strike:,.0f} ", style={"color": dir_clr, "fontWeight": "700", "fontSize": "0.74rem"}),
+            html.Span(st, style={"color": clr, "fontWeight": "700", "fontSize": "0.62rem"}),
+            html.Span(f"  {rtxt}", style={"color": r_clr, "fontSize": "0.66rem", "fontWeight": "700"}),
+            html.Span(f"  {t.get('conviction') or ''}", style={"color": "#475569", "fontSize": "0.52rem"}),
+        ]),
+        _trade_levels_bar(t),
+        html.Div([
+            lvl("SL ", sl, "#f87171"), lvl("E ", entry, "#94a3b8"),
+            lvl("● ", cur, "#e2e8f0"), lvl("T1 ", t1, "#22c55e"), lvl("T2 ", t2, "#16a34a"),
+        ]),
+        html.Div(f"peak {mfe:.1f} / low {mae:.1f}" if mfe and mae else "",
+                 style={"color": "#334155", "fontSize": "0.5rem", "marginTop": "2px"}),
+        html.Div((t.get("reason") or "")[:96],
+                 style={"color": "#52708f", "fontSize": "0.52rem", "marginTop": "3px", "lineHeight": "1.35"}),
+    ], style={"padding": "9px 0", "borderBottom": "1px solid #111d2e", **MONO})
+
+
+def _render_trade_book() -> "html.Div":
+    """Full Trade Book cockpit — trades by index with levels, progress, and reason."""
+    led   = intraday_trades.get_ledger()
+    today = datetime.datetime.now(tz=IST).date().isoformat()
+    s     = led.stats(today)
+    rows  = led.recent(200, today)
+    with _lock:
+        spots = {x: dict(_latest.get(x) or {}) for x in INDEX_SYMBOLS}
+
+    hdr_stats = []
+    if s.get("n"):
+        hit = s.get("hit_rate"); avgr = s.get("avg_r")
+        hdr_stats = [
+            html.Span(f"{s['n']} trades   ", style={"color": "#94a3b8"}),
+            html.Span(f"{s['wins']}W / {s['losses']}L   ", style={"color": "#cbd5e1"}),
+            html.Span(f"{hit:.0f}% hit   " if hit is not None else "",
+                      style={"color": "#4ade80" if (hit or 0) >= 50 else "#f87171", "fontWeight": "700"}),
+            html.Span(f"avg {avgr:+.2f}R" if avgr is not None else "",
+                      style={"color": "#4ade80" if (avgr or 0) >= 0 else "#f87171"}),
+        ]
+    header = html.Div([
+        html.Span("📒 TRADE BOOK — TODAY   ", style={
+            "color": "#fbbf24", "fontWeight": "700", "fontSize": "0.95rem", "letterSpacing": "0.08em"}),
+        html.Span(hdr_stats, style={"fontSize": "0.72rem"}),
+    ], style={"marginBottom": "14px"})
+
+    if not rows:
+        return html.Div([header, html.Div(
+            "No trades yet today — signals log here as the engine fires across all 4 indices.",
+            style={"color": "#475569", "fontSize": "0.75rem", **MONO})])
+
+    cols = []
+    for sym in INDEX_SYMBOLS:
+        idx_rows = [t for t in rows if t.get("index_sym") == sym]
+        cd = COLORS[sym]
+        sp = spots.get(sym, {})
+        spot_v = sp.get("ltp", 0); chp = sp.get("chp", 0)
+        spot_clr = "#22c55e" if chp >= 0 else "#ef4444"
+        cards = [_trade_card(t) for t in idx_rows] or [
+            html.Div("—", style={"color": "#334155", "fontSize": "0.7rem", "padding": "6px 0"})]
+        cols.append(dbc.Col([
+            html.Div([
+                html.Span(LABELS[sym], style={"color": cd, "fontWeight": "700", "fontSize": "0.68rem",
+                                              "letterSpacing": "0.08em"}),
+                html.Span(f"  {spot_v:,.0f} ", style={"color": "#cbd5e1", "fontSize": "0.6rem"}) if spot_v else "",
+                html.Span(f"{chp:+.2f}%" if spot_v else "", style={"color": spot_clr, "fontSize": "0.56rem"}),
+            ], style={"borderBottom": f"2px solid {cd}55", "paddingBottom": "5px", "marginBottom": "4px"}),
+            html.Div(cards),
+        ], md=3, style={"padding": "0 9px"}))
+
+    return html.Div([header, dbc.Row(cols, className="gx-0")],
+                    style={"background": BG_CARD, "border": "1px solid #111d2e",
+                           "borderRadius": "10px", "padding": "16px 18px"})
+
+
+@app.callback(
+    Output("sidebar-trades", "children"),
+    Input("setup-tick",      "n_intervals"),
+)
+def update_sidebar_trades(_):
+    return _render_sidebar_trades()
+
+
+@app.callback(
+    Output("trade-book-panel", "children"),
+    Input("setup-tick",        "n_intervals"),
+    Input("sel-sym",           "data"),
+)
+def update_trade_book(_, sel):
+    if sel != "TRADES":
+        return no_update
+    return _render_trade_book()
+
+
 @app.callback(
     Output("trade-rec",      "children"),
     Output("velocity-panel", "children"),
@@ -3155,16 +3393,6 @@ def update_trade_rec(tf_key, _, expiry, sym):
     return _render_trade_rec(rec, sym), _render_velocity_panel(sym), _render_oi_intel(oi_dyn, cont)
 
 
-# ── Callback: sidebar prediction block (30-second refresh via setup-tick) ─────
-@app.callback(
-    Output("sidebar-pred", "children"),
-    Input("signal-tick",   "n_intervals"),
-    Input("setup-tick",    "n_intervals"),
-)
-def update_sidebar_pred(*_):
-    return _render_sidebar_pred()
-
-
 # ── Callback: daily context panel (60-second refresh, same interval) ──────────
 @app.callback(
     Output("context-panel", "children"),
@@ -3221,6 +3449,12 @@ if __name__ == "__main__":
         daemon=True, name="trade-tracker",
     ).start()
     print("  Trade tracker started — paper-trade outcomes every 20s")
+
+    threading.Thread(
+        target=_auto_signal_poller,
+        daemon=True, name="auto-signal",
+    ).start()
+    print("  Auto signal eval started — all 4 indices every 60s")
 
     print(f"  Open  →  http://127.0.0.1:8050")
     print(SEP)
