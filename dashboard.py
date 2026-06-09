@@ -567,6 +567,8 @@ def _onmessage(msg: dict) -> None:
     if ltp:
         # Single call: feeds candle builders AND persists raw tick to DuckDB
         record_tick(sym, ts, ltp, vol, day_open, day_high, day_low, ch, chp)
+        global _last_tick_wall
+        _last_tick_wall = time.time()
 
     if sym not in _seen:
         _seen.add(sym)
@@ -591,6 +593,24 @@ def _start_ws(token: str):
         on_error=_onerror, on_message=_onmessage,
     )
     _ws.connect()
+
+
+# ── WebSocket health heartbeat (read by supervise.py) ────────────────────────
+_last_tick_wall = 0.0
+HEARTBEAT_FILE = Path(__file__).parent / "data" / "ws_heartbeat.txt"
+
+
+def _heartbeat_writer():
+    """Write the wall-clock of the last received tick to a file every 10s, so the
+    supervisor can detect a stalled WebSocket (no ticks during market hours) and
+    restart the process before capture is lost."""
+    HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            HEARTBEAT_FILE.write_text(f"{_last_tick_wall:.0f}")
+        except Exception:
+            pass
+        time.sleep(10)
 
 
 def _oi_background_poller():
@@ -3580,6 +3600,11 @@ if __name__ == "__main__":
         daemon=True, name="auto-signal",
     ).start()
     print("  Auto signal eval started — all 4 indices every 60s")
+
+    threading.Thread(
+        target=_heartbeat_writer,
+        daemon=True, name="heartbeat",
+    ).start()
 
     print(f"  Open  →  http://127.0.0.1:8050")
     print(SEP)
