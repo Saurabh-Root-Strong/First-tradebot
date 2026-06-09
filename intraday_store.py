@@ -27,14 +27,24 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # resolution name → seconds per candle
 RESOLUTIONS = {
+    "1sec":  1,
+    "5sec":  5,
+    "15sec": 15,
+    "30sec": 30,
     "1min":  60,
     "5min":  300,
     "15min": 900,
     "60min": 3600,
 }
 
-# keep enough candles for full session + small buffer
+# keep enough candles for full session + small buffer (in-memory deque length).
+# Sub-minute resolutions keep a recent rolling window (full history lives in the
+# persisted `candles` table + raw `ticks` ledger).
 _MAXLEN = {
+    "1sec":  900,   # ~15 min of 1-sec (live scalping window)
+    "5sec":  720,   # ~60 min
+    "15sec": 480,   # ~2 hr
+    "30sec": 360,   # ~3 hr
     "1min":  400,   # ~6.5 hr at 1-min
     "5min":  80,
     "15min": 30,

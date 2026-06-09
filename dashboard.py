@@ -16,7 +16,7 @@ from dash import dcc, html, Input, Output, State, no_update
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from fyers_apiv3.FyersWebsocket import data_ws
-from signals import run_full_analysis, recommend_option
+from signals import run_full_analysis, recommend_option, fetch_ohlcv, _vwap
 from trade_setup import build_recommendation, TF_PROFILES
 from intraday_store import candle_store, oi_store, build_oi_snapshot, session_phase, record_tick
 import intraday_oi_intel
@@ -1167,6 +1167,29 @@ app.layout = dbc.Container([
                     dcc.Graph(id="ov-chart",
                               config={"displayModeBar": False},
                               style={"height": "220px"}),
+                ]), style={"background": BG_CARD, "border": "1px solid #111d2e",
+                           "borderRadius": "10px", "marginBottom": "12px"}),
+                # ── Multi-timeframe candlestick chart (1m / 5m / 15m / 1h) ────────
+                dbc.Card(dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col(html.Div("CANDLES", style={
+                            "fontSize": "0.62rem", "letterSpacing": "0.12em",
+                            "color": "#1e3a5f", "fontWeight": "700", "paddingTop": "6px"}), md=2),
+                        dbc.Col(dcc.Dropdown(
+                            id="cndl-idx", clearable=False,
+                            options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
+                            value="NSE:NIFTY50-INDEX", style={"fontSize": "0.72rem"}), md=4),
+                        dbc.Col(dcc.Dropdown(
+                            id="cndl-tf", clearable=False,
+                            options=[{"label": "1 Sec", "value": "1S"}, {"label": "5 Sec", "value": "5S"},
+                                     {"label": "15 Sec", "value": "15S"}, {"label": "30 Sec", "value": "30S"},
+                                     {"label": "1 Min", "value": "1"}, {"label": "5 Min", "value": "5"},
+                                     {"label": "15 Min", "value": "15"}, {"label": "1 Hour", "value": "60"},
+                                     {"label": "Daily", "value": "D"}],
+                            value="5", style={"fontSize": "0.72rem"}), md=3),
+                    ], className="gx-1 mb-1"),
+                    dcc.Graph(id="cndl-chart", config={"displayModeBar": False},
+                              style={"height": "380px"}),
                 ]), style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "marginBottom": "12px"}),
                 # Trade signals panel
@@ -3266,10 +3289,12 @@ def _render_trade_book() -> "html.Div":
         html.Span("📒 TRADE BOOK — TODAY   ", style={
             "color": "#fbbf24", "fontWeight": "700", "fontSize": "0.95rem", "letterSpacing": "0.08em"}),
         html.Span(hdr_stats, style={"fontSize": "0.72rem"}),
-    ], style={"marginBottom": "14px"})
+    ], style={"marginBottom": "10px"})
+
+    pred_dropdown = _prediction_dropdown(is_open=False)
 
     if not rows:
-        return html.Div([header, html.Div(
+        return html.Div([header, pred_dropdown, html.Div(
             "No trades yet today — signals log here as the engine fires across all 4 indices.",
             style={"color": "#475569", "fontSize": "0.75rem", **MONO})])
 
@@ -3292,7 +3317,7 @@ def _render_trade_book() -> "html.Div":
             html.Div(cards),
         ], md=3, style={"padding": "0 9px"}))
 
-    return html.Div([header, dbc.Row(cols, className="gx-0")],
+    return html.Div([header, pred_dropdown, dbc.Row(cols, className="gx-0")],
                     style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "padding": "16px 18px"})
 
@@ -3403,6 +3428,21 @@ def update_trade_rec(tf_key, _, expiry, sym):
     return _render_trade_rec(rec, sym), _render_velocity_panel(sym), _render_oi_intel(oi_dyn, cont)
 
 
+def _prediction_dropdown(is_open: bool = True) -> "html.Div":
+    """Index Prediction as a collapsible, scrollable dropdown (shared by overview + Trade Book)."""
+    try:
+        _pred = _render_context_panel()
+    except Exception:
+        _pred = html.Div()
+    return html.Details([
+        html.Summary("📈  INDEX PREDICTION — Tomorrow's Directional Forecast",
+                     style={"cursor": "pointer", "color": "#40c4ff", "fontSize": "0.78rem",
+                            "fontWeight": "700", "letterSpacing": "0.05em", "padding": "8px 4px"}),
+        html.Div(_pred, style={"maxHeight": "440px", "overflowY": "auto", "padding": "8px 4px"}),
+    ], open=is_open, style={"border": "1px solid #14243a", "borderRadius": "8px",
+                            "background": "#0b1320", "marginBottom": "12px", "padding": "0 6px"})
+
+
 # ── Callback: daily context panel (60-second refresh, same interval) ──────────
 @app.callback(
     Output("context-panel", "children"),
@@ -3412,7 +3452,82 @@ def update_trade_rec(tf_key, _, expiry, sym):
 def update_context_panel(_, sel):
     if sel:   # overview hidden while OC panel is active
         return no_update
-    return _render_context_panel()
+    return _prediction_dropdown(is_open=True)
+
+
+def _stored_candles(sym: str, resolution: str, limit: int = 200) -> "pd.DataFrame":
+    """Read built candles from our own DuckDB `candles` table (for 1-sec, which Fyers can't serve)."""
+    try:
+        from intraday_db import idb
+        sql = (f"SELECT ts, open, high, low, close, volume FROM candles "
+               f"WHERE symbol = '{sym}' AND resolution = '{resolution}' "
+               f"ORDER BY ts DESC LIMIT {int(limit)}")
+        df = idb.query(sql)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.sort_values("ts").reset_index(drop=True)
+        df["ts"] = pd.to_datetime(df["ts"])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _candle_fig(sym: str, res: str) -> "go.Figure":
+    """Multi-timeframe OHLC candlestick chart. 1-sec from our store; rest from Fyers + live forming bar."""
+    fig = go.Figure()
+    if res == "1S":
+        df = _stored_candles(sym, "1sec", 200)
+        empty_msg = "1-sec candles build from your tick store during market hours — none stored yet"
+    else:
+        days = {"5S": 1, "15S": 1, "30S": 1, "1": 2, "5": 4, "15": 8, "60": 20, "D": 90}.get(res, 4)
+        try:
+            df = fetch_ohlcv(sym, res, days)
+        except Exception:
+            df = pd.DataFrame()
+        empty_msg = "No candle data yet (market closed / warming up)"
+    if df is None or df.empty:
+        fig.update_layout(plot_bgcolor=BG, paper_bgcolor=BG, height=380,
+                          margin=dict(l=40, r=16, t=8, b=28),
+                          annotations=[dict(text=empty_msg, showarrow=False,
+                                            font=dict(color="#475569", size=12))])
+        return fig
+    df = df.tail(160).copy()
+    fig.add_trace(go.Candlestick(
+        x=df["ts"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+        increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
+        increasing_fillcolor="#22c55e", decreasing_fillcolor="#ef4444",
+        line=dict(width=1), name="", showlegend=False))
+    if res != "D":
+        try:
+            fig.add_trace(go.Scatter(x=df["ts"], y=_vwap(df), mode="lines",
+                                     line=dict(color="#fbbf24", width=1.1), name="VWAP", showlegend=False))
+        except Exception:
+            pass
+    rb = [dict(bounds=["sat", "mon"])]
+    if res != "D":
+        rb.append(dict(bounds=[15.6, 9.25], pattern="hour"))   # hide overnight
+    fig.update_layout(
+        plot_bgcolor=BG, paper_bgcolor=BG, height=380,
+        margin=dict(l=10, r=52, t=8, b=28),
+        xaxis=dict(rangeslider_visible=False, gridcolor="#0f1a2a",
+                   tickfont=dict(color="#475569", size=9), rangebreaks=rb),
+        yaxis=dict(side="right", gridcolor="#0f1a2a", tickfont=dict(color="#64748b", size=9)),
+        hovermode="x unified",
+    )
+    return fig
+
+
+@app.callback(
+    Output("cndl-chart", "figure"),
+    Input("cndl-idx",   "value"),
+    Input("cndl-tf",    "value"),
+    Input("setup-tick", "n_intervals"),
+    State("sel-sym",    "data"),
+)
+def update_candle_chart(sym, res, _, sel):
+    if sel:   # overview hidden while a panel is active
+        return no_update
+    return _candle_fig(sym or "NSE:NIFTY50-INDEX", res or "5")
 
 
 # ── Callback: trade signals (60-second refresh) ────────────────────────────────

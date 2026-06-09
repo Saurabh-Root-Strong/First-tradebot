@@ -24,7 +24,8 @@ HISTORY_URL = "https://api-t1.fyers.in/data/history"
 
 # Maps Fyers history resolution string → candle_store resolution key.
 # "D" maps to None because daily candles don't need a forming-candle append.
-_STORE_RES_MAP = {"5": "5min", "15": "15min", "60": "60min", "D": None}
+_STORE_RES_MAP = {"5S": "5sec", "15S": "15sec", "30S": "30sec",
+                  "1": "1min", "5": "5min", "15": "15min", "60": "60min", "D": None}
 
 INDEX_LABELS = {
     "NSE:NIFTY50-INDEX":    "NIFTY 50",
