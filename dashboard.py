@@ -3466,16 +3466,17 @@ def _render_liveoi(sym: str) -> "html.Div":
             html.Div(val, style={"color": c, "fontSize": "0.82rem", "fontWeight": "700", **MONO}),
         ], style={"marginRight": "22px", "marginBottom": "4px"})
 
-    pcr_c = "#22c55e" if last.pcr >= 1 else "#ef4444"
+    _n = lambda v: float(v) if v is not None and not (isinstance(v, float) and v != v) else 0.0
+    pcr_c = "#22c55e" if _n(last.pcr) >= 1 else "#ef4444"
     strip = html.Div([
-        metric("SPOT", f"{last.spot:,.1f}", cd),
-        metric("CALL OI", _fmt_oi(last.total_call_oi), "#ef4444"),
-        metric("PUT OI", _fmt_oi(last.total_put_oi), "#22c55e"),
-        metric("PCR", f"{last.pcr:.2f}", pcr_c),
-        metric("ATM IV", f"{last.atm_iv:.1f}%"),
-        metric("CALL WALL", f"{last.call_wall:,.0f}", "#ef4444"),
-        metric("PUT WALL", f"{last.put_wall:,.0f}", "#22c55e"),
-        metric("MAX PAIN", f"{last.max_pain:,.0f}", "#a78bfa"),
+        metric("SPOT", f"{_n(last.spot):,.1f}", cd),
+        metric("CALL OI", _fmt_oi(_n(last.total_call_oi)), "#ef4444"),
+        metric("PUT OI", _fmt_oi(_n(last.total_put_oi)), "#22c55e"),
+        metric("PCR", f"{_n(last.pcr):.2f}", pcr_c),
+        metric("ATM IV", f"{_n(last.atm_iv):.1f}%"),
+        metric("CALL WALL", f"{_n(last.call_wall):,.0f}", "#ef4444"),
+        metric("PUT WALL", f"{_n(last.put_wall):,.0f}", "#22c55e"),
+        metric("MAX PAIN", f"{_n(last.max_pain):,.0f}", "#a78bfa"),
     ], style={"display": "flex", "flexWrap": "wrap", "padding": "8px 4px",
               "marginBottom": "6px", "borderBottom": "1px solid #111d2e"})
 
@@ -3543,7 +3544,7 @@ def _render_liveoi(sym: str) -> "html.Div":
     Output("liveoi-content", "children"),
     Input("liveoi-idx",   "value"),
     Input("setup-tick",   "n_intervals"),
-    State("sel-sym",      "data"),
+    Input("sel-sym",      "data"),
 )
 def update_liveoi(sym, _, sel):
     if sel != "LIVEOI":
