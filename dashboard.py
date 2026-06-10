@@ -3610,7 +3610,10 @@ if __name__ == "__main__":
     print(SEP)
 
     # Auto-open the dashboard in the default browser once the server is up.
-    import webbrowser
-    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
+    # Suppressed via TRADEBOT_NO_BROWSER=1 (the supervisor sets it on auto-restarts
+    # so a crash/WS-stall recovery doesn't spawn a fresh tab each time).
+    import os, webbrowser
+    if not os.environ.get("TRADEBOT_NO_BROWSER"):
+        threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
 
     app.run(debug=False, host="127.0.0.1", port=8050)

@@ -101,10 +101,12 @@ def _free_port_8050() -> None:
     time.sleep(2)
 
 
-def launch() -> subprocess.Popen:
+def launch(first: bool = False) -> subprocess.Popen:
     _free_port_8050()
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
-    log("Launching dashboard.py")
+    if not first:
+        env["TRADEBOT_NO_BROWSER"] = "1"   # only the first launch pops the browser
+    log("Launching dashboard.py" + ("" if first else " (restart — no new browser tab)"))
     return subprocess.Popen([str(PY), str(HERE / "dashboard.py")], cwd=str(HERE), env=env)
 
 
@@ -114,7 +116,7 @@ def main() -> None:
         log("No valid token — aborting. Run fyers_auth.py, then re-run supervise.py.")
         sys.exit(1)
 
-    proc = launch()
+    proc = launch(first=True)
     started = time.time()
     try:
         while True:
