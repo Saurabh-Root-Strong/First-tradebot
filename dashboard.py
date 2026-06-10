@@ -3405,6 +3405,16 @@ def _render_liveoi(sym: str) -> "html.Div":
     ts = [s.ts for s in series]
     last = series[-1]
 
+    # ── EOD support context (last night's DCM levels) ─────────────────────────
+    eod = {}
+    try:
+        from daily_context_bridge import get_bridge
+        eod = get_bridge().get_panel_data(sym) or {}
+    except Exception:
+        eod = {}
+    eod_cw = eod.get("top_call_strike"); eod_pw = eod.get("top_put_strike")
+    eod_mp = eod.get("max_pain_price");  eod_pc = eod.get("prev_close")
+
     def metric(lab, val, c="#cbd5e1"):
         return html.Div([
             html.Div(lab, style={"color": "#475569", "fontSize": "0.55rem", "letterSpacing": "0.08em"}),
@@ -3452,11 +3462,31 @@ def _render_liveoi(sym: str) -> "html.Div":
     f3.add_trace(go.Scatter(x=ts, y=[s.call_wall for s in series], name="Call wall", line=dict(color="#ef4444", width=1, dash="dot")))
     f3.add_trace(go.Scatter(x=ts, y=[s.put_wall for s in series], name="Put wall", line=dict(color="#22c55e", width=1, dash="dot")))
     f3.add_trace(go.Scatter(x=ts, y=[s.max_pain for s in series], name="Max pain", line=dict(color="#a78bfa", width=1, dash="dash")))
-    f3.update_layout(**lay("Walls & Max Pain vs Spot", 250))
+    f3.update_layout(**lay("Walls & Max Pain vs Spot  (— live · ‑‑ EOD support)", 250))
+    # EOD support overlay: last night's DCM levels as horizontal reference lines
+    def _eod_line(fig, y, color, label):
+        if y:
+            fig.add_hline(y=float(y), line=dict(color=color, width=1, dash="dashdot"),
+                          annotation_text=f"EOD {label}", annotation_position="right",
+                          annotation_font=dict(size=8, color=color))
+    _eod_line(f3, eod_cw, "#ef4444", "call wall")
+    _eod_line(f3, eod_pw, "#22c55e", "put wall")
+    _eod_line(f3, eod_mp, "#a78bfa", "max pain")
+    _eod_line(f3, eod_pc, "#64748b", "prev close")
+
+    eod_bits = []
+    if eod_pc: eod_bits.append(f"prev close {eod_pc:,.0f}")
+    if eod_cw: eod_bits.append(f"call wall {eod_cw:,.0f}")
+    if eod_pw: eod_bits.append(f"put wall {eod_pw:,.0f}")
+    if eod_mp: eod_bits.append(f"max pain {eod_mp:,.0f}")
+    eod_cap = (html.Div("🌙 EOD support (last night): " + "  ·  ".join(eod_bits),
+                        style={"color": "#52708f", "fontSize": "0.6rem", "marginBottom": "6px", **MONO})
+               if eod_bits else html.Div())
 
     g = lambda fig: dcc.Graph(figure=fig, config={"displayModeBar": False})
     return html.Div([
         strip,
+        eod_cap,
         html.Div(f"{len(series)} snapshots · {ts[0]:%H:%M}–{ts[-1]:%H:%M} IST",
                  style={"color": "#334155", "fontSize": "0.55rem", "marginBottom": "4px", **MONO}),
         g(f1), g(f2), g(f3),
@@ -3636,6 +3666,20 @@ def _candle_fig(sym: str, res: str) -> "go.Figure":
         try:
             fig.add_trace(go.Scatter(x=df["ts"], y=_vwap(df), mode="lines",
                                      line=dict(color="#fbbf24", width=1.1), name="VWAP", showlegend=False))
+        except Exception:
+            pass
+        # EOD support overlay (last night's DCM levels) — dotted reference lines
+        try:
+            from daily_context_bridge import get_bridge
+            _eod = get_bridge().get_panel_data(sym) or {}
+            for _y, _c, _lbl in [(_eod.get("prev_close"), "#64748b", "prev close"),
+                                 (_eod.get("max_pain_price"), "#a78bfa", "max pain"),
+                                 (_eod.get("top_call_strike"), "#ef4444", "call wall"),
+                                 (_eod.get("top_put_strike"), "#22c55e", "put wall")]:
+                if _y:
+                    fig.add_hline(y=float(_y), line=dict(color=_c, width=1, dash="dot"),
+                                  annotation_text=_lbl, annotation_position="left",
+                                  annotation_font=dict(size=8, color=_c))
         except Exception:
             pass
     rb = [dict(bounds=["sat", "mon"])]
