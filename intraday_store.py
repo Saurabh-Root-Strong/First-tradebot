@@ -320,6 +320,11 @@ class OITimeSeriesStore:
             q = self._s.get(sym)
             return q[-1] if q else None
 
+    def series(self, sym: str) -> list:
+        """Copy of this index's session OI snapshots (oldest→newest) for charting."""
+        with self._lock:
+            return list(self._s.get(sym, []))
+
     def count(self, sym: str) -> int:
         with self._lock:
             return len(self._s.get(sym, []))

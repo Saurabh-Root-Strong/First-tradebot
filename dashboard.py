@@ -1161,6 +1161,18 @@ app.layout = dbc.Container([
                 "marginTop": "18px", "padding": "10px 12px", "borderRadius": "8px",
                 "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #fbbf24",
                 "background": BG_CARD, "cursor": "pointer"}),
+            # ── Clickable: Live OI → opens the OI time-series view ────────────
+            html.Div(id="nav-liveoi", n_clicks=0, children=[
+                html.Div("📡 LIVE OI", style={
+                    "letterSpacing": "0.14em", "color": "#cbd5e1", "fontWeight": "700",
+                    "fontSize": "0.6rem", "marginBottom": "3px"}),
+                html.Div("OI · PCR · walls vs price", style={"color": "#475569", "fontSize": "0.5rem"}),
+                html.Div("click to view ▸", style={
+                    "color": "#475569", "fontSize": "0.5rem", "marginTop": "4px"}),
+            ], style={
+                "marginTop": "10px", "padding": "10px 12px", "borderRadius": "8px",
+                "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #40c4ff",
+                "background": BG_CARD, "cursor": "pointer"}),
         ], md=2, style={
             "background": BG_SIDE, "padding": "16px 10px",
             "borderRight": "1px solid #111d2e",
@@ -1280,6 +1292,20 @@ app.layout = dbc.Container([
 
             # TRADE BOOK PANEL (hidden until 'Today's Trades' is clicked)
             html.Div(id="trade-book-panel", style={"display": "none"}),
+
+            # LIVE OI PANEL (hidden until 'Live OI' is clicked)
+            html.Div(id="live-oi-panel", style={"display": "none"}, children=[
+                dbc.Row([
+                    dbc.Col(html.Div("📡 LIVE OI — SESSION TIME-SERIES", style={
+                        "color": "#40c4ff", "fontWeight": "700", "fontSize": "0.95rem",
+                        "letterSpacing": "0.08em", "paddingTop": "6px"}), md=7),
+                    dbc.Col(dcc.Dropdown(
+                        id="liveoi-idx", clearable=False,
+                        options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
+                        value="NSE:NIFTY50-INDEX", style={"fontSize": "0.75rem"}), md=4),
+                ], className="mb-2 align-items-center"),
+                html.Div(id="liveoi-content"),
+            ]),
         ], md=10, style={"padding": "12px 16px"}),
     ], className="gx-0"),
 
@@ -2698,17 +2724,20 @@ def _render_trade_rec(rec: dict, sym: str) -> html.Div:
     Output("sel-expiry", "data"),
     [Input(f"nav-{_slug(s)}", "n_clicks") for s in INDEX_SYMBOLS],
     Input("nav-tradebook", "n_clicks"),
+    Input("nav-liveoi",    "n_clicks"),
     State("sel-sym", "data"),
     prevent_initial_call=True,
 )
 def on_nav_click(*args):
-    *_, _tradebook_clicks, current = args
+    *_, _tradebook_clicks, _liveoi_clicks, current = args
     from dash import callback_context as ctx
     if not ctx.triggered:
         return current, ""
     tid = ctx.triggered[0]["prop_id"].split(".")[0]
     if tid == "nav-tradebook":
         return (None, "") if current == "TRADES" else ("TRADES", "")
+    if tid == "nav-liveoi":
+        return (None, "") if current == "LIVEOI" else ("LIVEOI", "")
     for sym in INDEX_SYMBOLS:
         if tid == f"nav-{_slug(sym)}":
             return (None, "") if current == sym else (sym, "")
@@ -2720,17 +2749,20 @@ def on_nav_click(*args):
     Output("overview-panel",  "style"),
     Output("oc-panel",        "style"),
     Output("trade-book-panel", "style"),
+    Output("live-oi-panel",   "style"),
     Output("oc-title",        "children"),
     *[Output(f"nav-{_slug(s)}", "style") for s in INDEX_SYMBOLS],
     Input("sel-sym", "data"),
 )
 def toggle_view(sym):
     is_trades = (sym == "TRADES")
-    is_index  = bool(sym) and not is_trades
+    is_liveoi = (sym == "LIVEOI")
+    is_index  = bool(sym) and not is_trades and not is_liveoi
 
     ov_style = {"display": "block"} if not sym else {"display": "none"}
     oc_style = {"display": "block"} if is_index else {"display": "none"}
     tb_style = {"display": "block"} if is_trades else {"display": "none"}
+    lo_style = {"display": "block"} if is_liveoi else {"display": "none"}
 
     if is_index:
         color = COLORS[sym]
@@ -2755,7 +2787,7 @@ def toggle_view(sym):
             "background": f"{c}18" if selected else BG_CARD,
             "cursor": "pointer", "transition": "background 0.15s",
         })
-    return (ov_style, oc_style, tb_style, title, *nav_styles)
+    return (ov_style, oc_style, tb_style, lo_style, title, *nav_styles)
 
 
 # ── Callback 3: sidebar live prices + status ───────────────────────────────────
@@ -3359,6 +3391,89 @@ def update_trade_book(_, sel):
     if sel != "TRADES":
         return no_update
     return _render_trade_book()
+
+
+def _render_liveoi(sym: str) -> "html.Div":
+    """Live OI session time-series: total OI buildup, PCR, walls/max-pain — all vs spot."""
+    series = oi_store.series(sym)
+    cd = COLORS.get(sym, "#40c4ff")
+    if not series:
+        return html.Div(
+            "No OI snapshots yet — they fill every ~90s during market hours "
+            "(market closed / engine warming up).",
+            style={"color": "#475569", "fontSize": "0.78rem", "padding": "20px 4px", **MONO})
+    ts = [s.ts for s in series]
+    last = series[-1]
+
+    def metric(lab, val, c="#cbd5e1"):
+        return html.Div([
+            html.Div(lab, style={"color": "#475569", "fontSize": "0.55rem", "letterSpacing": "0.08em"}),
+            html.Div(val, style={"color": c, "fontSize": "0.82rem", "fontWeight": "700", **MONO}),
+        ], style={"marginRight": "22px", "marginBottom": "4px"})
+
+    pcr_c = "#22c55e" if last.pcr >= 1 else "#ef4444"
+    strip = html.Div([
+        metric("SPOT", f"{last.spot:,.1f}", cd),
+        metric("CALL OI", _fmt_oi(last.total_call_oi), "#ef4444"),
+        metric("PUT OI", _fmt_oi(last.total_put_oi), "#22c55e"),
+        metric("PCR", f"{last.pcr:.2f}", pcr_c),
+        metric("ATM IV", f"{last.atm_iv:.1f}%"),
+        metric("CALL WALL", f"{last.call_wall:,.0f}", "#ef4444"),
+        metric("PUT WALL", f"{last.put_wall:,.0f}", "#22c55e"),
+        metric("MAX PAIN", f"{last.max_pain:,.0f}", "#a78bfa"),
+    ], style={"display": "flex", "flexWrap": "wrap", "padding": "8px 4px",
+              "marginBottom": "6px", "borderBottom": "1px solid #111d2e"})
+
+    def lay(title, h=260, y2=False):
+        d = dict(plot_bgcolor=BG, paper_bgcolor=BG, height=h, margin=dict(l=12, r=52, t=22, b=24),
+                 title=dict(text=title, font=dict(color="#64748b", size=11), x=0.01),
+                 xaxis=dict(gridcolor="#0f1a2a", tickfont=dict(color="#475569", size=9), tickformat="%H:%M"),
+                 yaxis=dict(gridcolor="#0f1a2a", tickfont=dict(color="#64748b", size=9)),
+                 legend=dict(orientation="h", y=1.14, x=0, font=dict(size=9, color="#94a3b8")),
+                 hovermode="x unified")
+        if y2:
+            d["yaxis2"] = dict(overlaying="y", side="right", showgrid=False, tickfont=dict(color="#fbbf24", size=9))
+        return d
+
+    f1 = go.Figure()
+    f1.add_trace(go.Scatter(x=ts, y=[s.total_call_oi for s in series], name="Call OI", line=dict(color="#ef4444", width=1.5)))
+    f1.add_trace(go.Scatter(x=ts, y=[s.total_put_oi for s in series], name="Put OI", line=dict(color="#22c55e", width=1.5)))
+    f1.add_trace(go.Scatter(x=ts, y=[s.spot for s in series], name="Spot", yaxis="y2", line=dict(color="#fbbf24", width=2)))
+    f1.update_layout(**lay("Total OI buildup vs Spot", 270, y2=True))
+
+    f2 = go.Figure()
+    f2.add_trace(go.Scatter(x=ts, y=[s.pcr for s in series], name="PCR", line=dict(color="#40c4ff", width=1.5),
+                            fill="tozeroy", fillcolor="rgba(64,196,255,0.08)"))
+    f2.update_layout(**lay("PCR (put / call OI)", 190))
+    f2.add_hline(y=1.0, line=dict(color="#475569", width=1, dash="dash"))
+
+    f3 = go.Figure()
+    f3.add_trace(go.Scatter(x=ts, y=[s.spot for s in series], name="Spot", line=dict(color="#fbbf24", width=2)))
+    f3.add_trace(go.Scatter(x=ts, y=[s.call_wall for s in series], name="Call wall", line=dict(color="#ef4444", width=1, dash="dot")))
+    f3.add_trace(go.Scatter(x=ts, y=[s.put_wall for s in series], name="Put wall", line=dict(color="#22c55e", width=1, dash="dot")))
+    f3.add_trace(go.Scatter(x=ts, y=[s.max_pain for s in series], name="Max pain", line=dict(color="#a78bfa", width=1, dash="dash")))
+    f3.update_layout(**lay("Walls & Max Pain vs Spot", 250))
+
+    g = lambda fig: dcc.Graph(figure=fig, config={"displayModeBar": False})
+    return html.Div([
+        strip,
+        html.Div(f"{len(series)} snapshots · {ts[0]:%H:%M}–{ts[-1]:%H:%M} IST",
+                 style={"color": "#334155", "fontSize": "0.55rem", "marginBottom": "4px", **MONO}),
+        g(f1), g(f2), g(f3),
+    ], style={"background": BG_CARD, "border": "1px solid #111d2e",
+              "borderRadius": "10px", "padding": "14px 16px"})
+
+
+@app.callback(
+    Output("liveoi-content", "children"),
+    Input("liveoi-idx",   "value"),
+    Input("setup-tick",   "n_intervals"),
+    State("sel-sym",      "data"),
+)
+def update_liveoi(sym, _, sel):
+    if sel != "LIVEOI":
+        return no_update
+    return _render_liveoi(sym or "NSE:NIFTY50-INDEX")
 
 
 @app.callback(
