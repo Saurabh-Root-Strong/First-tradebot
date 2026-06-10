@@ -1310,6 +1310,7 @@ app.layout = dbc.Container([
     ], className="gx-0"),
 
     # State stores
+    dcc.Location(id="url", refresh=False),
     dcc.Store(id="sel-sym",    data=None),
     dcc.Store(id="sel-expiry", data=""),
 
@@ -2744,6 +2745,22 @@ def on_nav_click(*args):
     return current, ""
 
 
+_URL_SHORT = {"NSE:NIFTY50-INDEX": "nifty50", "NSE:NIFTYBANK-INDEX": "banknifty",
+              "NSE:FINNIFTY-INDEX": "finnifty", "NSE:MIDCPNIFTY-INDEX": "midcpnifty"}
+
+
+@app.callback(Output("url", "pathname"), Input("sel-sym", "data"))
+def _sync_url(sym):
+    """Reflect the active section in the address bar so the current page is visible."""
+    if sym == "TRADES":
+        return "/trades"
+    if sym == "LIVEOI":
+        return "/live-oi"
+    if sym in INDEX_SYMBOLS:
+        return f"/chain/{_URL_SHORT.get(sym, 'index')}"
+    return "/"
+
+
 # ── Callback 2: toggle panels + highlight selected nav card ───────────────────
 @app.callback(
     Output("overview-panel",  "style"),
@@ -3393,9 +3410,37 @@ def update_trade_book(_, sel):
     return _render_trade_book()
 
 
+def _liveoi_db_fallback(sym: str):
+    """Latest persisted OI session from DuckDB (for review when in-memory is empty)."""
+    try:
+        from intraday_db import idb
+        from types import SimpleNamespace
+        cols = ("ts,spot,pcr,total_call_oi,total_put_oi,atm_iv,call_wall,put_wall,max_pain,"
+                "atm_call_oi,atm_put_oi,near_call_oi,near_put_oi,atm_call_iv,atm_put_iv")
+        for d in reversed(idb.list_sessions() or []):
+            df = idb.query(f"SELECT {cols} FROM oi_snapshots WHERE symbol='{sym}' ORDER BY ts", date=d)
+            if df is not None and not df.empty:
+                out = [SimpleNamespace(
+                    ts=pd.to_datetime(r["ts"]), spot=r["spot"], pcr=r["pcr"],
+                    total_call_oi=r["total_call_oi"], total_put_oi=r["total_put_oi"],
+                    atm_iv=r["atm_iv"], call_wall=r["call_wall"], put_wall=r["put_wall"],
+                    max_pain=r["max_pain"], atm_call_oi=r["atm_call_oi"], atm_put_oi=r["atm_put_oi"],
+                    near_call_oi=r["near_call_oi"], near_put_oi=r["near_put_oi"],
+                    atm_call_iv=r["atm_call_iv"], atm_put_iv=r["atm_put_iv"])
+                    for _, r in df.iterrows()]
+                return out, str(d)[:10]
+    except Exception:
+        pass
+    return [], None
+
+
 def _render_liveoi(sym: str) -> "html.Div":
     """Live OI session time-series: total OI buildup, PCR, walls/max-pain — all vs spot."""
     series = oi_store.series(sym)
+    src_note = "live"
+    if not series:
+        series, _sd = _liveoi_db_fallback(sym)
+        src_note = f"last session {_sd}" if series else "live"
     cd = COLORS.get(sym, "#40c4ff")
     if not series:
         return html.Div(
@@ -3487,7 +3532,7 @@ def _render_liveoi(sym: str) -> "html.Div":
     return html.Div([
         strip,
         eod_cap,
-        html.Div(f"{len(series)} snapshots · {ts[0]:%H:%M}–{ts[-1]:%H:%M} IST",
+        html.Div(f"{len(series)} snapshots · {ts[0]:%H:%M}–{ts[-1]:%H:%M} IST · {src_note}",
                  style={"color": "#334155", "fontSize": "0.55rem", "marginBottom": "4px", **MONO}),
         g(f1), g(f2), g(f3),
     ], style={"background": BG_CARD, "border": "1px solid #111d2e",
