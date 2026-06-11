@@ -34,6 +34,12 @@ try:
 except Exception:
     _BRIDGE_AVAILABLE = False
 
+try:
+    from intraday_shock import analyze_shock
+    _SHOCK_AVAILABLE = True
+except Exception:
+    _SHOCK_AVAILABLE = False
+
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 
@@ -629,16 +635,21 @@ def _velocity_layer(sym: str, spot: float) -> tuple[float, list]:
 # ── Composite score + conviction ──────────────────────────────────────────────
 def _composite(tech_score, oi_score, vel_score, inst_score,
                fut_score, iv_score, pcr_score, mp_score,
-               ctx_score) -> tuple[float, str, str]:
+               ctx_score, shock_score=0.0) -> tuple[float, str, str]:
     """
-    9-layer weighted composite. Returns (weighted_score, verdict, color).
+    10-layer weighted composite. Returns (weighted_score, verdict, color).
 
     Weight rationale:
-      Daily Context (17%) provides yesterday's EOD structural setup from a
+      Daily Context (≈16%) provides yesterday's EOD structural setup from a
       24-signal prediction engine + HMM regime + FII trend — a dense,
       pre-computed signal that anchors intraday decisions.
-      Institutional (10%) reduced because FII data now also appears in
-      Layer 9, avoiding double-counting.
+      Institutional reduced because FII data now also appears in Layer 9,
+      avoiding double-counting.
+      Shock (Layer 10, ≈7%) is the abrupt-regime modulator: sudden OI bursts,
+      volume surges and price impulses inside the last few minutes. It is the
+      LINEAR part of the shock's influence; the non-linear override (confidence
+      cut / signal stand-down on an opposing alert) is applied separately in
+      build_recommendation via apply_shock_override().
     """
     w = {
         "tech":    0.25,
@@ -650,21 +661,26 @@ def _composite(tech_score, oi_score, vel_score, inst_score,
         "pcr":     0.04,
         "mp":      0.02,
         "ctx":     0.17,   # Daily Context bridge
+        "shock":   0.08,   # Layer 10 — abrupt regime modulator
     }
-    # Weights sum = 0.25+0.10+0.18+0.10+0.08+0.06+0.04+0.02+0.17 = 1.00
+    # Renormalise so the 10 weights sum to exactly 1.0 (preserves the relative
+    # proportions of the original 9 layers while making room for shock).
+    _tot = sum(w.values())
+    w = {k: v / _tot for k, v in w.items()}
 
     tech_n = max(min(tech_score / 2, 4), -4)
 
     composite = (
-        tech_n     * w["tech"]    +
-        oi_score   * w["oi"]      +
-        vel_score  * w["vel"]     +
-        inst_score * w["inst"]    +
-        fut_score  * w["futures"] +
-        iv_score   * w["iv"]      +
-        pcr_score  * w["pcr"]     +
-        mp_score   * w["mp"]      +
-        ctx_score  * w["ctx"]
+        tech_n      * w["tech"]    +
+        oi_score    * w["oi"]      +
+        vel_score   * w["vel"]     +
+        inst_score  * w["inst"]    +
+        fut_score   * w["futures"] +
+        iv_score    * w["iv"]      +
+        pcr_score   * w["pcr"]     +
+        mp_score    * w["mp"]      +
+        ctx_score   * w["ctx"]     +
+        shock_score * w["shock"]
     )
 
     if   composite >= 2.0:  return composite, "STRONG BUY",  "#22c55e"
@@ -674,6 +690,51 @@ def _composite(tech_score, oi_score, vel_score, inst_score,
     elif composite <= -1.0: return composite, "SELL",          "#f87171"
     elif composite <= -0.4: return composite, "MILD SELL",    "#fca5a5"
     else:                   return composite, "NEUTRAL",       "#94a3b8"
+
+
+# ── Shock override (non-linear conviction modulator) ──────────────────────────
+def apply_shock_override(composite: float, confidence: float, shock: dict
+                         ) -> tuple[float, float, bool, list]:
+    """
+    The non-linear half of Layer 10 (the linear half is already folded into
+    `composite` by _composite). Adjusts confidence — and, on a strong opposing
+    alert against a weak setup, stands the signal down entirely.
+
+    Returns (composite, confidence, forced_neutral, notes).
+      forced_neutral=True  → caller routes to the NEUTRAL "Regime Shift" path.
+    """
+    notes: list = []
+    if not shock:
+        return composite, confidence, False, notes
+    level = shock.get("level", "none")
+    sdir  = shock.get("direction", "")        # "CE" bullish / "PE" bearish / ""
+    if level == "none" or not sdir:
+        return composite, confidence, False, notes
+
+    comp_dir = "CE" if composite > 0 else "PE" if composite < 0 else ""
+    aligned  = sdir == comp_dir and comp_dir != ""
+    head     = shock["signals"][0][1] if shock.get("signals") else "market shock"
+
+    if level == "alert":
+        if aligned:
+            confidence = min(confidence + 12, 95)
+            notes.append(f"✓ SHOCK CONFIRMS — {head}")
+        else:
+            confidence = round(confidence * 0.40)
+            notes.append(f"⚠ CONDITIONS CHANGING — {head}")
+            # Weak base signal overwhelmed by a sudden opposing flow → stand aside.
+            if abs(composite) < 1.0:
+                notes.append("Signal stood down — opposing shock overwhelms a weak setup")
+                return 0.0, min(confidence, 25), True, notes
+    elif level == "watch":
+        if aligned:
+            confidence = min(confidence + 5, 95)
+            notes.append(f"Shock leans with signal — {head}")
+        else:
+            confidence = round(confidence * 0.75)
+            notes.append(f"⚠ Early opposing flow — {head}")
+
+    return composite, confidence, False, notes
 
 
 # ── Expiry selection ──────────────────────────────────────────────────────────
@@ -757,6 +818,17 @@ def build_recommendation(
     else:
         ctx_score, ctx_signals = 0.0, [("neut", "Daily context: bridge module unavailable")]
 
+    # ── Layer 10: Market Shock / Regime-Shift (abrupt OI/volume/price) ────────
+    if _SHOCK_AVAILABLE:
+        try:
+            shock = analyze_shock(sym)
+        except Exception:
+            shock = {"level": "none", "score": 0.0, "direction": "", "signals": []}
+    else:
+        shock = {"level": "none", "score": 0.0, "direction": "", "signals": []}
+    shock_score   = shock.get("score", 0.0)
+    shock_signals = shock.get("signals", [])
+
     # ── Session phase quality multiplier ─────────────────────────────────────
     if _INTRADAY_STORE_AVAILABLE:
         phase_name, phase_mult, phase_caution = session_phase()
@@ -767,16 +839,16 @@ def build_recommendation(
     composite, verdict, verdict_clr = _composite(
         tech_score, oi_score, vel_score, inst_score,
         fut_score, iv_score, pcr_score, mp_score,
-        ctx_score,
+        ctx_score, shock_score,
     )
 
-    # Count layer agreements (how many of the 9 layers agree with composite direction?)
+    # Count layer agreements (how many of the 10 layers agree with composite direction?)
     layer_scores = [tech_score / 2, oi_score, vel_score,
                     inst_score, fut_score, iv_score, pcr_score, mp_score,
-                    ctx_score]
+                    ctx_score, shock_score]
     bull_layers  = sum(1 for s in layer_scores if s > 0.3)
     bear_layers  = sum(1 for s in layer_scores if s < -0.3)
-    neut_layers  = 9 - bull_layers - bear_layers
+    neut_layers  = 10 - bull_layers - bear_layers
 
     if composite > 0:
         agreement = bull_layers
@@ -786,7 +858,7 @@ def build_recommendation(
         agreement = neut_layers
 
     # Confidence from composite magnitude + layer agreement + session phase.
-    # Threshold = 5 (majority of 9 layers).  Each layer beyond 5 agreeing adds +5%.
+    # Threshold = 5.  Each layer beyond 5 agreeing adds +5%.
     # Below threshold: each missing layer subtracts 5% (reduces false conviction).
     # Clamped [0, 95] — negative confidence is meaningless and breaks UI/delta.
     raw_conf    = min(abs(composite) / 2.5 * 100, 95)
@@ -794,16 +866,24 @@ def build_recommendation(
     confidence  = min(max(round((raw_conf + align_bonus) * phase_mult, 0), 0), 95)
     # Hard floor: strong composite magnitude cannot override genuinely split signals.
     # Only applied when ≤2 layers agree — this is the case where one anomalously
-    # high layer is dragging the composite while 7 others are neutral/opposing.
-    # 3 layers is NOT capped: Layer9 (17%) + Layer1 (25%) + Layer4 (10%) = 52%
-    # of total weight agreeing is a legitimate high-conviction setup.
+    # high layer is dragging the composite while the rest are neutral/opposing.
     if agreement <= 2:
-        confidence = min(confidence, 35)   # 2/9 agreeing = speculative at best
+        confidence = min(confidence, 35)   # 2/10 agreeing = speculative at best
 
-    # Neutral — no clear edge.
+    # ── Shock override (non-linear half of Layer 10) ─────────────────────────
+    # A sudden ALERT-level shock against the signal slashes confidence and, on a
+    # weak base setup, stands the trade down. Aligned shocks add conviction.
+    composite, confidence, forced_neutral, shock_notes = apply_shock_override(
+        composite, confidence, shock,
+    )
+
+    # Neutral — no clear edge (or signal stood down by an opposing shock).
     # Threshold matches _composite()'s neutral band (±0.40) exactly,
     # so we never return a trade with signal="NEUTRAL".
-    if abs(composite) < 0.40:
+    if forced_neutral or abs(composite) < 0.40:
+        neutral_label = "NEUTRAL — Regime Shift" if forced_neutral else "NEUTRAL — No Clear Edge"
+        neutral_clr   = "#f59e0b" if forced_neutral else "#94a3b8"
+        neutral_warn  = "  |  ".join([n for n in shock_notes] + ([phase_caution] if phase_caution else [])) or phase_caution
         _idb_write_setup(
             sym, tf_key, "NEUTRAL",
             composite, confidence, "",
@@ -812,15 +892,16 @@ def build_recommendation(
             agreement, phase_name, spot, atm_iv,
         )
         return {
-            "signal":     "NEUTRAL — No Clear Edge",
-            "color":      "#94a3b8",
+            "signal":     neutral_label,
+            "color":      neutral_clr,
             "score":      composite,
             "confidence": confidence,
             "neutral":    True,
             "tf_label":   profile["label"],
             "phase":      phase_name,
-            "warning":    phase_caution,
+            "warning":    neutral_warn,
             "reasons":    tech_reasons,
+            "shock":      shock,
         }
 
     direction = "CE" if composite > 0 else "PE"
@@ -904,16 +985,18 @@ def build_recommendation(
         warnings.append("Daily + intraday trend ALIGNED (bearish) — higher conviction, can hold with trailing SL")
 
     if agreement <= 2:
-        warnings.append(f"Only {agreement}/9 signal layers agree — CONFLICTED setup, small size or skip")
+        warnings.append(f"Only {agreement}/10 signal layers agree — CONFLICTED setup, small size or skip")
     elif agreement == 3:
-        warnings.append(f"{agreement}/9 layers agree — mixed conviction, use half position size")
+        warnings.append(f"{agreement}/10 layers agree — mixed conviction, use half position size")
 
     if atm_iv > 20:
         warnings.append(f"ATM IV {atm_iv:.1f}% elevated — buy dips in premium if possible, IV crush will erode gains fast")
 
-    # Layered signals for "WHY THIS TRADE?" panel (combine all layers)
+    # Layered signals for "WHY THIS TRADE?" panel (combine all layers).
+    # Shock signals lead when present — they are the freshest, most actionable read.
     all_opt_signals = (
-        ctx_signals[:6] +          # Daily context first — structural EOD setup (B1-B8)
+        shock_signals[:2] +        # Layer 10 — abrupt regime shifts (last few minutes)
+        ctx_signals[:5] +          # Daily context — structural EOD setup (B1-B8)
         vel_signals[:2] +          # Intraday velocity next
         inst_signals[:2] +
         oi_signals[:2] +
@@ -922,7 +1005,9 @@ def build_recommendation(
         fut_signals[:1]
     )
 
-    # Session phase caution appended to warnings
+    # Shock override notes lead the warnings (most time-sensitive), then phase.
+    for n in reversed(shock_notes):
+        warnings.insert(0, n)
     if phase_caution:
         warnings.insert(0, phase_caution)
 
@@ -938,8 +1023,9 @@ def build_recommendation(
         "iv":       {"score": iv_score,   "label": "IV (6%)"},
         "pcr":      {"score": pcr_score,  "label": "PCR (4%)"},
         "mp":       {"score": mp_score,   "label": "Max Pain (2%)"},
-        "context":  {"score": ctx_score,  "label": "Daily Context EOD (17%)"},
-        "agree":    f"{agreement}/9 layers aligned",
+        "context":  {"score": ctx_score,  "label": "Daily Context EOD (16%)"},
+        "shock":    {"score": shock_score, "label": "Market Shock (7%)"},
+        "agree":    f"{agreement}/10 layers aligned",
         "phase":    phase_name,
     }
 
@@ -1006,4 +1092,6 @@ def build_recommendation(
         "warning":      warning,
         "daily_score":  daily_score,
         "layer_summary": layer_summary,
+        "shock":        shock,
+        "shock_level":  shock.get("level", "none"),
     }

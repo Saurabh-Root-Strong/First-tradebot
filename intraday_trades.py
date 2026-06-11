@@ -38,7 +38,7 @@ _REENTRY_COOLDOWN_MIN = 10
 # Minimum confidence to log a trade. 0 = track every directional (non-NEUTRAL)
 # call and tag its conviction (LOW/MODERATE/HIGH) — the dedup + cooldown prevent
 # spam, and this builds the full validation dataset (do LOW setups lose, HIGH win?).
-_MIN_CONFIDENCE = 0
+_MIN_CONFIDENCE = 50
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS paper_trades (
@@ -88,10 +88,12 @@ class TradeLedger:
         _DB.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.execute(_DDL)
-            try:
-                con.execute("ALTER TABLE paper_trades ADD COLUMN reason TEXT")
-            except Exception:
-                pass   # column already exists
+            for _col, _type in (("reason", "TEXT"), ("regime_flag", "TEXT"),
+                                ("t1_booked", "INTEGER DEFAULT 0")):
+                try:
+                    con.execute(f"ALTER TABLE paper_trades ADD COLUMN {_col} {_type}")
+                except Exception:
+                    pass   # column already exists
             con.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -165,6 +167,30 @@ class TradeLedger:
                     bits.append(str(_sigs[0][1]))
                 reason = " | ".join(bits)[:280] if bits else str(rec.get("warning") or "")[:280]
 
+                # Direction-flip reconciliation: the engine now wants `direction`
+                # on this index, so close any OPEN trade in the OPPOSITE direction
+                # ('reversed out') at its last price — we never hold CE and PE
+                # together. Recorded as a FLIP exit with honest blended outcome.
+                opp = "PE" if direction == "CE" else "CE"
+                for o in con.execute(
+                    "SELECT * FROM paper_trades WHERE index_sym=? AND direction=? "
+                    "AND status='OPEN' AND date=?", [index_sym, opp, day]).fetchall():
+                    px = o["last_ltp"] or o["entry_ltp"] or 0.0
+                    e  = o["entry_ltp"] or px
+                    rk = o["risk"] or 1.0
+                    if o["t1_booked"]:
+                        r_t1 = (o["t1"] - e) / rk if rk else 0.0
+                        r = round(0.5 * r_t1 + 0.5 * ((px - e) / rk), 2) if rk else 0.0
+                    else:
+                        r = round((px - e) / rk, 2) if rk else 0.0
+                    outc = "WIN" if r > 0 else "LOSS" if r < 0 else "SCRATCH"
+                    con.execute(
+                        "UPDATE paper_trades SET status='FLIP', exit_ltp=?, exit_ts=?, "
+                        "r_multiple=?, outcome=?, last_ltp=?, updated_ts=?, regime_flag=? "
+                        "WHERE trade_id=?",
+                        [px, ts.isoformat(), r, outc, px, ts.isoformat(),
+                         f"↺ REVERSED OUT — engine flipped to {direction}", o["trade_id"]])
+
                 tid = uuid.uuid4().hex[:12]
                 con.execute(
                     "INSERT INTO paper_trades (trade_id, opened_ts, date, index_sym, "
@@ -210,16 +236,35 @@ class TradeLedger:
     def _apply(self, con, t, ltp: float, ts) -> None:
         entry = t["entry_ltp"]; sl = t["sl"]; t1 = t["t1"]; t2 = t["t2"]
         risk  = t["risk"] or (entry - sl) or 1.0
+        booked = bool(t["t1_booked"])
+        r_t1   = (t1 - entry) / risk if (t1 and risk) else 0.0
         mfe = max(t["mfe"] if t["mfe"] is not None else ltp, ltp)
         mae = min(t["mae"] if t["mae"] is not None else ltp, ltp)
 
         status = exit_ltp = outcome = r = exit_ts = None
         if ltp <= sl:
-            status, exit_ltp, outcome, r, exit_ts = "SL", sl, "LOSS", -1.0, ts.isoformat()
+            # Stop hit. If T1 was already booked, SL has been raised to breakeven
+            # (≈entry), so the runner exits flat and realised R is just the booked
+            # half — a protected partial win, not a full loss.
+            if booked:
+                status, exit_ltp, exit_ts = "T1", sl, ts.isoformat()
+                r = round(0.5 * r_t1 + 0.5 * ((sl - entry) / risk), 2)
+                outcome = "WIN" if r > 0 else "SCRATCH" if r == 0 else "LOSS"
+            else:
+                status, exit_ltp, outcome, r, exit_ts = "SL", sl, "LOSS", -1.0, ts.isoformat()
         elif t2 and ltp >= t2:
-            status, exit_ltp, outcome, r, exit_ts = "T2", t2, "WIN", round((t2 - entry) / risk, 2), ts.isoformat()
-        elif t1 and ltp >= t1:
-            status, exit_ltp, outcome, r, exit_ts = "T1", t1, "WIN", round((t1 - entry) / risk, 2), ts.isoformat()
+            # Final target. Blend the booked half with the runner half if T1 booked.
+            r = (round(0.5 * r_t1 + 0.5 * ((t2 - entry) / risk), 2) if booked
+                 else round((t2 - entry) / risk, 2))
+            status, exit_ltp, outcome, exit_ts = "T2", t2, "WIN", ts.isoformat()
+        elif (not booked) and t1 and ltp >= t1:
+            # First T1 touch: book half, lift SL to breakeven, keep the runner OPEN
+            # to chase T2 risk-free. No terminal status yet.
+            con.execute(
+                "UPDATE paper_trades SET mfe=?, mae=?, last_ltp=?, updated_ts=?, "
+                "t1_booked=1, sl=? WHERE trade_id=?",
+                [mfe, mae, ltp, ts.isoformat(), entry, t["trade_id"]])
+            return
 
         if status:
             con.execute(
@@ -245,8 +290,12 @@ class TradeLedger:
                 for t in con.execute("SELECT * FROM paper_trades WHERE status='OPEN'").fetchall():
                     ltp = float(price_map.get(t["option_sym"], t["last_ltp"] or t["entry_ltp"]))
                     entry = t["entry_ltp"]; risk = t["risk"] or 1.0
-                    r = round((ltp - entry) / risk, 2)
-                    outcome = "WIN" if ltp > entry else "LOSS" if ltp < entry else "SCRATCH"
+                    if t["t1_booked"]:
+                        r_t1 = (t["t1"] - entry) / risk if risk else 0.0
+                        r = round(0.5 * r_t1 + 0.5 * ((ltp - entry) / risk), 2)
+                    else:
+                        r = round((ltp - entry) / risk, 2)
+                    outcome = "WIN" if r > 0 else "LOSS" if r < 0 else "SCRATCH"
                     con.execute(
                         "UPDATE paper_trades SET last_ltp=?, updated_ts=?, status='EOD', "
                         "exit_ltp=?, exit_ts=?, r_multiple=?, outcome=? WHERE trade_id=?",
@@ -257,6 +306,43 @@ class TradeLedger:
             finally:
                 con.close()
         return closed
+
+    # ── Adaptive regime-shift flag (Layer-10 shock against an open trade) ─────
+    def flag_regime_shift(self, trade_id: str, note: str,
+                          new_sl: Optional[float] = None) -> bool:
+        """
+        Mark an open trade as hit by an opposing market shock and (optionally)
+        TIGHTEN its stop to lock risk. Stops are only ever raised, never loosened,
+        and never set above the last traded price — so this is a risk-tightening
+        aid, not a forced exit (the next price tick still resolves SL/T1/T2 via
+        the normal _apply path).
+
+        Returns True if anything changed (flag set or SL tightened).
+        """
+        with self._lock:
+            con = self._conn()
+            try:
+                row = con.execute(
+                    "SELECT sl, last_ltp, entry_ltp, status, regime_flag "
+                    "FROM paper_trades WHERE trade_id=?", [trade_id]).fetchone()
+                if not row or row["status"] != "OPEN":
+                    return False
+                cur_sl = row["sl"] or 0.0
+                tightened = cur_sl
+                if new_sl is not None:
+                    cap = (row["last_ltp"] or row["entry_ltp"] or new_sl)
+                    # Raise toward the cap, but stay just below it (no instant trigger).
+                    tightened = max(cur_sl, min(float(new_sl), cap - 0.05))
+                prev_flag = row["regime_flag"] or ""
+                if tightened == cur_sl and note == prev_flag:
+                    return False
+                con.execute(
+                    "UPDATE paper_trades SET regime_flag=?, sl=? WHERE trade_id=?",
+                    [note, tightened, trade_id])
+                con.commit()
+                return True
+            finally:
+                con.close()
 
     # ── Reads ─────────────────────────────────────────────────────────────────
     def open_trades(self) -> list[dict]:

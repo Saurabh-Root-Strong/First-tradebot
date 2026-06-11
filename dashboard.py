@@ -22,6 +22,11 @@ from intraday_store import candle_store, oi_store, build_oi_snapshot, session_ph
 import intraday_oi_intel
 import intraday_trades
 try:
+    import intraday_shock
+    _SHOCK_AVAILABLE = True
+except Exception:
+    _SHOCK_AVAILABLE = False
+try:
     from dcm_prediction import get_dcm_reader as _get_dcm_reader
     _DCM_OK = True
 except Exception:
@@ -715,6 +720,24 @@ def _trade_tracker_poller():
                 prices = _fetch_quotes(syms)
                 if prices:
                     led.update_open_trades(prices)
+                # Adaptive Layer-10 overlay: if a sudden shock now fires AGAINST an
+                # open trade, flag it and tighten the stop to lock risk (no forced
+                # exit — the next price tick still resolves it via the normal path).
+                if _SHOCK_AVAILABLE:
+                    for t in led.open_trades():        # re-read: some may have resolved above
+                        try:
+                            sh = intraday_shock.shock_against(t["index_sym"], t.get("direction"))
+                            if not sh:
+                                continue
+                            head = sh["signals"][0][1] if sh.get("signals") else "opposing market shock"
+                            note = f"⚠ REGIME SHIFT — {head}"
+                            last = t.get("last_ltp") or t.get("entry_ltp") or 0
+                            risk = t.get("risk") or 0
+                            # Lock half the remaining risk: raise SL toward last price.
+                            new_sl = (last - 0.5 * risk) if (last and risk) else None
+                            led.flag_regime_shift(t["trade_id"], note, new_sl)
+                        except Exception:
+                            pass
             # End-of-session mark-to-close (once per day)
             if now.time() >= datetime.time(15, 31) and eod_done_for != now.date().isoformat():
                 still = [t["option_sym"] for t in led.open_trades() if t.get("option_sym")]
@@ -3245,7 +3268,8 @@ def update_track_record(_, sel):
 
 _IDX_ABBR = {"NSE:NIFTY50-INDEX": "NIFTY", "NSE:NIFTYBANK-INDEX": "BANK",
              "NSE:FINNIFTY-INDEX": "FIN", "NSE:MIDCPNIFTY-INDEX": "MIDCP"}
-_TRADE_ST_CLR = {"OPEN": "#fbbf24", "T1": "#4ade80", "T2": "#22c55e", "SL": "#f87171", "EOD": "#94a3b8"}
+_TRADE_ST_CLR = {"OPEN": "#fbbf24", "T1": "#4ade80", "T2": "#22c55e", "SL": "#f87171",
+                 "EOD": "#94a3b8", "FLIP": "#a78bfa"}
 
 
 def _render_sidebar_trades() -> "html.Div":
@@ -3319,6 +3343,8 @@ def _trade_card(t) -> "html.Div":
             html.Span(f"{dirn} {strike:,.0f} ", style={"color": dir_clr, "fontWeight": "700", "fontSize": "0.74rem"}),
             html.Span(st, style={"color": clr, "fontWeight": "700", "fontSize": "0.62rem"}),
             html.Span(f"  {rtxt}", style={"color": r_clr, "fontSize": "0.66rem", "fontWeight": "700"}),
+            html.Span("  T1✓ BE", style={"color": "#22c55e", "fontSize": "0.55rem", "fontWeight": "700"})
+                if (st == "OPEN" and t.get("t1_booked")) else None,
             html.Span(f"  {t.get('conviction') or ''}", style={"color": "#475569", "fontSize": "0.52rem"}),
         ]),
         _trade_levels_bar(t),
@@ -3328,6 +3354,12 @@ def _trade_card(t) -> "html.Div":
         ]),
         html.Div(f"peak {mfe:.1f} / low {mae:.1f}" if mfe and mae else "",
                  style={"color": "#334155", "fontSize": "0.5rem", "marginTop": "2px"}),
+        # Adaptive Layer-10 regime-shift banner (set when a shock fired against this trade).
+        html.Div((t.get("regime_flag") or "")[:160],
+                 style={"color": "#fb923c", "fontSize": "0.54rem", "marginTop": "3px",
+                        "fontWeight": "700", "lineHeight": "1.35", "whiteSpace": "normal",
+                        "background": "#27160a", "border": "1px solid #7c2d12",
+                        "borderRadius": "3px", "padding": "3px 5px"}) if t.get("regime_flag") else None,
         html.Div((t.get("reason") or "")[:180],
                  style={"color": "#52708f", "fontSize": "0.52rem", "marginTop": "3px",
                         "lineHeight": "1.4", "whiteSpace": "normal"}),
