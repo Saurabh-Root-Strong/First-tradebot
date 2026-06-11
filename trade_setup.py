@@ -23,7 +23,7 @@ import datetime
 from signals import fetch_ohlcv, _analyze, TIMEFRAMES, _fmt_oi
 from market_data_bridge import get_institutional_bias
 try:
-    from intraday_store import oi_store, session_phase
+    from intraday_store import oi_store, session_phase, session_strategy
     _INTRADAY_STORE_AVAILABLE = True
 except Exception:
     _INTRADAY_STORE_AVAILABLE = False
@@ -829,11 +829,16 @@ def build_recommendation(
     shock_score   = shock.get("score", 0.0)
     shock_signals = shock.get("signals", [])
 
-    # ── Session phase quality multiplier ─────────────────────────────────────
+    # ── Session phase / strategy profile (time-of-day trade shaping) ──────────
     if _INTRADAY_STORE_AVAILABLE:
-        phase_name, phase_mult, phase_caution = session_phase()
+        strat = session_strategy()
     else:
-        phase_name, phase_mult, phase_caution = "UNKNOWN", 1.0, ""
+        strat = dict(phase="UNKNOWN", conf_mult=1.0, allow_new_entry=True, min_conf=0,
+                     stop_mult=1.0, target_mult=1.0, reentry_cooldown_min=10,
+                     bias="", caution="")
+    phase_name    = strat["phase"]
+    phase_mult    = strat["conf_mult"]
+    phase_caution = strat["caution"]
 
     # ── Composite direction ───────────────────────────────────────────────────
     composite, verdict, verdict_clr = _composite(
@@ -937,10 +942,12 @@ def build_recommendation(
     if ltp < 2:
         return None
 
-    # ── Risk management ───────────────────────────────────────────────────────
-    sl_pct = profile["sl_pct"]
-    t1_pct = profile["t1_pct"]
-    t2_pct = profile["t2_pct"]
+    # ── Risk management (geometry shaped by session phase) ────────────────────
+    # Wider stops at the volatile open; tighter, faster targets into the
+    # theta-heavy close. Multipliers come from session_strategy().
+    sl_pct = profile["sl_pct"] * strat["stop_mult"]
+    t1_pct = profile["t1_pct"] * strat["target_mult"]
+    t2_pct = profile["t2_pct"] * strat["target_mult"]
 
     entry_lo  = round(ltp * 0.98, 2)
     entry_hi  = round(ltp * 1.02, 2)
@@ -1094,4 +1101,10 @@ def build_recommendation(
         "layer_summary": layer_summary,
         "shock":        shock,
         "shock_level":  shock.get("level", "none"),
+        # Time-of-day strategy gates (consumed by the ledger at open time).
+        "phase":               phase_name,
+        "phase_bias":          strat["bias"],
+        "allow_new_entry":     strat["allow_new_entry"],
+        "phase_min_conf":      strat["min_conf"],
+        "reentry_cooldown_min": strat["reentry_cooldown_min"],
     }

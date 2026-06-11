@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 from fyers_apiv3.FyersWebsocket import data_ws
 from signals import run_full_analysis, recommend_option, fetch_ohlcv, _vwap
 from trade_setup import build_recommendation, TF_PROFILES
-from intraday_store import candle_store, oi_store, build_oi_snapshot, session_phase, record_tick
+from intraday_store import candle_store, oi_store, build_oi_snapshot, session_phase, session_strategy, record_tick
 import intraday_oi_intel
 import intraday_trades
 try:
@@ -3392,10 +3392,28 @@ def _render_trade_book() -> "html.Div":
         html.Span(hdr_stats, style={"fontSize": "0.72rem"}),
     ], style={"marginBottom": "10px"})
 
+    # ── Session-strategy banner: what the engine is doing RIGHT NOW by clock ──
+    strat = session_strategy()
+    gate_open = strat["allow_new_entry"]
+    gate_clr  = "#22c55e" if gate_open else "#f87171"
+    strat_banner = html.Div([
+        html.Span(f"⏱ {strat['phase']}", style={
+            "color": "#e2e8f0", "fontWeight": "700", "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
+        html.Span("  ENTRIES " + ("OPEN" if gate_open else "BLOCKED"), style={
+            "color": gate_clr, "fontWeight": "700", "fontSize": "0.62rem"}),
+        html.Span(f"  · min-conf {strat['min_conf']}%  · stop ×{strat['stop_mult']:.2f}"
+                  f"  · target ×{strat['target_mult']:.2f}", style={
+            "color": "#64748b", "fontSize": "0.58rem"}),
+        html.Div(strat["bias"], style={
+            "color": "#94a3b8", "fontSize": "0.6rem", "marginTop": "2px", "fontStyle": "italic"}),
+    ], style={"marginBottom": "10px", "padding": "6px 9px", "borderRadius": "4px",
+              "background": "#0c1626", "border": f"1px solid {'#15351f' if gate_open else '#3a1418'}",
+              **MONO})
+
     pred_dropdown = _prediction_dropdown(is_open=False)
 
     if not rows:
-        return html.Div([header, pred_dropdown, html.Div(
+        return html.Div([header, strat_banner, pred_dropdown, html.Div(
             "No trades yet today — signals log here as the engine fires across all 4 indices.",
             style={"color": "#475569", "fontSize": "0.75rem", **MONO})])
 
@@ -3418,7 +3436,7 @@ def _render_trade_book() -> "html.Div":
             html.Div(cards),
         ], md=3, style={"padding": "0 9px"}))
 
-    return html.Div([header, pred_dropdown, dbc.Row(cols, className="gx-0")],
+    return html.Div([header, strat_banner, pred_dropdown, dbc.Row(cols, className="gx-0")],
                     style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "padding": "16px 18px"})
 

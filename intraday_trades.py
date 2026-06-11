@@ -113,7 +113,14 @@ class TradeLedger:
         """
         if not rec or rec.get("neutral") or rec.get("direction") not in ("CE", "PE"):
             return None
-        if int(rec.get("confidence") or 0) < _MIN_CONFIDENCE:
+        # Time-of-day hard gate: no new entries in the noisy windows
+        # (first 5 min, lunch, final 15 min) — see session_strategy().
+        if rec.get("allow_new_entry") is False:
+            return None
+        # Confidence must clear BOTH the global floor and the phase-specific bar
+        # (stricter at the open / lunch / close).
+        conf_floor = max(_MIN_CONFIDENCE, int(rec.get("phase_min_conf") or 0))
+        if int(rec.get("confidence") or 0) < conf_floor:
             return None
         entry = float(rec.get("ltp") or 0)
         sl    = float(rec.get("sl") or 0)
@@ -135,19 +142,30 @@ class TradeLedger:
                     [index_sym, direction, day],
                 ).fetchone():
                     return None
-                # Cooldown: skip if one closed very recently (anti-churn).
+                # Cooldown + post-SL discipline. Look at the last closed trade in
+                # this (index, direction) today.
                 last = con.execute(
-                    "SELECT exit_ts FROM paper_trades WHERE index_sym=? AND direction=? "
-                    "AND date=? AND exit_ts IS NOT NULL ORDER BY exit_ts DESC LIMIT 1",
+                    "SELECT exit_ts, status, confidence FROM paper_trades "
+                    "WHERE index_sym=? AND direction=? AND date=? AND exit_ts IS NOT NULL "
+                    "ORDER BY exit_ts DESC LIMIT 1",
                     [index_sym, direction, day],
                 ).fetchone()
                 if last and last["exit_ts"]:
+                    _cd = rec.get("reentry_cooldown_min")
+                    cooldown = int(_cd) if _cd is not None else _REENTRY_COOLDOWN_MIN
                     try:
                         gap = (ts - datetime.datetime.fromisoformat(last["exit_ts"])).total_seconds() / 60
-                        if gap < _REENTRY_COOLDOWN_MIN:
+                        if gap < cooldown:
                             return None
                     except Exception:
                         pass
+                    # Post-SL stronger-signal rule: if the last trade this direction
+                    # was stopped out, only re-enter when the new signal is STRICTLY
+                    # stronger than the one that failed — never re-buy the same losing
+                    # move on an equal-or-weaker read.
+                    if last["status"] == "SL":
+                        if int(rec.get("confidence") or 0) <= int(last["confidence"] or 0):
+                            return None
 
                 # Capture the edge: live OI-Dynamics (A) + overnight continuity (B)
                 # + the top 9-layer signal, so the cockpit 'why' shows the real read.

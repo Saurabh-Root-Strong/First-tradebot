@@ -544,6 +544,62 @@ def session_phase() -> tuple[str, float, str]:
         return "CLOSE",      0.25, "⚠ Final 10 min — avoid option buys, theta collapsing fast"
 
 
+def session_strategy() -> dict:
+    """
+    Time-of-day STRATEGY profile — the richer sibling of session_phase().
+
+    The same six windows, but each now carries the actual trade-shaping rules,
+    not just a confidence multiplier:
+
+      allow_new_entry  — hard gate: no new trades open in noisy windows
+                         (first 5 min, lunch, final 15 min).
+      min_conf         — phase-specific confidence floor to OPEN (>= global 50).
+      stop_mult /      — risk geometry: wider stops at the volatile open,
+      target_mult        tighter/faster targets into the theta-heavy close.
+      reentry_cooldown_min — anti-churn gap, longer in chop.
+      bias             — one-line description of the regime + what to favour,
+                         shown in the Trade Book so the 'why now' is explicit.
+
+    Boundary note: OPENING runs to 10:00 (the user's mental anchor) — before
+    10 is gap / opening-range territory, after 10 is established trend.
+    """
+    T   = datetime.time
+    now = datetime.datetime.now(tz=IST).time()
+    if   now < T(9, 20):
+        return dict(phase="PRE-OPEN", conf_mult=0.40, allow_new_entry=False, min_conf=70,
+                    stop_mult=1.25, target_mult=1.00, reentry_cooldown_min=10,
+                    bias="First 5 min — price discovery, no entries",
+                    caution="⚠ First 5 min — wait for the range to set")
+    elif now < T(10, 0):
+        return dict(phase="OPENING", conf_mult=0.70, allow_new_entry=True, min_conf=58,
+                    stop_mult=1.20, target_mult=1.05, reentry_cooldown_min=12,
+                    bias="Opening range — gap/EOD-led, wider stops, higher bar",
+                    caution="⚠ Opening (pre-10) — volatile, size down")
+    elif now < T(12, 0):
+        return dict(phase="MORNING", conf_mult=1.00, allow_new_entry=True, min_conf=50,
+                    stop_mult=1.00, target_mult=1.00, reentry_cooldown_min=10,
+                    bias="Trend-follow — prime window (post-10)", caution="")
+    elif now < T(13, 0):
+        return dict(phase="LUNCH", conf_mult=0.65, allow_new_entry=False, min_conf=65,
+                    stop_mult=1.00, target_mult=0.90, reentry_cooldown_min=20,
+                    bias="Stand aside — low-volume chop, manage only",
+                    caution="⚠ Lunch — no new entries, signals unreliable")
+    elif now < T(14, 30):
+        return dict(phase="AFTERNOON", conf_mult=1.00, allow_new_entry=True, min_conf=52,
+                    stop_mult=1.00, target_mult=1.00, reentry_cooldown_min=10,
+                    bias="Institutional momentum — trend continuation", caution="")
+    elif now < T(15, 15):
+        return dict(phase="PRE-CLOSE", conf_mult=0.85, allow_new_entry=True, min_conf=58,
+                    stop_mult=0.85, target_mult=0.80, reentry_cooldown_min=12,
+                    bias="Theta-aware scalps — tighter, faster targets",
+                    caution="Pre-close: take profits faster, no fresh swings")
+    else:
+        return dict(phase="CLOSE", conf_mult=0.30, allow_new_entry=False, min_conf=90,
+                    stop_mult=0.80, target_mult=0.70, reentry_cooldown_min=30,
+                    bias="Square-off only — no new option buys",
+                    caution="⚠ Final 15 min — theta collapse, exit don't enter")
+
+
 # ── Module singletons (imported by signals.py, trade_setup.py, dashboard.py) ──
 
 _SYMBOLS = [
