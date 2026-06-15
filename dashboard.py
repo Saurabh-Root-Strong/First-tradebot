@@ -37,6 +37,11 @@ try:
 except Exception:
     _PLAYBOOK_AVAILABLE = False
 try:
+    import session_conductor
+    _CONDUCTOR_AVAILABLE = True
+except Exception:
+    _CONDUCTOR_AVAILABLE = False
+try:
     from dcm_prediction import get_dcm_reader as _get_dcm_reader
     _DCM_OK = True
 except Exception:
@@ -3440,6 +3445,13 @@ _PB_ACTION_CLR = {"BUY CE": "#4ade80", "BUY PE": "#f87171", "WRITE PE": "#fbbf24
                   "WRITE CE": "#fbbf24", "BUY FUT": "#60a5fa", "SELL FUT": "#60a5fa",
                   "NO TRADE": "#64748b"}
 _PB_TONE_CLR = {"bull": "#4ade80", "bear": "#f87171", "flat": "#475569"}
+# Direction tag + stance clarifier — so a WRITE PE (a bullish premium-sell) never
+# reads as a bearish "put" trade at a glance.
+_PB_DIR_TAG = {"BULLISH": ("▲ BULLISH", "#4ade80"),
+               "BEARISH": ("▼ BEARISH", "#f87171"),
+               "NEUTRAL": ("● NEUTRAL", "#94a3b8")}
+_PB_STANCE_HINT = {"WRITE PE": "sell puts · bullish", "WRITE CE": "sell calls · bearish",
+                   "BUY FUT": "long futures", "SELL FUT": "short futures"}
 
 
 def _render_opening_playbook(asof_value=None) -> "html.Div":
@@ -3478,34 +3490,134 @@ def _render_opening_playbook(asof_value=None) -> "html.Div":
         act = p["action"]; aclr = _PB_ACTION_CLR.get(act, "#94a3b8")
         strike_txt = f" {p['strike']:,}" if p.get("strike") else ""
         flip = p.get("flip") or {}
+        dirn = p.get("direction", "NEUTRAL")
+        dtag, dclr = _PB_DIR_TAG.get(dirn, ("● NEUTRAL", "#94a3b8"))
+        hint = _PB_STANCE_HINT.get(act, "")
         cards.append(dbc.Col([
+            # Headline (always visible): label · conviction · direction stance
             html.Div([
                 html.Span(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
                           "fontSize": "0.6rem", "letterSpacing": "0.06em"}),
-                html.Span(f"  {p['conviction']}%", style={"color": "#94a3b8", "fontSize": "0.55rem"}),
-            ]),
-            html.Div(f"{act}{strike_txt}", style={"color": aclr, "fontWeight": "700",
-                     "fontSize": "0.82rem", "margin": "2px 0"}),
+                html.Span(f" {p['conviction']}%", style={"color": "#94a3b8", "fontSize": "0.55rem"}),
+                html.Span(dtag, style={"color": dclr, "fontWeight": "700",
+                          "fontSize": "0.52rem", "marginLeft": "auto"}),
+            ], style={"display": "flex", "alignItems": "center"}),
+            # Action + strike, with a plain-English stance clarifier (WRITE/FUT)
+            html.Div([
+                html.Span(f"{act}{strike_txt}", style={"color": aclr, "fontWeight": "700",
+                          "fontSize": "0.82rem"}),
+                html.Span(f"  · {hint}", style={"color": dclr, "fontSize": "0.5rem"}) if hint else None,
+            ], style={"margin": "2px 0"}),
             html.Div(flip.get("msg", ""), style={"color": "#fb923c", "fontSize": "0.52rem",
                      "fontWeight": "700", "background": "#27160a", "border": "1px solid #7c2d12",
                      "borderRadius": "3px", "padding": "2px 4px", "marginBottom": "3px"})
                 if flip.get("flipped") else None,
-            html.Div(p.get("why", ""), style={"color": "#94a3b8", "fontSize": "0.54rem",
-                     "lineHeight": "1.35", "marginBottom": "3px", "whiteSpace": "normal"}),
-            html.Div([html.Div(m, style={"color": _PB_TONE_CLR.get(tone, "#64748b"),
-                     "fontSize": "0.52rem", "lineHeight": "1.4", "whiteSpace": "normal"})
-                      for tone, m in (p.get("factors") or [])]),
-            html.Div(f"wrong {'below' if p['direction'] == 'BULLISH' else 'above'} "
+            # Invalidation stays visible — the one risk number you must see.
+            html.Div(f"wrong {'below' if dirn == 'BULLISH' else 'above'} "
                      f"{p['invalidation']:,.0f}", style={"color": "#f87171",
                      "fontSize": "0.52rem", "marginTop": "2px", "fontWeight": "600"})
-                if p.get("invalidation") and p.get("direction") != "NEUTRAL" else None,
-            html.Div(p.get("margin_note", ""), style={"color": "#7c2d12", "fontSize": "0.5rem",
-                     "marginTop": "1px"}) if p.get("margin_note") else None,
+                if p.get("invalidation") and dirn != "NEUTRAL" else None,
+            # Verbose rationale folded into a collapsible, scrollable disclosure.
+            html.Details([
+                html.Summary("why & factors", style={"color": "#64748b",
+                             "fontSize": "0.52rem", "cursor": "pointer", "marginTop": "3px"}),
+                html.Div([
+                    html.Div(p.get("why", ""), style={"color": "#94a3b8", "fontSize": "0.54rem",
+                             "lineHeight": "1.35", "marginBottom": "3px", "whiteSpace": "normal"}),
+                    *[html.Div(m, style={"color": _PB_TONE_CLR.get(tone, "#64748b"),
+                              "fontSize": "0.52rem", "lineHeight": "1.4", "whiteSpace": "normal"})
+                      for tone, m in (p.get("factors") or [])],
+                    html.Div(p.get("margin_note", ""), style={"color": "#a16207",
+                             "fontSize": "0.5rem", "marginTop": "2px"}) if p.get("margin_note") else None,
+                ], style={"maxHeight": "150px", "overflowY": "auto", "marginTop": "3px",
+                          "paddingRight": "4px"}),
+            ]),
         ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {cd}33"}))
 
     return html.Div([head, dbc.Row(cards, className="gx-0")], style={
         "marginBottom": "10px", "padding": "8px 10px", "borderRadius": "4px",
         "background": "#0d1420", "border": "1px solid #2a2410", **MONO})
+
+
+# ── Session Conductor panel — the unified, evolving stance per index ────────────
+_COND_DIR_CLR   = {"LONG": "#4ade80", "SHORT": "#f87171", "FLAT": "#94a3b8"}
+_COND_DIR_ARROW = {"LONG": "▲", "SHORT": "▼", "FLAT": "•"}
+
+
+def _cond_drv_clr(v: float) -> str:
+    return "#4ade80" if v > 0.05 else "#f87171" if v < -0.05 else "#475569"
+
+
+def _render_conductor() -> "html.Div":
+    """One fused, evolving stance per index — resolves the stale-opening-vs-live
+    dissonance into a single directive. Decision-support (does not auto-execute)."""
+    if not _CONDUCTOR_AVAILABLE:
+        return html.Div()
+    try:
+        per = session_conductor.conduct_all()
+    except Exception:
+        return html.Div()
+    head = html.Div([
+        html.Span("🎛 SESSION CONDUCTOR", style={"color": "#a78bfa", "fontWeight": "700",
+                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
+        html.Span("  fused stance — opening thesis (decaying) ⊕ regime ⊕ momentum ⊕ OI"
+                  "  ·  decision-support", style={"color": "#64748b", "fontSize": "0.55rem"}),
+    ], style={"marginBottom": "6px"})
+
+    cards = []
+    for sym in INDEX_SYMBOLS:
+        r = per.get(sym) or {}
+        cd = COLORS.get(sym, "#a78bfa")
+        if not r.get("has_data"):
+            cards.append(dbc.Col([
+                html.Div(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700", "fontSize": "0.6rem"}),
+                html.Div(r.get("note", "warming up"), style={"color": "#475569", "fontSize": "0.52rem"})],
+                md=3, style={"padding": "0 8px"}))
+            continue
+        dirn = r["direction"]; dclr = _COND_DIR_CLR.get(dirn, "#94a3b8")
+        inst = r["instrument"]; aclr = _PB_ACTION_CLR.get(inst["action"], "#94a3b8")
+        strike = f" {inst['strike']:,}" if inst.get("strike") else ""
+        cards.append(dbc.Col([
+            html.Div([
+                html.Span(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
+                          "fontSize": "0.6rem", "letterSpacing": "0.06em"}),
+                html.Span(f"  {_COND_DIR_ARROW[dirn]} {dirn}", style={"color": dclr,
+                          "fontWeight": "700", "fontSize": "0.56rem"}),
+                html.Span(f"{r['conviction']}%", style={"color": "#94a3b8", "fontSize": "0.54rem",
+                          "marginLeft": "auto"}),
+            ], style={"display": "flex", "alignItems": "center"}),
+            html.Div(f"{inst['action']}{strike}", style={"color": aclr, "fontWeight": "700",
+                     "fontSize": "0.8rem", "margin": "2px 0"}),
+            html.Div(f"{r['transition']}" + ("" if r["act_now"] else " · wait"),
+                     style={"color": "#cbd5e1" if r["act_now"] else "#64748b", "fontSize": "0.5rem",
+                            "fontWeight": "700" if r["act_now"] else "400", "marginBottom": "2px"}),
+            html.Div(f"opened {r.get('opening_dir','?')} ({r.get('opening_action','—')}) → {dirn}"
+                     if r.get("opening_action") else "",
+                     style={"color": "#64748b", "fontSize": "0.5rem", "marginBottom": "2px"}),
+            html.Details([
+                html.Summary("drivers & why", style={"color": "#64748b", "fontSize": "0.5rem", "cursor": "pointer"}),
+                html.Div([html.Div(inst.get("why", ""), style={"color": "#94a3b8",
+                          "fontSize": "0.5rem", "marginBottom": "2px", "whiteSpace": "normal"})] +
+                    [html.Div([
+                        html.Span(("▲" if v > 0.05 else "▼" if v < -0.05 else "·") + " ",
+                                  style={"color": _cond_drv_clr(v)}),
+                        html.Span(f"{name} ", style={"color": "#94a3b8"}),
+                        html.Span(f"{v:+.2f} ", style={"color": _cond_drv_clr(v), "fontWeight": "600"}),
+                        html.Span(str(detail)[:44], style={"color": "#475569"}),
+                    ], style={"fontSize": "0.5rem", "lineHeight": "1.5", "whiteSpace": "normal"})
+                     for name, v, detail in r.get("drivers", [])],
+                    style={"maxHeight": "120px", "overflowY": "auto", "marginTop": "2px"}),
+            ]),
+            html.Div(f"wrong {'below' if dirn == 'LONG' else 'above'} {r['invalidation']:,.0f}"
+                     if r.get("invalidation") and dirn != "FLAT" else "",
+                     style={"color": "#f87171", "fontSize": "0.5rem", "marginTop": "2px"}),
+            html.Div(f"⏳ regime → {r['regime_eta']}" if r.get("regime_eta") else "",
+                     style={"color": "#fb923c", "fontSize": "0.5rem"}),
+        ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {dclr}55"}))
+
+    return html.Div([head, dbc.Row(cards, className="gx-0")], style={
+        "marginBottom": "10px", "padding": "9px 11px", "borderRadius": "4px",
+        "background": "#0c0e18", "border": "1px solid #2a2440", **MONO})
 
 
 def _trade_card(t, fc=None) -> "html.Div":
@@ -3609,10 +3721,11 @@ def _render_trade_book(asof_value=None) -> "html.Div":
               **MONO})
 
     pred_dropdown = _prediction_dropdown(is_open=False)
+    conductor = _render_conductor()
     playbook = _render_opening_playbook(asof_value)
 
     if not rows:
-        return html.Div([header, strat_banner, playbook, regime_radar, pred_dropdown, html.Div(
+        return html.Div([header, strat_banner, conductor, playbook, regime_radar, pred_dropdown, html.Div(
             "No trades yet today — signals log here as the engine fires across all 4 indices.",
             style={"color": "#475569", "fontSize": "0.75rem", **MONO})])
 
@@ -3635,7 +3748,8 @@ def _render_trade_book(asof_value=None) -> "html.Div":
             html.Div(cards),
         ], md=3, style={"padding": "0 9px"}))
 
-    return html.Div([header, strat_banner, playbook, regime_radar, pred_dropdown, dbc.Row(cols, className="gx-0")],
+    return html.Div([header, strat_banner, conductor, playbook, regime_radar, pred_dropdown,
+                     dbc.Row(cols, className="gx-0")],
                     style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "padding": "16px 18px"})
 
