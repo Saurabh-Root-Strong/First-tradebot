@@ -27,6 +27,16 @@ try:
 except Exception:
     _SHOCK_AVAILABLE = False
 try:
+    import regime_forecast
+    _REGIME_AVAILABLE = True
+except Exception:
+    _REGIME_AVAILABLE = False
+try:
+    import opening_playbook
+    _PLAYBOOK_AVAILABLE = True
+except Exception:
+    _PLAYBOOK_AVAILABLE = False
+try:
     from dcm_prediction import get_dcm_reader as _get_dcm_reader
     _DCM_OK = True
 except Exception:
@@ -672,6 +682,24 @@ def _oi_background_poller():
                         snap = build_oi_snapshot(sym, spot, strike_map, tot_c, tot_p, pcr, mp)
                         if snap:
                             oi_store.add(snap)
+                        # Persist per-strike legs near ATM so strike-level OI
+                        # dynamics (writing vs unwinding) survive the session
+                        # and reach the parquet mirrors for playbook/replay.
+                        try:
+                            from intraday_db import idb
+                            near = sorted(strike_map, key=lambda sp: abs(sp - spot))[:17]
+                            legs = []
+                            for sp in near:
+                                for side in ("CE", "PE"):
+                                    e = strike_map[sp].get(side)
+                                    if e:
+                                        legs.append((sp, side,
+                                                     e.get("ltp"), e.get("ltpch"),
+                                                     e.get("oi"), e.get("oich"),
+                                                     e.get("volume")))
+                            idb.write_chain(sym, datetime.datetime.now(tz=IST), legs)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
         except Exception:
@@ -857,6 +885,59 @@ def _nav_card(sym: str) -> html.Div:
         "border": f"1px solid {color}22", "borderLeft": f"3px solid {color}",
         "background": f"linear-gradient(135deg, #0c1522 0%, {color}0a 100%)",
         "cursor": "pointer",
+    })
+
+
+# ── Header nav chip (horizontal, clickable) — replaces the old left-pane tile ──
+def _nav_chip_style(sym: str, selected: bool = False) -> dict:
+    """Base style for a header index chip. Shared with toggle_view so the selected
+    highlight stays in sync with the layout (the callback overwrites this style)."""
+    c = COLORS[sym]
+    return {
+        "display": "flex", "alignItems": "center", "gap": "8px",
+        "padding": "6px 12px", "borderRadius": "8px",
+        "border": f"1px solid {c}{'aa' if selected else '33'}",
+        "borderBottom": f"2px solid {c}",
+        "background": f"{c}1f" if selected else BG_CARD,
+        "cursor": "pointer", "transition": "background 0.15s",
+        "whiteSpace": "nowrap",
+    }
+
+
+def _header_nav_card(sym: str) -> html.Div:
+    """Compact horizontal index chip (label · LTP · change · OC) for the header bar.
+    Keeps the same ids (nav-/s-ltp-/s-chg-) as the old tile so callbacks are unchanged."""
+    slug, color = _slug(sym), COLORS[sym]
+    return html.Div(id=f"nav-{slug}", n_clicks=0,
+                    title=f"Open {LABELS[sym]} option chain", children=[
+        html.Span(className="live-dot", style={"flexShrink": "0"}),
+        html.Span(LABELS[sym], style={
+            "color": color, "fontSize": "0.55rem",
+            "letterSpacing": "0.12em", "fontWeight": "800"}),
+        html.Span(id=f"s-ltp-{slug}", children="—", style={
+            **MONO, "fontSize": "0.95rem", "fontWeight": "900",
+            "color": "#f1f5f9", "lineHeight": "1", "letterSpacing": "-0.02em"}),
+        html.Span(id=f"s-chg-{slug}", children="", style={**MONO, "fontSize": "0.6rem"}),
+        html.Span("OC ›", style={
+            "color": f"{color}66", "fontSize": "0.5rem", "letterSpacing": "0.05em"}),
+    ], style=_nav_chip_style(sym))
+
+
+def _header_action_chip(id_: str, icon: str, label: str, color: str,
+                        extra_child=None) -> html.Div:
+    """Compact clickable section button (Today's Trades / Live OI) for the header bar."""
+    children = [
+        html.Span(icon, style={"fontSize": "0.72rem"}),
+        html.Span(label, style={"color": "#cbd5e1", "fontSize": "0.55rem",
+                                "fontWeight": "700", "letterSpacing": "0.1em"}),
+    ]
+    if extra_child is not None:
+        children.append(extra_child)
+    return html.Div(id=id_, n_clicks=0, children=children, style={
+        "display": "flex", "alignItems": "center", "gap": "7px",
+        "padding": "6px 12px", "borderRadius": "8px",
+        "border": f"1px solid {color}55", "borderBottom": f"2px solid {color}",
+        "background": BG_CARD, "cursor": "pointer", "whiteSpace": "nowrap",
     })
 
 
@@ -1121,89 +1202,40 @@ body { background:#030810 !important; overflow-x:hidden; }
 app.index_string = app.index_string.replace("</head>", _CSS + "</head>")
 
 app.layout = dbc.Container([
-    # ── Header ─────────────────────────────────────────────────────────────────
-    dbc.Row([
-        dbc.Col([
-            html.Div([
+    # ── Header (brand + status, then a horizontal index/nav strip) ──────────────
+    html.Div([
+        dbc.Row([
+            dbc.Col(html.Div([
                 html.Span("◆ ", style={
-                    "color": "#00d4ff", "fontSize": "0.9rem", "marginRight": "8px",
-                }),
+                    "color": "#00d4ff", "fontSize": "0.9rem", "marginRight": "8px"}),
                 html.Span("NSE", style={
                     "fontSize": "0.72rem", "fontWeight": "900", "letterSpacing": "0.3em",
-                    "color": "#00b4d8", "marginRight": "8px",
-                }),
+                    "color": "#00b4d8", "marginRight": "8px"}),
                 html.Span("INDEX LIVE", style={
                     "fontSize": "0.82rem", "fontWeight": "700", "letterSpacing": "0.2em",
-                    "color": "#e2e8f0",
-                }),
+                    "color": "#e2e8f0"}),
                 html.Span("  DASHBOARD", style={
                     "fontSize": "0.82rem", "fontWeight": "300", "letterSpacing": "0.2em",
-                    "color": "#475569",
-                }),
-            ], style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
-            html.Div([
-                html.Span("NIFTY 50", style={"color": COLORS["NSE:NIFTY50-INDEX"],
-                          "fontSize": "0.5rem", "letterSpacing": "0.1em", "marginRight": "12px"}),
-                html.Span("BANK NIFTY", style={"color": COLORS["NSE:NIFTYBANK-INDEX"],
-                          "fontSize": "0.5rem", "letterSpacing": "0.1em", "marginRight": "12px"}),
-                html.Span("FIN NIFTY", style={"color": COLORS["NSE:FINNIFTY-INDEX"],
-                          "fontSize": "0.5rem", "letterSpacing": "0.1em", "marginRight": "12px"}),
-                html.Span("MIDCAP NIFTY", style={"color": COLORS["NSE:MIDCPNIFTY-INDEX"],
-                          "fontSize": "0.5rem", "letterSpacing": "0.1em"}),
-            ], style={"marginLeft": "26px"}),
-        ], width=8),
-        dbc.Col(html.Div(id="status", style={
-            "textAlign": "right", "fontSize": "0.68rem",
-        }), width=4),
-    ], className="mt-3 mb-2 align-items-center",
-       style={"paddingBottom": "10px"}),
+                    "color": "#475569"}),
+            ], style={"display": "flex", "alignItems": "center"})),
+            dbc.Col(html.Div(id="status", style={
+                "textAlign": "right", "fontSize": "0.68rem"}), width="auto"),
+        ], className="align-items-center g-0"),
+        # Horizontal index chips (clickable nav) + section actions — replaces the left pane
+        html.Div([
+            *[_header_nav_card(sym) for sym in INDEX_SYMBOLS],
+            html.Div(style={"flex": "1 1 auto"}),     # spacer pushes actions to the right
+            _header_action_chip(
+                "nav-tradebook", "📒", "TODAY'S TRADES", "#fbbf24",
+                html.Div(id="sidebar-trades", style={"display": "flex", "alignItems": "center"})),
+            _header_action_chip("nav-liveoi", "📡", "LIVE OI", "#40c4ff"),
+        ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px",
+                  "alignItems": "center", "marginTop": "10px"}),
+    ], style={"padding": "14px 16px 10px"}),
     html.Div(className="header-line"),
 
     dbc.Row([
-        # ── Left sidebar ───────────────────────────────────────────────────────
-        dbc.Col([
-            html.Div([
-                html.Span("INDICES", style={"letterSpacing": "0.22em", "color": "#1e3a5f",
-                                             "fontWeight": "700"}),
-            ], style={"fontSize": "0.54rem", "marginBottom": "12px"}),
-            *[_nav_card(sym) for sym in INDEX_SYMBOLS],
-            html.Div([
-                html.Span("▲ ", style={"color": "#1e3a5f", "fontSize": "0.6rem"}),
-                html.Span("click to open chain", style={"color": "#1e2d40",
-                                                          "fontSize": "0.52rem", "letterSpacing": "0.04em"}),
-            ], style={"textAlign": "center", "marginTop": "14px"}),
-            # ── Clickable: Today's Trades → opens the Trade Book view ─────────
-            html.Div(id="nav-tradebook", n_clicks=0, children=[
-                html.Div("📒 TODAY'S TRADES", style={
-                    "letterSpacing": "0.14em", "color": "#cbd5e1", "fontWeight": "700",
-                    "fontSize": "0.6rem", "marginBottom": "4px"}),
-                html.Div(id="sidebar-trades"),
-                html.Div("click to view ▸", style={
-                    "color": "#475569", "fontSize": "0.5rem", "marginTop": "4px"}),
-            ], style={
-                "marginTop": "18px", "padding": "10px 12px", "borderRadius": "8px",
-                "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #fbbf24",
-                "background": BG_CARD, "cursor": "pointer"}),
-            # ── Clickable: Live OI → opens the OI time-series view ────────────
-            html.Div(id="nav-liveoi", n_clicks=0, children=[
-                html.Div("📡 LIVE OI", style={
-                    "letterSpacing": "0.14em", "color": "#cbd5e1", "fontWeight": "700",
-                    "fontSize": "0.6rem", "marginBottom": "3px"}),
-                html.Div("OI · PCR · walls vs price", style={"color": "#475569", "fontSize": "0.5rem"}),
-                html.Div("click to view ▸", style={
-                    "color": "#475569", "fontSize": "0.5rem", "marginTop": "4px"}),
-            ], style={
-                "marginTop": "10px", "padding": "10px 12px", "borderRadius": "8px",
-                "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #40c4ff",
-                "background": BG_CARD, "cursor": "pointer"}),
-        ], md=2, style={
-            "background": BG_SIDE, "padding": "16px 10px",
-            "borderRight": "1px solid #111d2e",
-            "minHeight": "calc(100vh - 70px)",
-            "overflowY": "auto",
-        }),
-
-        # ── Main content ────────────────────────────────────────────────────────
+        # ── Main content (full width — index nav now lives in the header) ────────
         dbc.Col([
             # OVERVIEW PANEL
             html.Div(id="overview-panel", children=[
@@ -1329,13 +1361,17 @@ app.layout = dbc.Container([
                 ], className="mb-2 align-items-center"),
                 html.Div(id="liveoi-content"),
             ]),
-        ], md=10, style={"padding": "12px 16px"}),
+        ], md=12, style={"padding": "12px 16px"}),
     ], className="gx-0"),
 
     # State stores
     dcc.Location(id="url", refresh=False),
     dcc.Store(id="sel-sym",    data=None),
     dcc.Store(id="sel-expiry", data=""),
+    # Regime Radar checkpoint lives in a static Store: the dropdown that sets it
+    # is rendered dynamically inside the Trade Book, and a callback may not use a
+    # dynamically-created component as an Input before it exists in the DOM.
+    dcc.Store(id="regime-asof", data="now"),
 
     # Intervals
     dcc.Interval(id="fast-tick",   interval=1000,  n_intervals=0),
@@ -2816,17 +2852,7 @@ def toggle_view(sym):
     else:
         title = ""
 
-    nav_styles = []
-    for s in INDEX_SYMBOLS:
-        c = COLORS[s]
-        selected = (s == sym)
-        nav_styles.append({
-            "padding": "12px 14px", "marginBottom": "8px", "borderRadius": "8px",
-            "border": f"1px solid {c}{'88' if selected else '33'}",
-            "borderLeft": f"3px solid {c}",
-            "background": f"{c}18" if selected else BG_CARD,
-            "cursor": "pointer", "transition": "background 0.15s",
-        })
+    nav_styles = [_nav_chip_style(s, selected=(s == sym)) for s in INDEX_SYMBOLS]
     return (ov_style, oc_style, tb_style, lo_style, title, *nav_styles)
 
 
@@ -3322,7 +3348,167 @@ def _trade_levels_bar(t) -> "html.Div":
               "margin": "11px 3px 7px 3px"})
 
 
-def _trade_card(t) -> "html.Div":
+_REGIME_CLR = {"BULLISH": "#4ade80", "BEARISH": "#f87171", "NEUTRAL": "#94a3b8"}
+_STAGE_CLR  = {"IMMINENT": "#ef4444", "BUILDING": "#f59e0b", "STABLE": "#22c55e"}
+
+
+def _regime_risk_badge(t, fc=None):
+    """Amber/red forward-looking badge when a regime flip is building against this trade."""
+    if not _REGIME_AVAILABLE:
+        return None
+    try:
+        risk = regime_forecast.trade_regime_risk(t, fc)
+    except Exception:
+        risk = None
+    if not risk:
+        return None
+    clr = _STAGE_CLR.get(risk["stage"], "#f59e0b")
+    return html.Div(risk["msg"][:170], style={
+        "color": clr, "fontSize": "0.54rem", "marginTop": "3px", "fontWeight": "700",
+        "lineHeight": "1.35", "whiteSpace": "normal", "background": "#1a1206",
+        "border": f"1px solid {clr}66", "borderRadius": "3px", "padding": "3px 5px"})
+
+
+def _render_regime_radar(asof_value=None) -> "html.Div":
+    """
+    Forward-looking Regime Radar with a 30-min time-machine dropdown.
+    Selecting a checkpoint reconstructs the market regime + change-forecast as it
+    stood at that moment (read from the persisted snapshot mirrors).
+    """
+    if not _REGIME_AVAILABLE:
+        return html.Div()
+    marks = regime_forecast.checkpoint_times()
+    opts = [{"label": "● Now (live)", "value": "now"}] + \
+           [{"label": t.strftime("%H:%M"), "value": t.isoformat()} for t in marks]
+    val = asof_value or "now"
+    as_of = None
+    if val and val != "now":
+        try:
+            as_of = datetime.datetime.fromisoformat(val)
+        except Exception:
+            as_of = None
+
+    m = regime_forecast.market_forecast(as_of)
+    stage = m.get("stage", "—") if m.get("has_data") else "—"
+    sclr  = _STAGE_CLR.get(stage, "#64748b")
+
+    head = html.Div([
+        html.Span("🛰 REGIME RADAR", style={"color": "#67e8f9", "fontWeight": "700",
+                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
+        html.Span("  forecast as of", style={"color": "#64748b", "fontSize": "0.55rem"}),
+        dcc.Dropdown(id="regime-checkpoint", options=opts, value=val, clearable=False,
+                     style={"width": "130px", "fontSize": "0.62rem", "color": "#0b1320"}),
+    ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "6px"})
+
+    if not m.get("has_data"):
+        body = html.Div("Regime data warming up — need ~12 min of snapshots.",
+                        style={"color": "#475569", "fontSize": "0.6rem"})
+    else:
+        nxt = m.get("next_dir") or "—"
+        market_line = html.Div([
+            html.Span(f"MARKET {m['regime']}", style={
+                "color": _REGIME_CLR.get(m["regime"], "#94a3b8"), "fontWeight": "700",
+                "fontSize": "0.66rem"}),
+            html.Span(f"  · {stage}", style={"color": sclr, "fontWeight": "700", "fontSize": "0.62rem"}),
+            html.Span(f"  next {nxt} in {m['eta']} ({m['confidence']}%)  · {m['coherence']}"
+                      if stage != "STABLE" else f"  holding · {m['coherence']}",
+                      style={"color": "#94a3b8", "fontSize": "0.58rem"}),
+        ], style={"marginBottom": "4px"})
+        rows = []
+        for s in regime_forecast.INDEX_SYMBOLS:
+            f = (m.get("per_index") or {}).get(s, {})
+            if not f.get("has_data"):
+                continue
+            st = f["stage"]
+            rows.append(html.Div([
+                html.Span(LABELS.get(s, s), style={"color": COLORS.get(s, "#94a3b8"),
+                          "fontWeight": "700", "fontSize": "0.58rem", "minWidth": "78px",
+                          "display": "inline-block"}),
+                html.Span(f["regime"], style={"color": _REGIME_CLR.get(f["regime"], "#94a3b8"),
+                          "fontSize": "0.58rem", "fontWeight": "600"}),
+                html.Span(f"  {st}" + (f" → {f['next_dir']} {f['eta']}" if st != "STABLE" and f["next_dir"] else ""),
+                          style={"color": _STAGE_CLR.get(st, "#64748b"), "fontSize": "0.56rem"}),
+            ], style={"marginBottom": "1px"}))
+        body = html.Div([market_line, *rows])
+
+    return html.Div([head, body], style={
+        "marginBottom": "10px", "padding": "8px 10px", "borderRadius": "4px",
+        "background": "#0a1622", "border": f"1px solid {sclr}33", **MONO})
+
+
+_PB_ACTION_CLR = {"BUY CE": "#4ade80", "BUY PE": "#f87171", "WRITE PE": "#fbbf24",
+                  "WRITE CE": "#fbbf24", "BUY FUT": "#60a5fa", "SELL FUT": "#60a5fa",
+                  "NO TRADE": "#64748b"}
+_PB_TONE_CLR = {"bull": "#4ade80", "bear": "#f87171", "flat": "#475569"}
+
+
+def _render_opening_playbook(asof_value=None) -> "html.Div":
+    """Opening Playbook — the first-20-min F&O morning call, one card per index."""
+    if not _PLAYBOOK_AVAILABLE:
+        return html.Div()
+    as_of = None
+    if asof_value and asof_value != "now":
+        try:
+            as_of = datetime.datetime.fromisoformat(asof_value)
+        except Exception:
+            as_of = None
+    try:
+        pb = opening_playbook.playbook_all(as_of)
+    except Exception:
+        return html.Div()
+
+    head = html.Div([
+        html.Span("⚡ OPENING PLAYBOOK", style={"color": "#fbbf24", "fontWeight": "700",
+                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
+        html.Span("  first-20-min F&O read · OI · premium · basis · EOD memory",
+                  style={"color": "#64748b", "fontSize": "0.55rem"}),
+        html.Span(f"  · {pb.get('coherence', '')}", style={"color": "#94a3b8", "fontSize": "0.55rem"}),
+    ], style={"marginBottom": "6px"})
+
+    cards = []
+    for sym in INDEX_SYMBOLS:
+        p = (pb.get("per_index") or {}).get(sym) or {}
+        cd = COLORS.get(sym, "#40c4ff")
+        if not p.get("has_data"):
+            body = html.Div(p.get("note") or "no data", style={"color": "#475569", "fontSize": "0.55rem"})
+            cards.append(dbc.Col([html.Div(LABELS.get(sym, sym), style={
+                "color": cd, "fontWeight": "700", "fontSize": "0.6rem"}), body],
+                md=3, style={"padding": "0 8px"}))
+            continue
+        act = p["action"]; aclr = _PB_ACTION_CLR.get(act, "#94a3b8")
+        strike_txt = f" {p['strike']:,}" if p.get("strike") else ""
+        flip = p.get("flip") or {}
+        cards.append(dbc.Col([
+            html.Div([
+                html.Span(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
+                          "fontSize": "0.6rem", "letterSpacing": "0.06em"}),
+                html.Span(f"  {p['conviction']}%", style={"color": "#94a3b8", "fontSize": "0.55rem"}),
+            ]),
+            html.Div(f"{act}{strike_txt}", style={"color": aclr, "fontWeight": "700",
+                     "fontSize": "0.82rem", "margin": "2px 0"}),
+            html.Div(flip.get("msg", ""), style={"color": "#fb923c", "fontSize": "0.52rem",
+                     "fontWeight": "700", "background": "#27160a", "border": "1px solid #7c2d12",
+                     "borderRadius": "3px", "padding": "2px 4px", "marginBottom": "3px"})
+                if flip.get("flipped") else None,
+            html.Div(p.get("why", ""), style={"color": "#94a3b8", "fontSize": "0.54rem",
+                     "lineHeight": "1.35", "marginBottom": "3px", "whiteSpace": "normal"}),
+            html.Div([html.Div(m, style={"color": _PB_TONE_CLR.get(tone, "#64748b"),
+                     "fontSize": "0.52rem", "lineHeight": "1.4", "whiteSpace": "normal"})
+                      for tone, m in (p.get("factors") or [])]),
+            html.Div(f"wrong {'below' if p['direction'] == 'BULLISH' else 'above'} "
+                     f"{p['invalidation']:,.0f}", style={"color": "#f87171",
+                     "fontSize": "0.52rem", "marginTop": "2px", "fontWeight": "600"})
+                if p.get("invalidation") and p.get("direction") != "NEUTRAL" else None,
+            html.Div(p.get("margin_note", ""), style={"color": "#7c2d12", "fontSize": "0.5rem",
+                     "marginTop": "1px"}) if p.get("margin_note") else None,
+        ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {cd}33"}))
+
+    return html.Div([head, dbc.Row(cards, className="gx-0")], style={
+        "marginBottom": "10px", "padding": "8px 10px", "borderRadius": "4px",
+        "background": "#0d1420", "border": "1px solid #2a2410", **MONO})
+
+
+def _trade_card(t, fc=None) -> "html.Div":
     st = t.get("status") or "OPEN"
     r  = t.get("r_multiple")
     clr = _TRADE_ST_CLR.get(st, "#94a3b8")
@@ -3360,13 +3546,15 @@ def _trade_card(t) -> "html.Div":
                         "fontWeight": "700", "lineHeight": "1.35", "whiteSpace": "normal",
                         "background": "#27160a", "border": "1px solid #7c2d12",
                         "borderRadius": "3px", "padding": "3px 5px"}) if t.get("regime_flag") else None,
+        # Forward-looking regime-RISK forecast (only when a flip is building against an OPEN trade).
+        _regime_risk_badge(t, fc) if st == "OPEN" else None,
         html.Div((t.get("reason") or "")[:180],
                  style={"color": "#52708f", "fontSize": "0.52rem", "marginTop": "3px",
                         "lineHeight": "1.4", "whiteSpace": "normal"}),
     ], style={"padding": "9px 0", "borderBottom": "1px solid #111d2e", **MONO})
 
 
-def _render_trade_book() -> "html.Div":
+def _render_trade_book(asof_value=None) -> "html.Div":
     """Full Trade Book cockpit — trades by index with levels, progress, and reason."""
     led   = intraday_trades.get_ledger()
     today = datetime.datetime.now(tz=IST).date().isoformat()
@@ -3374,6 +3562,16 @@ def _render_trade_book() -> "html.Div":
     rows  = led.recent(200, today)
     with _lock:
         spots = {x: dict(_latest.get(x) or {}) for x in INDEX_SYMBOLS}
+
+    # Live (now) regime forecasts — computed once per render, reused by every card.
+    forecasts = {}
+    if _REGIME_AVAILABLE:
+        for x in INDEX_SYMBOLS:
+            try:
+                forecasts[x] = regime_forecast.forecast_index(x)
+            except Exception:
+                forecasts[x] = {}
+    regime_radar = _render_regime_radar(asof_value)
 
     hdr_stats = []
     if s.get("n"):
@@ -3411,9 +3609,10 @@ def _render_trade_book() -> "html.Div":
               **MONO})
 
     pred_dropdown = _prediction_dropdown(is_open=False)
+    playbook = _render_opening_playbook(asof_value)
 
     if not rows:
-        return html.Div([header, strat_banner, pred_dropdown, html.Div(
+        return html.Div([header, strat_banner, playbook, regime_radar, pred_dropdown, html.Div(
             "No trades yet today — signals log here as the engine fires across all 4 indices.",
             style={"color": "#475569", "fontSize": "0.75rem", **MONO})])
 
@@ -3424,7 +3623,7 @@ def _render_trade_book() -> "html.Div":
         sp = spots.get(sym, {})
         spot_v = sp.get("ltp", 0); chp = sp.get("chp", 0)
         spot_clr = "#22c55e" if chp >= 0 else "#ef4444"
-        cards = [_trade_card(t) for t in idx_rows] or [
+        cards = [_trade_card(t, forecasts.get(sym)) for t in idx_rows] or [
             html.Div("—", style={"color": "#334155", "fontSize": "0.7rem", "padding": "6px 0"})]
         cols.append(dbc.Col([
             html.Div([
@@ -3436,7 +3635,7 @@ def _render_trade_book() -> "html.Div":
             html.Div(cards),
         ], md=3, style={"padding": "0 9px"}))
 
-    return html.Div([header, strat_banner, pred_dropdown, dbc.Row(cols, className="gx-0")],
+    return html.Div([header, strat_banner, playbook, regime_radar, pred_dropdown, dbc.Row(cols, className="gx-0")],
                     style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "padding": "16px 18px"})
 
@@ -3453,11 +3652,28 @@ def update_sidebar_trades(_):
     Output("trade-book-panel", "children"),
     Input("setup-tick",        "n_intervals"),
     Input("sel-sym",           "data"),
+    Input("regime-asof",       "data"),
 )
-def update_trade_book(_, sel):
+def update_trade_book(_, sel, asof_value):
     if sel != "TRADES":
         return no_update
-    return _render_trade_book()
+    # asof_value mirrors the Regime Radar 30-min dropdown ("now" or an ISO mark)
+    # via the regime-asof Store, so the selection persists across the 30s tick.
+    return _render_trade_book(asof_value)
+
+
+@app.callback(
+    Output("regime-asof",      "data"),
+    Input("regime-checkpoint", "value"),
+    State("regime-asof",       "data"),
+    prevent_initial_call=True,
+)
+def set_regime_asof(value, current):
+    # The dropdown is re-created on every Trade Book render, which re-fires this
+    # callback with the same value — pass no_update then, or it would loop.
+    if not value or value == current:
+        return no_update
+    return value
 
 
 def _liveoi_db_fallback(sym: str):
