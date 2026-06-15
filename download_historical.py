@@ -1,8 +1,13 @@
 """
-download_historical.py  —  Download OHLCV history for all 4 NSE indices.
+download_historical.py  —  Download OHLCV history for the NSE F&O universe.
 
-Saves one file per symbol × timeframe to  data/historical/.
-Default: 220 calendar days ≈ 150 trading days (excludes weekends/holidays).
+Covers every F&O underlying (indices + ~211 stock futures, see fno_universe.py)
+across 4 timeframes, sized for backtesting the Tradebot engine.
+
+Saves one file per symbol × timeframe to  data/historical/<timeframe>/.
+Default depth (Fyers serves intraday 2+ years back):
+  intraday (5/15/60-min) : 730 calendar days  (~2 years)
+  daily                  : 1500 calendar days (~4 years)
 
 Formats:
   parquet  — compact, fast, preserves dtypes  (recommended for backtesting)
@@ -16,11 +21,16 @@ Columns in every file:
   close     float
   volume    int
 
+The job is resumable: existing files are skipped unless --force, so an
+interrupted run (token expiry, network) can simply be re-run.
+
 Usage:
-  .venv\\Scripts\\python.exe download_historical.py
-  .venv\\Scripts\\python.exe download_historical.py --days 365
+  .venv\\Scripts\\python.exe download_historical.py                 # full universe, default depth
+  .venv\\Scripts\\python.exe download_historical.py --indices-only  # just the 5 indices
+  .venv\\Scripts\\python.exe download_historical.py --intraday-days 400 --daily-days 750
+  .venv\\Scripts\\python.exe download_historical.py --timeframes 5min,15min
   .venv\\Scripts\\python.exe download_historical.py --format csv
-  .venv\\Scripts\\python.exe download_historical.py --force   # re-download existing
+  .venv\\Scripts\\python.exe download_historical.py --force         # re-download existing
 """
 
 import argparse
@@ -38,6 +48,8 @@ if hasattr(sys.stderr, "reconfigure"):
 import pandas as pd
 import requests
 
+from fno_universe import ALL_SYMBOLS, INDEX_SYMBOLS, LABELS
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_ID       = "WVDZUTO6HL-100"
 TOKEN_FILE   = Path("access_token.txt")
@@ -45,27 +57,17 @@ DATA_DIR     = Path("data") / "historical"
 HISTORY_URL  = "https://api-t1.fyers.in/data/history"
 IST          = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
-SYMBOLS = [
-    "NSE:NIFTY50-INDEX",
-    "NSE:NIFTYBANK-INDEX",
-    "NSE:FINNIFTY-INDEX",
-    "NSE:MIDCPNIFTY-INDEX",
-]
+# Full F&O universe (indices + stock futures) sourced from fno_universe.py.
+SYMBOLS      = ALL_SYMBOLS
+SYMBOL_LABEL = LABELS
 
-SYMBOL_LABEL = {
-    "NSE:NIFTY50-INDEX":    "NIFTY 50",
-    "NSE:NIFTYBANK-INDEX":  "BANK NIFTY",
-    "NSE:FINNIFTY-INDEX":   "FIN NIFTY",
-    "NSE:MIDCPNIFTY-INDEX": "MIDCAP NIFTY",
-}
-
-# (tf_key, fyers_resolution, max_calendar_days_per_api_call, display_label)
+# (tf_key, fyers_resolution, max_calendar_days_per_api_call, is_intraday, display_label)
 # Conservative batch sizes — Fyers allows more but throttling is safer.
 TIMEFRAMES = [
-    ("5min",  "5",  60,  "5-Min   intraday scalp"),
-    ("15min", "15", 100, "15-Min  intraday swing"),
-    ("60min", "60", 100, "1-Hour  BTST / positional"),
-    ("daily", "D",  365, "Daily   swing positional"),
+    ("5min",  "5",  60,  True,  "5-Min   intraday scalp"),
+    ("15min", "15", 100, True,  "15-Min  intraday swing"),
+    ("60min", "60", 100, True,  "1-Hour  BTST / positional"),
+    ("daily", "D",  365, False, "Daily   swing positional"),
 ]
 
 RETRY_DELAYS = [1.5, 3.0, 6.0]   # seconds between retries (exponential backoff)
@@ -190,7 +192,8 @@ def _download_one(sym: str, tf_key: str, resolution: str,
     Download `total_cal_days` in chunks of `batch_days`, deduplicate, save.
     Returns (candle_count, out_path).  candle_count == 0 on failure/skip.
     """
-    out_path = DATA_DIR / f"{_safe(sym)}_{tf_key}.{fmt}"
+    out_dir  = DATA_DIR / tf_key
+    out_path = out_dir / f"{_safe(sym)}_{tf_key}.{fmt}"
 
     if out_path.exists() and not force:
         size_kb = out_path.stat().st_size // 1024
@@ -229,7 +232,7 @@ def _download_one(sym: str, tf_key: str, resolution: str,
         .reset_index(drop=True)
     )
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     if fmt == "parquet":
         result.to_parquet(out_path, index=False)
     else:
@@ -254,12 +257,23 @@ def _row_count(path: Path, fmt: str) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Download NSE index OHLCV history from Fyers API"
+        description="Download NSE F&O-universe OHLCV history from Fyers API"
     )
     ap.add_argument(
-        "--days", type=int, default=220,
-        metavar="N",
-        help="Calendar days to download (220 ≈ 150 trading days).  Default: 220",
+        "--intraday-days", type=int, default=730, metavar="N",
+        help="Calendar days for 5/15/60-min timeframes.  Default: 730 (~2 yrs)",
+    )
+    ap.add_argument(
+        "--daily-days", type=int, default=1500, metavar="N",
+        help="Calendar days for the daily timeframe.  Default: 1500 (~4 yrs)",
+    )
+    ap.add_argument(
+        "--indices-only", action="store_true",
+        help="Download only the index symbols (skip the ~211 stock futures)",
+    )
+    ap.add_argument(
+        "--timeframes", type=str, default="",
+        help="Comma list to restrict timeframes, e.g. '5min,15min'.  Default: all",
     )
     ap.add_argument(
         "--format", choices=["parquet", "csv"], default="parquet",
@@ -271,12 +285,26 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    symbols = INDEX_SYMBOLS if args.indices_only else SYMBOLS
+
+    timeframes = TIMEFRAMES
+    if args.timeframes.strip():
+        wanted     = {t.strip() for t in args.timeframes.split(",")}
+        timeframes = [tf for tf in TIMEFRAMES if tf[0] in wanted]
+        if not timeframes:
+            print(f"ERROR: no known timeframes in '{args.timeframes}'. "
+                  f"Choose from: {', '.join(tf[0] for tf in TIMEFRAMES)}")
+            sys.exit(1)
+
     print(SEP2)
-    print("  NSE HISTORICAL DATA DOWNLOADER")
+    print("  NSE F&O HISTORICAL DATA DOWNLOADER")
     print(SEP2)
-    print(f"  Calendar days  : {args.days}  (≈ {int(args.days * 5/7 * 0.95)} trading days)")
-    print(f"  Symbols        : {len(SYMBOLS)}")
-    print(f"  Timeframes     : {len(TIMEFRAMES)}")
+    print(f"  Intraday depth : {args.intraday_days} cal days  "
+          f"(≈ {int(args.intraday_days * 5/7 * 0.95)} trading days)")
+    print(f"  Daily depth    : {args.daily_days} cal days")
+    print(f"  Symbols        : {len(symbols)}  "
+          f"({'indices only' if args.indices_only else 'full F&O universe'})")
+    print(f"  Timeframes     : {', '.join(tf[0] for tf in timeframes)}")
     print(f"  Format         : {args.format}")
     print(f"  Output dir     : {DATA_DIR.resolve()}")
     print(f"  Force overwrite: {args.force}")
@@ -285,23 +313,24 @@ def main() -> None:
     _validate_token()
     print()
 
-    total_tasks = len(SYMBOLS) * len(TIMEFRAMES)
+    total_tasks = len(symbols) * len(timeframes)
     task_no     = 0
     summary     = []
 
-    for sym in SYMBOLS:
-        label = SYMBOL_LABEL[sym]
+    for sym in symbols:
+        label = SYMBOL_LABEL.get(sym, sym)
         print(f"\n{'=' * 64}")
         print(f"  {label}  ({sym})")
         print(f"{'=' * 64}")
 
-        for tf_key, resolution, batch_days, tf_label in TIMEFRAMES:
+        for tf_key, resolution, batch_days, is_intraday, tf_label in timeframes:
             task_no += 1
-            print(f"\n  [{task_no:>2}/{total_tasks}]  {tf_label}")
+            total_cal_days = args.intraday_days if is_intraday else args.daily_days
+            print(f"\n  [{task_no:>3}/{total_tasks}]  {tf_label}")
 
             n, out_path = _download_one(
                 sym, tf_key, resolution,
-                batch_days, args.days, args.format, args.force,
+                batch_days, total_cal_days, args.format, args.force,
             )
 
             if n == -1:          # skipped
@@ -312,7 +341,7 @@ def main() -> None:
                 summary.append((label, tf_key, f"{n:,} rows", out_path))
             else:
                 print(f"\n    FAIL  no data downloaded")
-                summary.append((label, tf_key, "FAILED", out_path))
+                summary.append((label, tf_key, "FAILED", out_path))  
 
     # ── Summary ────────────────────────────────────────────────────────────────
     print(f"\n{SEP2}")
@@ -323,10 +352,19 @@ def main() -> None:
     for sym_lbl, tf, status, path in summary:
         print(f"  {sym_lbl:<16}  {tf:<6}  {status:<14}  {path.name}")
     print(SEP2)
-    print(f"\n  All files saved to:  {DATA_DIR.resolve()}")
+    ok_rows = sum(1 for _, _, st, _ in summary if st not in ("SKIP", "FAILED"))
+    failed  = [(s, t) for s, t, st, _ in summary if st == "FAILED"]
+    print(f"\n  Files OK: {ok_rows}   Skipped: "
+          f"{sum(1 for _,_,st,_ in summary if st=='SKIP')}   "
+          f"Failed: {len(failed)}")
+    if failed:
+        print("  FAILED tasks (re-run to retry — existing files are skipped):")
+        for s, t in failed:
+            print(f"    - {s} {t}")
+    print(f"\n  All files saved under:  {DATA_DIR.resolve()}\\<timeframe>\\")
     print(f"\n  Load in Python:")
     print(f"    import pandas as pd")
-    print(f"    df = pd.read_parquet('data/historical/NSE_NIFTY50_INDEX_5min.parquet')")
+    print(f"    df = pd.read_parquet('data/historical/5min/NSE_RELIANCE_EQ_5min.parquet')")
     print(f"    # ts column is IST, timezone-naive  (e.g. 2025-11-01 09:15:00)")
     print()
 
