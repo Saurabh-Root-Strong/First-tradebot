@@ -155,11 +155,12 @@ _STATE_OF = {"LONG": "LONG_DELTA", "SHORT": "SHORT_DELTA", "FLAT": "FLAT"}
 
 
 # ── Core ────────────────────────────────────────────────────────────────────────
-def conduct(sym: str, current_state: str | None = None) -> dict:
-    now = datetime.datetime.now(tz=IST)
-    pb = OP.playbook_index(sym)
-    rf = RF.forecast_index(sym)
-    td = TD.analyze_index(sym)
+def conduct(sym: str, current_state: str | None = None,
+            as_of: datetime.datetime | None = None, date: str | None = None) -> dict:
+    now = as_of or datetime.datetime.now(tz=IST)
+    pb = OP.playbook_index(sym, as_of=as_of, date=date)
+    rf = RF.forecast_index(sym, as_of=as_of, date=date)
+    td = TD.analyze_index(sym, date=date, as_of=as_of)
 
     if not td.get("has_data"):
         return {"sym": sym, "label": LABELS.get(sym, sym), "has_data": False,

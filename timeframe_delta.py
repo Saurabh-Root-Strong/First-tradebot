@@ -69,7 +69,8 @@ def _today() -> str:
 
 # ── Loaders ─────────────────────────────────────────────────────────────────────
 
-def _load_index_ticks(sym: str, date: str | None = None) -> pd.DataFrame | None:
+def _load_index_ticks(sym: str, date: str | None = None,
+                      as_of: datetime.datetime | None = None) -> pd.DataFrame | None:
     p = LIVE_DIR / f"{date or _today()}_ticks.parquet"
     if not p.exists():
         return None
@@ -78,10 +79,13 @@ def _load_index_ticks(sym: str, date: str | None = None) -> pd.DataFrame | None:
     if df.empty:
         return None
     df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    return df.sort_values("ts").reset_index(drop=True)
+    if as_of is not None:                       # replay cutoff — no lookahead
+        df = df[df["ts"] <= pd.Timestamp(as_of)]
+    return df.sort_values("ts").reset_index(drop=True) if len(df) else None
 
 
-def _load_index_oi(sym: str, date: str | None = None) -> pd.DataFrame | None:
+def _load_index_oi(sym: str, date: str | None = None,
+                   as_of: datetime.datetime | None = None) -> pd.DataFrame | None:
     p = LIVE_DIR / f"{date or _today()}_oi_snapshots.parquet"
     if not p.exists():
         return None
@@ -90,7 +94,9 @@ def _load_index_oi(sym: str, date: str | None = None) -> pd.DataFrame | None:
     if df.empty:
         return None
     df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    return df.sort_values("ts").reset_index(drop=True)
+    if as_of is not None:
+        df = df[df["ts"] <= pd.Timestamp(as_of)]
+    return df.sort_values("ts").reset_index(drop=True) if len(df) else None
 
 
 def _load_hist(label: str) -> tuple[str, pd.DataFrame] | None:
@@ -255,15 +261,16 @@ def _synthesize(rows: list[dict], incr: dict | None = None) -> dict:
 
 # ── Public API ──────────────────────────────────────────────────────────────────
 
-def analyze_index(sym: str, date: str | None = None) -> dict:
-    ticks = _load_index_ticks(sym, date)
+def analyze_index(sym: str, date: str | None = None,
+                  as_of: datetime.datetime | None = None) -> dict:
+    ticks = _load_index_ticks(sym, date, as_of)
     if ticks is None or len(ticks) < 3:
         return {"sym": sym, "has_data": False, "note": "no tick capture yet"}
     ts = ticks["ts"].to_numpy()
     price = ticks["ltp"].to_numpy(dtype="float64")
     cv = ticks["cum_vol"].to_numpy(dtype="float64")
     has_vol = float(np.nanmax(cv) - np.nanmin(cv)) > 0     # indices often have none
-    oi = _load_index_oi(sym, date)
+    oi = _load_index_oi(sym, date, as_of)
     now_ts = ticks["ts"].iloc[-1]
     sigma1 = _sigma_1min(ts, price)
 

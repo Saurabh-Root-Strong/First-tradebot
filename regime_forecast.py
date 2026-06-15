@@ -56,10 +56,10 @@ def _today() -> str:
     return datetime.datetime.now(tz=IST).date().isoformat()
 
 
-def _read(tbl: str) -> "pd.DataFrame | None":
+def _read(tbl: str, date: Optional[str] = None) -> "pd.DataFrame | None":
     if not _PANDAS:
         return None
-    p = _LIVE_DIR / f"{_today()}_{tbl}.parquet"
+    p = _LIVE_DIR / f"{date or _today()}_{tbl}.parquet"
     if not p.exists():
         return None
     try:
@@ -70,8 +70,9 @@ def _read(tbl: str) -> "pd.DataFrame | None":
         return None
 
 
-def _snaps(sym: str, as_of: Optional[datetime.datetime]) -> "pd.DataFrame | None":
-    df = _read("oi_snapshots")
+def _snaps(sym: str, as_of: Optional[datetime.datetime],
+           date: Optional[str] = None) -> "pd.DataFrame | None":
+    df = _read("oi_snapshots", date)
     if df is None or df.empty:
         return None
     df = df[df["symbol"] == sym].sort_values("ts")
@@ -127,9 +128,10 @@ def _window_read(df: "pd.DataFrame", minutes: int) -> tuple[float, list]:
     return round(score, 3), f
 
 
-def _vol_confirm(sym: str, as_of: Optional[datetime.datetime]) -> float:
+def _vol_confirm(sym: str, as_of: Optional[datetime.datetime],
+                 date: Optional[str] = None) -> float:
     """Recent 1-min price direction as a light confirmation factor, in [-0.3, 0.3]."""
-    df = _read("candles")
+    df = _read("candles", date)
     if df is None or df.empty or "resolution" not in df.columns:
         return 0.0
     df = df[(df["symbol"] == sym) & (df["resolution"] == "1min")].sort_values("ts")
@@ -156,21 +158,23 @@ def _label(score: float) -> str:
 
 
 # ── Per-index forecast ─────────────────────────────────────────────────────────
-def forecast_index(sym: str, as_of: Optional[datetime.datetime] = None) -> dict:
+def forecast_index(sym: str, as_of: Optional[datetime.datetime] = None,
+                   date: Optional[str] = None) -> dict:
     """
-    Regime + change-forecast for one index.
+    Regime + change-forecast for one index.  `date` (ISO) replays a past captured
+    session; `as_of` cuts the read off at a moment within it (lookahead-free).
 
     Returns dict with: has_data, regime, bias, stage, eta, next_dir, confidence,
     factors, asof.
     """
     out = {"sym": sym, "has_data": False, "asof": as_of.isoformat() if as_of else None}
-    df = _snaps(sym, as_of)
+    df = _snaps(sym, as_of, date)
     if df is None:
         return out
 
     long_s,  long_f  = _window_read(df, _LONG_MIN)
     short_s, short_f = _window_read(df, _SHORT_MIN)
-    vol = _vol_confirm(sym, as_of)
+    vol = _vol_confirm(sym, as_of, date)
     short_s = _clip(short_s + vol)
 
     regime = _label(long_s)
