@@ -1,0 +1,35 @@
+# Cloud stack: the Tradebot app (private) + Caddy reverse proxy (public, TLS+password).
+# The app port is NEVER published to the internet — only Caddy's 443 is. Caddy adds
+# HTTPS + basic-auth, so office firewalls (which allow 443) can reach it securely.
+services:
+  tradebot:
+    build: .
+    env_file: .env
+    environment:
+      - DASH_HOST=0.0.0.0
+      - DASH_PORT=8050
+      - FYERS_HEADLESS=1
+      - TRADEBOT_NO_BROWSER=1
+    volumes:
+      - ./data:/app/data       # persist captured ticks/candles/OI across restarts
+      - ./logs:/app/logs
+    expose:
+      - "8050"                 # internal only — reachable by caddy, not the internet
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    depends_on: [tradebot]
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

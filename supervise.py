@@ -65,11 +65,15 @@ def token_valid() -> bool:
 def ensure_token() -> bool:
     if token_valid():
         return True
-    log("Token missing/expired — launching fyers_auth.py (log in via the browser)…")
+    # On a headless server (FYERS_HEADLESS=1) use the TOTP auth — no browser.
+    headless = os.environ.get("FYERS_HEADLESS") == "1"
+    auth_script = "fyers_auth_headless.py" if headless else "fyers_auth.py"
+    log(f"Token missing/expired — launching {auth_script}"
+        + ("" if headless else " (log in via the browser)") + "…")
     try:
-        subprocess.run([str(PY), str(HERE / "fyers_auth.py")], cwd=str(HERE))
+        subprocess.run([str(PY), str(HERE / auth_script)], cwd=str(HERE))
     except Exception as exc:
-        log(f"fyers_auth.py failed: {exc}")
+        log(f"{auth_script} failed: {exc}")
     ok = token_valid()
     log("Token OK." if ok else "Token still invalid after auth attempt.")
     return ok

@@ -4201,4 +4201,9 @@ if __name__ == "__main__":
     if not os.environ.get("TRADEBOT_NO_BROWSER"):
         threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
 
-    app.run(debug=False, host="127.0.0.1", port=8050)
+    # Host/port are env-overridable for containerised/cloud deploys. Defaults stay
+    # 127.0.0.1:8050 for local use; the cloud image sets DASH_HOST=0.0.0.0 so the
+    # Caddy reverse proxy (TLS + password) can reach it over the internal network.
+    app.run(debug=False,
+            host=os.environ.get("DASH_HOST", "127.0.0.1"),
+            port=int(os.environ.get("DASH_PORT", "8050")))

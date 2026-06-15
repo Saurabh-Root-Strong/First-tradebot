@@ -1,0 +1,15 @@
+# Keep the image small + secrets out. data/ and logs/ come in via volumes.
+.venv/
+data/
+logs/
+*.duckdb
+*.parquet
+__pycache__/
+**/__pycache__/
+*.pyc
+logs_*.txt
+.git/
+.gitignore
+access_token.txt
+.env
+*.md
