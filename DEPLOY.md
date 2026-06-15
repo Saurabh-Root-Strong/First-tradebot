@@ -22,6 +22,15 @@ password** — no dependence on your personal laptop being on.
 - **Headless token.** `fyers_auth_headless.py` refreshes the daily token via TOTP — no
   browser, so it's fully unattended.
 
+## Fast path (one command)
+After you have a VM (step 1) and the repo cloned on it, just run:
+```bash
+bash cloud_bootstrap.sh
+```
+It installs Docker, prompts for your secrets (hashes the password for you), **verifies
+the headless Fyers login before going live**, launches the stack, and sets the morning
+re-auth cron. The manual steps below are the same thing, broken out.
+
 ## 1. Provision a VM (Mumbai region for low NSE latency)
 Any of: AWS `ap-south-1` (t3.small), Oracle Cloud always-free (Ampere, Mumbai),
 DigitalOcean BLR. **1–2 GB RAM is plenty.** Ubuntu 22.04/24.04.

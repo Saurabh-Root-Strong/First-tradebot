@@ -1,0 +1,5 @@
+# Shell scripts must stay LF so they run on the Linux VM even when committed from Windows.
+*.sh text eol=lf
+Dockerfile text eol=lf
+Caddyfile text eol=lf
+docker-compose.yml text eol=lf
