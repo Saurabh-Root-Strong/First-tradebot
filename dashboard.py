@@ -52,6 +52,11 @@ try:
 except Exception:
     _NSE_OI_AVAILABLE = False
 try:
+    import trend_matrix
+    _TREND_AVAILABLE = True
+except Exception:
+    _TREND_AVAILABLE = False
+try:
     from dcm_prediction import get_dcm_reader as _get_dcm_reader
     _DCM_OK = True
 except Exception:
@@ -1290,6 +1295,8 @@ app.layout = dbc.Container([
             html.Div(id="overview-panel", children=[
                 # Live index prices (4 cards)
                 dbc.Row([_overview_card(s) for s in INDEX_SYMBOLS], className="gx-0 mb-2"),
+                # Multi-timeframe trend ribbon (5m→weekly) — alignment vs divergence
+                html.Div(id="trend-panel"),
                 # ── INDEX PREDICTION — above chart so visible on first load ──────
                 # This is tomorrow's directional forecast from the 24-signal engine.
                 # Placed here (not after the chart) so analysts see it immediately.
@@ -3801,6 +3808,50 @@ def _render_trade_book_footprint() -> "html.Div":
         "background": "#0a1118", "border": "1px solid #16323a", **MONO})
 
 
+# ── Multi-timeframe trend ribbon (5m → weekly) ──────────────────────────────────
+_TREND_CLR = {1: "#22c55e", -1: "#ef4444", 0: "#64748b"}
+
+
+def _trend_cell(key: str, t: dict) -> "html.Div":
+    clr = _TREND_CLR.get(t.get("dir", 0), "#64748b")
+    return html.Div([
+        html.Div(key, style={"color": "#475569", "fontSize": "0.46rem"}),
+        html.Div(t.get("label", "—"), style={"color": clr, "fontSize": "0.55rem", "fontWeight": "700"}),
+    ], style={"textAlign": "center", "minWidth": "64px", "padding": "3px 4px",
+              "borderRadius": "4px", "background": f"{clr}14", "border": f"1px solid {clr}33"})
+
+
+def _render_trend_matrix() -> "html.Div":
+    """Per-index trend across 5m/15m/1h/daily/weekly + alignment verdict. CONTEXT,
+    not a signal — tells you whether an intraday move rides or fights the bigger trend."""
+    if not _TREND_AVAILABLE:
+        return html.Div()
+    head = html.Div([
+        html.Span("📈 MULTI-TF TREND", style={"color": "#a78bfa", "fontWeight": "700",
+                  "fontSize": "0.68rem", "letterSpacing": "0.06em"}),
+        html.Span("  5m → weekly · ride the aligned, scalp the counter-trend",
+                  style={"color": "#64748b", "fontSize": "0.54rem"}),
+    ], style={"marginBottom": "6px"})
+    rows = []
+    for sym in INDEX_SYMBOLS:
+        try:
+            r = trend_matrix.trend_index(sym, fetch_ohlcv)
+        except Exception:
+            continue
+        rows.append(html.Div([
+            html.Div(LABELS.get(sym, sym), style={"color": COLORS.get(sym, "#a78bfa"),
+                     "fontWeight": "700", "fontSize": "0.6rem", "minWidth": "92px"}),
+            html.Div([_trend_cell(k, t) for k, t in r["ribbon"]],
+                     style={"display": "flex", "gap": "5px", "flexWrap": "wrap"}),
+            html.Div(r["verdict"], style={"color": r["vclr"], "fontSize": "0.55rem",
+                     "fontWeight": "600", "marginLeft": "auto", "textAlign": "right"}),
+        ], style={"display": "flex", "alignItems": "center", "gap": "10px",
+                  "padding": "5px 0", "borderBottom": "1px solid #111d2e"}))
+    return html.Div([head, *rows], style={
+        "marginBottom": "12px", "padding": "10px 12px", "borderRadius": "10px",
+        "background": "#0c1018", "border": "1px solid #241f3a", **MONO})
+
+
 def _trade_card(t, fc=None) -> "html.Div":
     st = t.get("status") or "OPEN"
     r  = t.get("r_multiple")
@@ -3951,6 +4002,14 @@ def update_sidebar_trades(_):
 )
 def update_intraday_tf(sym, _):
     return _render_intraday_tf(sym or "NSE:NIFTY50-INDEX")
+
+
+@app.callback(
+    Output("trend-panel", "children"),
+    Input("signal-tick", "n_intervals"),
+)
+def update_trend_matrix(_):
+    return _render_trend_matrix()
 
 
 @app.callback(
