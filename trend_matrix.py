@@ -32,27 +32,13 @@ import pandas as pd
 # Intraday TFs via live fetch (label, fyers_resolution, days). Daily/weekly come from
 # the downloaded 4-yr history (Fyers caps a daily call ~250 bars — too few for weekly).
 TFS = [("5m", "5", 5), ("15m", "15", 15), ("1h", "60", 60)]
-HIST_DAILY = Path(__file__).parent / "data" / "historical" / "daily"
-INDEX_SYMBOLS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX",
-                 "NSE:FINNIFTY-INDEX", "NSE:MIDCPNIFTY-INDEX"]
-LABELS = {"NSE:NIFTY50-INDEX": "NIFTY 50", "NSE:NIFTYBANK-INDEX": "BANK NIFTY",
-          "NSE:FINNIFTY-INDEX": "FIN NIFTY", "NSE:MIDCPNIFTY-INDEX": "MIDCAP NIFTY"}
-LABEL_TO_SYM = {"NIFTY": INDEX_SYMBOLS[0], "BANKNIFTY": INDEX_SYMBOLS[1],
-                "FINNIFTY": INDEX_SYMBOLS[2], "MIDCPNIFTY": INDEX_SYMBOLS[3]}
+from core.constants import (HIST_DIR, INDEX_SYMBOLS, LABELS,           # noqa: E402
+                            LABEL_TO_SYM, safe_sym as _safe)
+from core.ta import ema as _ema, atr as _atr                          # noqa: E402
 
+HIST_DAILY = HIST_DIR / "daily"
 _STRONG = 0.9      # ATR-normalised slope ≥ this → strong trend
 _TREND  = 0.35     # below this (and EMAs not stacked) → sideways
-
-
-def _ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-
-def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    pc = c.shift(1)
-    tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
 def trend_from_df(df: pd.DataFrame, min_bars: int = 55) -> dict:
@@ -79,10 +65,6 @@ def trend_from_df(df: pd.DataFrame, min_bars: int = 55) -> dict:
         strong = strength >= _STRONG and (up or dn)
         label = ("▲▲ STRONG" if d > 0 else "▼▼ STRONG") if strong else ("▲ UP" if d > 0 else "▼ DN")
     return {"dir": d, "strength": round(strength, 2), "label": label, "slope": round(slope, 3)}
-
-
-def _safe(sym: str) -> str:
-    return sym.replace(":", "_").replace("-", "_")
 
 
 def _load_daily(sym: str, fetch) -> pd.DataFrame | None:

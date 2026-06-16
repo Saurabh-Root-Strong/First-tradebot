@@ -46,57 +46,23 @@ if hasattr(sys.stdout, "reconfigure"):
 import numpy as np
 import pandas as pd
 
-IST       = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-LIVE_DIR  = Path("data") / "intraday" / "live"
-HIST_DIR  = Path("data") / "historical"
-
-INDEX_SYMBOLS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX",
-                 "NSE:FINNIFTY-INDEX", "NSE:MIDCPNIFTY-INDEX"]
-LABELS = {"NSE:NIFTY50-INDEX": "NIFTY 50", "NSE:NIFTYBANK-INDEX": "BANK NIFTY",
-          "NSE:FINNIFTY-INDEX": "FIN NIFTY", "NSE:MIDCPNIFTY-INDEX": "MIDCAP NIFTY"}
-LABEL_TO_SYM = {v.replace(" ", ""): k for k, v in LABELS.items()}
-LABEL_TO_SYM.update({"NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-                     "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
-                     "MIDCAPNIFTY": "NSE:MIDCPNIFTY-INDEX"})
+from core.constants import IST, HIST_DIR, INDEX_SYMBOLS, LABELS, LABEL_TO_SYM   # noqa: E402
+from core.mirror_io import read_mirror                                          # noqa: E402
 
 HORIZONS = [1, 5, 10, 15, 60]          # minutes
 _DEADBAND = 0.03                       # |ret%| below this counts as flat
 
 
-def _today() -> str:
-    return datetime.datetime.now(tz=IST).date().isoformat()
-
-
-# ── Loaders ─────────────────────────────────────────────────────────────────────
+# ── Loaders (thin wrappers over the shared mirror reader) ───────────────────────
 
 def _load_index_ticks(sym: str, date: str | None = None,
                       as_of: datetime.datetime | None = None) -> pd.DataFrame | None:
-    p = LIVE_DIR / f"{date or _today()}_ticks.parquet"
-    if not p.exists():
-        return None
-    df = pd.read_parquet(p)
-    df = df[df["symbol"] == sym].copy()
-    if df.empty:
-        return None
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    if as_of is not None:                       # replay cutoff — no lookahead
-        df = df[df["ts"] <= pd.Timestamp(as_of)]
-    return df.sort_values("ts").reset_index(drop=True) if len(df) else None
+    return read_mirror("ticks", date, as_of, sym)
 
 
 def _load_index_oi(sym: str, date: str | None = None,
                    as_of: datetime.datetime | None = None) -> pd.DataFrame | None:
-    p = LIVE_DIR / f"{date or _today()}_oi_snapshots.parquet"
-    if not p.exists():
-        return None
-    df = pd.read_parquet(p)
-    df = df[df["symbol"] == sym].copy()
-    if df.empty:
-        return None
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    if as_of is not None:
-        df = df[df["ts"] <= pd.Timestamp(as_of)]
-    return df.sort_values("ts").reset_index(drop=True) if len(df) else None
+    return read_mirror("oi_snapshots", date, as_of, sym)
 
 
 def _load_hist(label: str) -> tuple[str, pd.DataFrame] | None:

@@ -37,35 +37,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-LIVE_DIR = Path(__file__).parent / "data" / "intraday" / "live"
-TFS = [5, 10, 15, 60]
-LABELS = {"NSE:NIFTY50-INDEX": "NIFTY 50", "NSE:NIFTYBANK-INDEX": "BANK NIFTY",
-          "NSE:FINNIFTY-INDEX": "FIN NIFTY", "NSE:MIDCPNIFTY-INDEX": "MIDCAP NIFTY"}
-LABEL_TO_SYM = {"NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-                "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
-                "MIDCAPNIFTY": "NSE:MIDCPNIFTY-INDEX"}
+from core.constants import IST, LABELS, LABEL_TO_SYM, NSE_NAME as _NSE_UL   # noqa: E402
+from core.mirror_io import read_mirror as _read                            # noqa: E402
 
+TFS = [5, 10, 15, 60]
 _PX_DB  = 0.03    # |price%| deadband
 _OI_DB  = 0.5     # ΔOI deadband in lakhs (×1e5 contracts)
-# index symbol → NSE OI-spurts underlying name (for the futures_oi mirror)
-_NSE_UL = {"NSE:NIFTY50-INDEX": "NIFTY", "NSE:NIFTYBANK-INDEX": "BANKNIFTY",
-           "NSE:FINNIFTY-INDEX": "FINNIFTY", "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY"}
-
-
-def _today() -> str:
-    return datetime.datetime.now(tz=IST).date().isoformat()
-
-
-def _read(tbl, date, as_of):
-    p = LIVE_DIR / f"{date or _today()}_{tbl}.parquet"
-    if not p.exists() or p.stat().st_size < 100:
-        return None
-    df = pd.read_parquet(p)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    if as_of is not None:
-        df = df[df["ts"] <= pd.Timestamp(as_of)]
-    return df if len(df) else None
 
 
 def _at_or_before(df, sym_col, sym, value_ts):

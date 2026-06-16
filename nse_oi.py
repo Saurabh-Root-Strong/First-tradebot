@@ -33,8 +33,8 @@ import requests
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-LIVE_DIR = Path(__file__).parent / "data" / "intraday" / "live"
+from core.constants import (IST, LIVE_DIR, SYM_BY_NSE as INDEX_MAP,   # noqa: E402
+                            today_iso as _today)
 _SPURTS = "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings"
 _HOME   = "https://www.nseindia.com"
 _HEADERS = {
@@ -44,16 +44,8 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/market-data/oi-spurts",
 }
-# OI-spurts underlying name → our index symbol
-INDEX_MAP = {"NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-             "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX"}
-
 _session: requests.Session | None = None
 _lock = threading.Lock()
-
-
-def _today() -> str:
-    return datetime.datetime.now(tz=IST).date().isoformat()
 
 
 def _new_session() -> requests.Session:

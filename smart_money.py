@@ -40,36 +40,14 @@ if hasattr(sys.stdout, "reconfigure"):
 import numpy as np
 import pandas as pd
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-LIVE_DIR = Path("data") / "intraday" / "live"
-INDEX_SYMBOLS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX",
-                 "NSE:FINNIFTY-INDEX", "NSE:MIDCPNIFTY-INDEX"]
-LABELS = {"NSE:NIFTY50-INDEX": "NIFTY 50", "NSE:NIFTYBANK-INDEX": "BANK NIFTY",
-          "NSE:FINNIFTY-INDEX": "FIN NIFTY", "NSE:MIDCPNIFTY-INDEX": "MIDCAP NIFTY"}
-LABEL_TO_SYM = {"NIFTY": INDEX_SYMBOLS[0], "BANKNIFTY": INDEX_SYMBOLS[1],
-                "FINNIFTY": INDEX_SYMBOLS[2], "MIDCPNIFTY": INDEX_SYMBOLS[3],
-                "MIDCAPNIFTY": INDEX_SYMBOLS[3]}
+from core.constants import IST, INDEX_SYMBOLS, LABELS, LABEL_TO_SYM   # noqa: E402
+from core.mirror_io import read_mirror as _read                      # noqa: E402
 
 WINDOW_MIN = 20          # lookback for interval flow
 _NOISE_OI  = 1.0         # ignore strikes whose interval |ΔOI| is below this (in lots/1)
 
 # classification → (directional sign, base weight). Writing/covering = institutional.
 _BASE = {"write": 1.0, "cover": 0.9, "buy": 0.5, "unwind": 0.4}
-
-
-def _today() -> str:
-    return datetime.datetime.now(tz=IST).date().isoformat()
-
-
-def _read(tbl: str, date, as_of):
-    p = LIVE_DIR / f"{date or _today()}_{tbl}.parquet"
-    if not p.exists() or p.stat().st_size < 100:
-        return None
-    df = pd.read_parquet(p)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    if as_of is not None:
-        df = df[df["ts"] <= pd.Timestamp(as_of)]
-    return df if len(df) else None
 
 
 def _classify(side: str, d_oi: float, d_prem: float) -> tuple[str, float]:
