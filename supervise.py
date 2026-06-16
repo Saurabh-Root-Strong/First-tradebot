@@ -122,10 +122,24 @@ def main() -> None:
 
     proc = launch(first=True)
     started = time.time()
+    harvested_date = None          # footprint-validation harvest runs once/day post-close
     try:
         while True:
             time.sleep(HEALTH_POLL)
             now = datetime.datetime.now(tz=IST)
+
+            # 0) once per weekday after close, append today to the footprint-validation
+            #    ledger (accumulates toward a real verdict). Fire-and-forget; safe —
+            #    reads lock-free mirrors, never touches the live capture.
+            if (now.weekday() < 5 and now.time() > datetime.time(15, 35)
+                    and harvested_date != now.date()):
+                harvested_date = now.date()
+                try:
+                    subprocess.Popen([str(PY), str(HERE / "footprint_validate.py"), "--harvest"],
+                                     cwd=str(HERE))
+                    log("Post-close: footprint validation harvest triggered")
+                except Exception as exc:
+                    log(f"harvest trigger failed: {exc}")
 
             # 1) process died → restart
             if proc.poll() is not None:
