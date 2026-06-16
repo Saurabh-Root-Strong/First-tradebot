@@ -1258,9 +1258,9 @@ app.layout = dbc.Container([
         dbc.Col([
             # One index selector drives BOTH the TF footprint AND that index's trades.
             html.Div([
-                html.Span("📊 INTRADAY DESK", style={"color": "#67e8f9", "fontWeight": "700",
+                html.Span("📊 FOOTPRINT", style={"color": "#67e8f9", "fontWeight": "700",
                           "fontSize": "0.62rem", "letterSpacing": "0.1em"}),
-                html.Span("  footprint + trades", style={"color": "#475569", "fontSize": "0.5rem"}),
+                html.Span("  live monitor", style={"color": "#475569", "fontSize": "0.5rem"}),
                 dcc.Dropdown(
                     id="itf-idx", clearable=False,
                     options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
@@ -3775,13 +3775,30 @@ def _render_intraday_tf(sym) -> "html.Div":
         html.Div("option OI·price·volume per TF · futures: price/vol/basis "
                  "(intraday futures OI not in the Fyers feed)",
                  style={"color": "#334155", "fontSize": "0.46rem", "marginTop": "5px"}),
-        # ── merged in: trades on THIS index (read ⊕ position, one cockpit) ──
-        html.Div(f"📒 {r['label']} TRADES", style={
-            "color": "#fbbf24", "fontWeight": "700", "fontSize": "0.54rem",
-            "letterSpacing": "0.06em", "marginTop": "9px", "paddingTop": "6px",
-            "borderTop": "1px solid #1e3a5f55"}),
-        _render_index_trades(sym),
     ], style={**MONO})
+
+
+def _render_trade_book_footprint() -> "html.Div":
+    """The footprint for all 4 indices, as a strip inside the Trade Book cockpit —
+    so the OI·price·volume read sits next to the conductor stance and the trades."""
+    if not _ITF_AVAILABLE:
+        return html.Div()
+    head = html.Div([
+        html.Span("📊 INTRADAY FOOTPRINT", style={"color": "#67e8f9", "fontWeight": "700",
+                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
+        html.Span("  OI · price · volume per timeframe — who's building vs closing",
+                  style={"color": "#64748b", "fontSize": "0.55rem"}),
+    ], style={"marginBottom": "6px"})
+    cols = [dbc.Col([
+        html.Div(LABELS.get(s, s), style={"color": COLORS.get(s, "#67e8f9"),
+                 "fontWeight": "700", "fontSize": "0.58rem", "letterSpacing": "0.06em",
+                 "marginBottom": "3px"}),
+        _render_intraday_tf(s),
+    ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {COLORS.get(s, '#67e8f9')}33"})
+        for s in INDEX_SYMBOLS]
+    return html.Div([head, dbc.Row(cols, className="gx-0")], style={
+        "marginBottom": "10px", "padding": "9px 11px", "borderRadius": "4px",
+        "background": "#0a1118", "border": "1px solid #16323a", **MONO})
 
 
 def _trade_card(t, fc=None) -> "html.Div":
@@ -3886,10 +3903,11 @@ def _render_trade_book(asof_value=None) -> "html.Div":
 
     pred_dropdown = _prediction_dropdown(is_open=False)
     conductor = _render_conductor()
+    footprint = _render_trade_book_footprint()
     playbook = _render_opening_playbook(asof_value)
 
     if not rows:
-        return html.Div([header, strat_banner, conductor, playbook, regime_radar, pred_dropdown, html.Div(
+        return html.Div([header, strat_banner, conductor, footprint, playbook, regime_radar, pred_dropdown, html.Div(
             "No trades yet today — signals log here as the engine fires across all 4 indices.",
             style={"color": "#475569", "fontSize": "0.75rem", **MONO})])
 
@@ -3912,7 +3930,7 @@ def _render_trade_book(asof_value=None) -> "html.Div":
             html.Div(cards),
         ], md=3, style={"padding": "0 9px"}))
 
-    return html.Div([header, strat_banner, conductor, playbook, regime_radar, pred_dropdown,
+    return html.Div([header, strat_banner, conductor, footprint, playbook, regime_radar, pred_dropdown,
                      dbc.Row(cols, className="gx-0")],
                     style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "padding": "16px 18px"})
