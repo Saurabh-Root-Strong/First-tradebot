@@ -645,19 +645,22 @@ def _heartbeat_writer():
 
 def _oi_background_poller():
     """
-    Background thread: snapshot option chain for all 4 indices every 60 seconds.
+    Background thread: snapshot option chain for all 4 indices every 30 seconds.
 
     Runs independently of user interaction so OI history accumulates from 9:15
     whether or not the OC panel is open.  Uses the nearest expiry for each index.
     Skips outside market hours to avoid wasting API quota.
 
-    60s (was 180s): keeps option premium/price/volume fresh for the Intraday-TF /
-    smart-money panels. OI itself is NSE-cadence (~1-3 min), so faster polling
-    mainly sharpens premium/volume — duplicate OI between NSE updates is harmless.
+    30s (180→60→30): measured that Fyers option OI genuinely moves within ~25s, so
+    these aren't duplicates. 30s ≈ 1/10 of the shortest (5-min) TF → ±10% anchor
+    precision, matching the price side. NOT finer: <30s oversamples the 5-min frame
+    (the noisiest, least-trusted signal) — the real footprint is the 15/60-min and
+    day-level OI builds, indifferent to sub-30s. Export is decoupled (10s flush),
+    API is trivial (8 calls/min). NSE futures OI stays 60s (publication-bound).
     """
     OPEN  = datetime.time(9, 14)
     CLOSE = datetime.time(15, 31)
-    POLL  = 60   # seconds between snapshots
+    POLL  = 30   # seconds between snapshots
 
     while True:
         try:
@@ -4342,7 +4345,7 @@ if __name__ == "__main__":
         target=_oi_background_poller,
         daemon=True, name="oi-poller",
     ).start()
-    print("  OI snapshot poller started — 60s intervals")
+    print("  OI snapshot poller started — 30s intervals")
 
     # NSE intraday futures-OI poller (Fyers doesn't serve it). May 403 from a
     # datacenter IP — degrades gracefully (the panel just omits futures OI).
