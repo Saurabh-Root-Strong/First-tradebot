@@ -42,6 +42,11 @@ try:
 except Exception:
     _CONDUCTOR_AVAILABLE = False
 try:
+    import intraday_tf
+    _ITF_AVAILABLE = True
+except Exception:
+    _ITF_AVAILABLE = False
+try:
     from dcm_prediction import get_dcm_reader as _get_dcm_reader
     _DCM_OK = True
 except Exception:
@@ -1226,13 +1231,10 @@ app.layout = dbc.Container([
             dbc.Col(html.Div(id="status", style={
                 "textAlign": "right", "fontSize": "0.68rem"}), width="auto"),
         ], className="align-items-center g-0"),
-        # Horizontal index chips (clickable nav) + section actions — replaces the left pane
+        # Horizontal index chips (clickable nav). Today's Trades now lives in the left pane.
         html.Div([
             *[_header_nav_card(sym) for sym in INDEX_SYMBOLS],
             html.Div(style={"flex": "1 1 auto"}),     # spacer pushes actions to the right
-            _header_action_chip(
-                "nav-tradebook", "📒", "TODAY'S TRADES", "#fbbf24",
-                html.Div(id="sidebar-trades", style={"display": "flex", "alignItems": "center"})),
             _header_action_chip("nav-liveoi", "📡", "LIVE OI", "#40c4ff"),
         ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px",
                   "alignItems": "center", "marginTop": "10px"}),
@@ -1240,7 +1242,34 @@ app.layout = dbc.Container([
     html.Div(className="header-line"),
 
     dbc.Row([
-        # ── Main content (full width — index nav now lives in the header) ────────
+        # ── Left pane: Intraday-TF footprint matrix + Today's Trades ─────────────
+        dbc.Col([
+            html.Div([
+                html.Span("📊 INTRADAY TF", style={"color": "#67e8f9", "fontWeight": "700",
+                          "fontSize": "0.62rem", "letterSpacing": "0.1em"}),
+                dcc.Dropdown(
+                    id="itf-idx", clearable=False,
+                    options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
+                    value="NSE:NIFTY50-INDEX",
+                    style={"fontSize": "0.62rem", "marginTop": "5px", "color": "#0b1320"}),
+            ], style={"marginBottom": "6px"}),
+            dcc.Loading(html.Div(id="itf-content"), type="circle", color="#67e8f9"),
+            # Today's Trades — moved here from the header; opens the Trade Book.
+            html.Div(id="nav-tradebook", n_clicks=0, children=[
+                html.Div("📒 TODAY'S TRADES", style={
+                    "letterSpacing": "0.1em", "color": "#cbd5e1", "fontWeight": "700",
+                    "fontSize": "0.6rem", "marginBottom": "4px"}),
+                html.Div(id="sidebar-trades"),
+                html.Div("click to open ▸", style={
+                    "color": "#475569", "fontSize": "0.5rem", "marginTop": "4px"}),
+            ], style={"marginTop": "14px", "padding": "10px 12px", "borderRadius": "8px",
+                      "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #fbbf24",
+                      "background": BG_CARD, "cursor": "pointer"}),
+        ], md=3, lg=3, style={
+            "background": BG_SIDE, "padding": "14px 10px",
+            "borderRight": "1px solid #111d2e", "minHeight": "calc(100vh - 120px)"}),
+
+        # ── Main content ─────────────────────────────────────────────────────────
         dbc.Col([
             # OVERVIEW PANEL
             html.Div(id="overview-panel", children=[
@@ -1366,7 +1395,7 @@ app.layout = dbc.Container([
                 ], className="mb-2 align-items-center"),
                 html.Div(id="liveoi-content"),
             ]),
-        ], md=12, style={"padding": "12px 16px"}),
+        ], md=9, lg=9, style={"padding": "12px 16px"}),
     ], className="gx-0"),
 
     # State stores
@@ -3620,6 +3649,73 @@ def _render_conductor() -> "html.Div":
         "background": "#0c0e18", "border": "1px solid #2a2440", **MONO})
 
 
+# ── Intraday-TF footprint matrix (left pane) ────────────────────────────────────
+_ITF_TAG_CLR = {"LONG BUILDUP": "#22c55e", "SHORT COVER": "#86efac",
+                "SHORT BUILDUP": "#ef4444", "LONG UNWIND": "#fca5a5", "BALANCED": "#64748b"}
+_ITF_BIAS_CLR = {"BULLISH": "#22c55e", "BEARISH": "#ef4444", "NEUTRAL": "#94a3b8"}
+
+
+def _render_intraday_tf(sym) -> "html.Div":
+    """Per-timeframe OI·Price·Volume matrix + divergence flags for one index.
+    Shows whether each 5/10/15/60-min frame is fresh buildup or positions CLOSING,
+    so a rally on closing (distribution) or hidden call-writing is visible early."""
+    if not _ITF_AVAILABLE:
+        return html.Div()
+    try:
+        r = intraday_tf.analyze(sym)
+    except Exception:
+        return html.Div("—", style={"color": "#475569", "fontSize": "0.55rem"})
+    if not r.get("has_data"):
+        return html.Div(r.get("note", "warming up"),
+                        style={"color": "#475569", "fontSize": "0.55rem", **MONO})
+
+    rows = []
+    for c in r["cells"]:
+        up = c["px"] > 0.03; dn = c["px"] < -0.03
+        pcl = "#22c55e" if up else "#ef4444" if dn else "#94a3b8"
+        parr = "▲" if up else "▼" if dn else "·"
+        bld = c["oi_build"]
+        boi = ("↑ build" if bld > 0 else "↓ close" if bld < 0 else "· flat")
+        bclr = "#4ade80" if bld > 0 else "#f87171" if bld < 0 else "#64748b"
+        tclr = _ITF_TAG_CLR.get(c["tag"], "#64748b")
+        ovol = "" if c["ovol"] is None else f"  vol {c['ovol']:.0f}L"
+        farr = ("  fut▲" if (c["fpx"] or 0) > 0.03 else "  fut▼" if (c["fpx"] or 0) < -0.03 else "")
+        rows.append(html.Div([
+            html.Div([
+                html.Span(f"{c['tf']}m", style={"color": "#cbd5e1", "fontWeight": "700",
+                          "fontSize": "0.58rem", "minWidth": "26px", "display": "inline-block"}),
+                html.Span(f"{parr}{c['px']:+.2f}%", style={"color": pcl, "fontSize": "0.58rem"}),
+                html.Span(f"  {c['tag']}", style={"color": tclr, "fontSize": "0.55rem",
+                          "fontWeight": "700", "marginLeft": "auto"}),
+            ], style={"display": "flex", "alignItems": "center"}),
+            html.Div([
+                html.Span(f"OI {boi} {c['d_tot']:+.0f}L", style={"color": bclr, "fontSize": "0.52rem"}),
+                html.Span(f"{ovol}{farr}", style={"color": "#475569", "fontSize": "0.52rem"}),
+            ], style={"display": "flex", "justifyContent": "space-between"}),
+        ], style={"padding": "4px 0", "borderBottom": "1px solid #111d2e"}))
+
+    flag_divs = [html.Div(("⚠ " if t == "warn" else "✓ ") + m, style={
+        "color": "#fb923c" if t == "warn" else "#4ade80", "fontSize": "0.52rem",
+        "lineHeight": "1.35", "marginBottom": "3px", "whiteSpace": "normal",
+        "background": "#1a1407" if t == "warn" else "#0a1f12",
+        "border": f"1px solid {'#7c2d12' if t == 'warn' else '#14532d'}",
+        "borderRadius": "3px", "padding": "3px 5px"}) for t, m in r.get("flags", [])]
+
+    return html.Div([
+        html.Div([
+            html.Span(f"OI bias ", style={"color": "#64748b", "fontSize": "0.52rem"}),
+            html.Span(r["bias"], style={"color": _ITF_BIAS_CLR.get(r["bias"], "#94a3b8"),
+                      "fontWeight": "700", "fontSize": "0.56rem"}),
+            html.Span(f"  {r['now']}", style={"color": "#475569", "fontSize": "0.5rem",
+                      "marginLeft": "auto"}),
+        ], style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
+        *flag_divs,
+        html.Div(rows),
+        html.Div("OI·price·volume per TF · futures OI pending capture",
+                 style={"color": "#334155", "fontSize": "0.46rem", "marginTop": "5px"}),
+    ], style={**MONO})
+
+
 def _trade_card(t, fc=None) -> "html.Div":
     st = t.get("status") or "OPEN"
     r  = t.get("r_multiple")
@@ -3760,6 +3856,15 @@ def _render_trade_book(asof_value=None) -> "html.Div":
 )
 def update_sidebar_trades(_):
     return _render_sidebar_trades()
+
+
+@app.callback(
+    Output("itf-content", "children"),
+    Input("itf-idx",    "value"),
+    Input("setup-tick", "n_intervals"),
+)
+def update_intraday_tf(sym, _):
+    return _render_intraday_tf(sym or "NSE:NIFTY50-INDEX")
 
 
 @app.callback(
