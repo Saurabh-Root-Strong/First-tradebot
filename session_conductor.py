@@ -49,11 +49,7 @@ import opening_playbook as OP
 import regime_forecast as RF
 import timeframe_delta as TD
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-INDEX_SYMBOLS = OP.INDEX_SYMBOLS
-LABELS = TD.LABELS
-STRIKE_STEP = OP.STRIKE_STEP
-LABEL_TO_SYM = TD.LABEL_TO_SYM
+from core.constants import IST, INDEX_SYMBOLS, LABELS, STRIKE_STEP, LABEL_TO_SYM  # noqa: E402
 
 # Live fusion weights (renormalised against the decaying opening prior).
 _W_LIVE = {"regime": 0.42, "momentum": 0.38, "oi": 0.20}

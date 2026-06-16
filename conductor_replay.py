@@ -32,10 +32,7 @@ import pandas as pd
 import session_conductor as SC
 import timeframe_delta as TD
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-LIVE_DIR = Path("data") / "intraday" / "live"
-INDEX_SYMBOLS = SC.INDEX_SYMBOLS
-LABELS = SC.LABELS
+from core.constants import IST, LIVE_DIR, INDEX_SYMBOLS, LABELS  # noqa: E402
 
 START = datetime.time(9, 45)
 END   = datetime.time(15, 15)

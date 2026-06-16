@@ -36,11 +36,8 @@ import pandas as pd
 
 import smart_money as SM
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
-LIVE_DIR = Path(__file__).parent / "data" / "intraday" / "live"
-LEDGER = Path(__file__).parent / "data" / "validation" / "footprint_ledger.parquet"
-INDEX_SYMBOLS = SM.INDEX_SYMBOLS
-LABELS = SM.LABELS
+from core.constants import IST, LIVE_DIR, DATA_DIR, INDEX_SYMBOLS, LABELS  # noqa: E402
+LEDGER = DATA_DIR / "validation" / "footprint_ledger.parquet"
 
 CHECKPOINTS = [datetime.time(*t) for t in [(10, 30), (11, 30), (12, 30), (13, 30), (14, 15)]]
 HORIZONS = [30, 60]                       # forward minutes (capped at session end)

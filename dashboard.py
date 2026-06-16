@@ -71,22 +71,10 @@ except Exception:
 # ── Constants ──────────────────────────────────────────────────────────────────
 APP_ID     = "WVDZUTO6HL-100"
 TOKEN_FILE = Path("access_token.txt")
-IST        = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+from core.constants import IST, INDEX_SYMBOLS, LABELS   # single source of truth
 OC_URL     = "https://api-t1.fyers.in/data/options-chain-v3"
 SEP        = "─" * 58
 
-INDEX_SYMBOLS = [
-    "NSE:NIFTY50-INDEX",
-    "NSE:NIFTYBANK-INDEX",
-    "NSE:FINNIFTY-INDEX",
-    "NSE:MIDCPNIFTY-INDEX",
-]
-LABELS = {
-    "NSE:NIFTY50-INDEX":    "NIFTY 50",
-    "NSE:NIFTYBANK-INDEX":  "BANK NIFTY",
-    "NSE:FINNIFTY-INDEX":   "FIN NIFTY",
-    "NSE:MIDCPNIFTY-INDEX": "MIDCAP NIFTY",
-}
 COLORS = {
     "NSE:NIFTY50-INDEX":    "#00d4ff",
     "NSE:NIFTYBANK-INDEX":  "#ff6b9d",
