@@ -645,15 +645,19 @@ def _heartbeat_writer():
 
 def _oi_background_poller():
     """
-    Background thread: snapshot option chain for all 4 indices every 3 minutes.
+    Background thread: snapshot option chain for all 4 indices every 60 seconds.
 
     Runs independently of user interaction so OI history accumulates from 9:15
     whether or not the OC panel is open.  Uses the nearest expiry for each index.
     Skips outside market hours to avoid wasting API quota.
+
+    60s (was 180s): keeps option premium/price/volume fresh for the Intraday-TF /
+    smart-money panels. OI itself is NSE-cadence (~1-3 min), so faster polling
+    mainly sharpens premium/volume — duplicate OI between NSE updates is harmless.
     """
     OPEN  = datetime.time(9, 14)
     CLOSE = datetime.time(15, 31)
-    POLL  = 180  # seconds between snapshots
+    POLL  = 60   # seconds between snapshots
 
     while True:
         try:
@@ -4291,16 +4295,17 @@ if __name__ == "__main__":
         target=_oi_background_poller,
         daemon=True, name="oi-poller",
     ).start()
-    print("  OI snapshot poller started — 3-min intervals")
+    print("  OI snapshot poller started — 60s intervals")
 
     # NSE intraday futures-OI poller (Fyers doesn't serve it). May 403 from a
     # datacenter IP — degrades gracefully (the panel just omits futures OI).
+    # 60s poll + timestamp-dedupe → catches each NSE refresh without storing dups.
     if _NSE_OI_AVAILABLE:
         threading.Thread(
-            target=lambda: nse_oi.poll_loop(180),
+            target=lambda: nse_oi.poll_loop(60),
             daemon=True, name="nse-oi",
         ).start()
-        print("  NSE futures-OI poller started — 3-min intervals")
+        print("  NSE futures-OI poller started — 60s intervals")
 
     threading.Thread(
         target=_trade_tracker_poller,
