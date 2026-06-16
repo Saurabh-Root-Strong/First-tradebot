@@ -63,10 +63,20 @@ def _new_session() -> requests.Session:
     return s
 
 
-def fetch_oi() -> list[dict]:
-    """Return [{symbol, oi, chg_oi, volume}] for all F&O underlyings, or [] on failure."""
+def _parse_nse_ts(s: str) -> "datetime.datetime | None":
+    """NSE 'timestamp' field, e.g. '16-Jun-2026 09:57:44' → tz-aware IST datetime.
+    This is the ACTUAL data validity time (~50-60s behind wall clock) — using it
+    instead of our fetch time phase-aligns the futures-OI series honestly."""
+    try:
+        return datetime.datetime.strptime(s.strip(), "%d-%b-%Y %H:%M:%S").replace(tzinfo=IST)
+    except Exception:
+        return None
+
+
+def fetch_oi() -> "tuple[datetime.datetime | None, list[dict]]":
+    """Return (nse_data_time, [{symbol, oi, chg_oi, volume}]), or (None, []) on failure."""
     global _session
-    for attempt in range(2):
+    for _ in range(2):
         try:
             if _session is None:
                 _session = _new_session()
@@ -75,35 +85,43 @@ def fetch_oi() -> list[dict]:
                 _session = None              # cookies stale → re-handshake once
                 continue
             if r.status_code != 200:
-                return []
-            data = r.json().get("data", [])
-            return [{"symbol": d.get("symbol"), "oi": float(d.get("latestOI") or 0),
+                return None, []
+            j = r.json()
+            nse_ts = _parse_nse_ts(j.get("timestamp", "")) or datetime.datetime.now(tz=IST)
+            rows = [{"symbol": d.get("symbol"), "oi": float(d.get("latestOI") or 0),
                      "chg_oi": float(d.get("changeInOI") or 0),
-                     "volume": float(d.get("volume") or 0)} for d in data if d.get("symbol")]
+                     "volume": float(d.get("volume") or 0)}
+                    for d in j.get("data", []) if d.get("symbol")]
+            return nse_ts, rows
         except Exception:
             _session = None
             time.sleep(1.0)
-    return []
+    return None, []
 
 
 def record() -> int:
-    """Fetch once and append a timestamped batch to today's mirror. Returns row count."""
-    rows = fetch_oi()
-    if not rows:
+    """Fetch once and append a batch stamped with NSE's own data time. Dedupes when
+    NSE hasn't refreshed since the last stored snapshot. Returns rows added."""
+    nse_ts, rows = fetch_oi()
+    if not rows or nse_ts is None:
         return 0
     import pandas as pd
-    ts = datetime.datetime.now(tz=IST)
-    df = pd.DataFrame(rows)
-    df.insert(0, "ts", ts)
     p = LIVE_DIR / f"{_today()}_futures_oi.parquet"
     with _lock:
         LIVE_DIR.mkdir(parents=True, exist_ok=True)
+        old = None
         if p.exists():
             try:
                 old = pd.read_parquet(p)
-                df = pd.concat([old, df], ignore_index=True)
+                last = pd.to_datetime(old["ts"]).max()
+                if pd.notna(last) and pd.Timestamp(nse_ts) <= last:
+                    return 0          # NSE hasn't published a fresher snapshot — skip dup
             except Exception:
-                pass
+                old = None
+        df = pd.DataFrame(rows)
+        df.insert(0, "ts", nse_ts)
+        if old is not None:
+            df = pd.concat([old, df], ignore_index=True)
         df.to_parquet(p, index=False)
     return len(rows)
 
@@ -129,12 +147,14 @@ def main() -> None:
     if args.poll:
         poll_loop()
         return
-    rows = fetch_oi()
+    nse_ts, rows = fetch_oi()
     if not rows:
         print("FAILED — NSE returned no data (blocked or down).")
         return
+    age = (datetime.datetime.now(tz=IST) - nse_ts).total_seconds() if nse_ts else None
     by = {r["symbol"]: r for r in rows}
-    print(f"OK — {len(rows)} underlyings. Index futures OI:")
+    print(f"OK — {len(rows)} underlyings.  data time {nse_ts:%H:%M:%S} "
+          f"({age:.0f}s old).  Index futures OI:")
     for name, _sym in INDEX_MAP.items():
         r = by.get(name)
         if r:
