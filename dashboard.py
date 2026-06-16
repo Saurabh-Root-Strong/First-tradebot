@@ -47,6 +47,11 @@ try:
 except Exception:
     _ITF_AVAILABLE = False
 try:
+    import nse_oi
+    _NSE_OI_AVAILABLE = True
+except Exception:
+    _NSE_OI_AVAILABLE = False
+try:
     from dcm_prediction import get_dcm_reader as _get_dcm_reader
     _DCM_OK = True
 except Exception:
@@ -3678,8 +3683,11 @@ def _render_intraday_tf(sym) -> "html.Div":
         boi = ("↑ build" if bld > 0 else "↓ close" if bld < 0 else "· flat")
         bclr = "#4ade80" if bld > 0 else "#f87171" if bld < 0 else "#64748b"
         tclr = _ITF_TAG_CLR.get(c["tag"], "#64748b")
-        ovol = "" if c["ovol"] is None else f"  vol {c['ovol']:.0f}L"
-        farr = ("  fut▲" if (c["fpx"] or 0) > 0.03 else "  fut▼" if (c["fpx"] or 0) < -0.03 else "")
+        ovol = "" if c["ovol"] is None else f" vol {c['ovol']:.0f}L"
+        farr = ("fut▲" if (c["fpx"] or 0) > 0.03 else "fut▼" if (c["fpx"] or 0) < -0.03 else "fut·")
+        foi = c.get("foi"); fb = c.get("foi_build", 0)
+        foi_txt = "" if foi is None else f" OI{'↑' if fb>0 else '↓' if fb<0 else '·'}{foi:+.0f}L"
+        fclr = "#4ade80" if fb > 0 else "#f87171" if fb < 0 else "#475569"
         rows.append(html.Div([
             html.Div([
                 html.Span(f"{c['tf']}m", style={"color": "#cbd5e1", "fontWeight": "700",
@@ -3689,8 +3697,11 @@ def _render_intraday_tf(sym) -> "html.Div":
                           "fontWeight": "700", "marginLeft": "auto"}),
             ], style={"display": "flex", "alignItems": "center"}),
             html.Div([
-                html.Span(f"OI {boi} {c['d_tot']:+.0f}L", style={"color": bclr, "fontSize": "0.52rem"}),
-                html.Span(f"{ovol}{farr}", style={"color": "#475569", "fontSize": "0.52rem"}),
+                html.Span(f"optOI {boi} {c['d_tot']:+.0f}L", style={"color": bclr, "fontSize": "0.52rem"}),
+                html.Span([html.Span(f"{farr}", style={"color": "#64748b"}),
+                           html.Span(foi_txt, style={"color": fclr}),
+                           html.Span(ovol, style={"color": "#475569"})],
+                          style={"fontSize": "0.5rem"}),
             ], style={"display": "flex", "justifyContent": "space-between"}),
         ], style={"padding": "4px 0", "borderBottom": "1px solid #111d2e"}))
 
@@ -3706,6 +3717,8 @@ def _render_intraday_tf(sym) -> "html.Div":
             html.Span(f"OI bias ", style={"color": "#64748b", "fontSize": "0.52rem"}),
             html.Span(r["bias"], style={"color": _ITF_BIAS_CLR.get(r["bias"], "#94a3b8"),
                       "fontWeight": "700", "fontSize": "0.56rem"}),
+            html.Span((f"  ·  futOI {r['fut_oi_day']:+.0f}L today" if r.get("fut_oi_day") is not None else ""),
+                      style={"color": "#67e8f9", "fontSize": "0.5rem"}),
             html.Span(f"  {r['now']}", style={"color": "#475569", "fontSize": "0.5rem",
                       "marginLeft": "auto"}),
         ], style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
@@ -4279,6 +4292,15 @@ if __name__ == "__main__":
         daemon=True, name="oi-poller",
     ).start()
     print("  OI snapshot poller started — 3-min intervals")
+
+    # NSE intraday futures-OI poller (Fyers doesn't serve it). May 403 from a
+    # datacenter IP — degrades gracefully (the panel just omits futures OI).
+    if _NSE_OI_AVAILABLE:
+        threading.Thread(
+            target=lambda: nse_oi.poll_loop(180),
+            daemon=True, name="nse-oi",
+        ).start()
+        print("  NSE futures-OI poller started — 3-min intervals")
 
     threading.Thread(
         target=_trade_tracker_poller,

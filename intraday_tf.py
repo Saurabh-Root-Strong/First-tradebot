@@ -48,6 +48,9 @@ LABEL_TO_SYM = {"NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX"
 
 _PX_DB  = 0.03    # |price%| deadband
 _OI_DB  = 0.5     # ΔOI deadband in lakhs (×1e5 contracts)
+# index symbol → NSE OI-spurts underlying name (for the futures_oi mirror)
+_NSE_UL = {"NSE:NIFTY50-INDEX": "NIFTY", "NSE:NIFTYBANK-INDEX": "BANKNIFTY",
+           "NSE:FINNIFTY-INDEX": "FINNIFTY", "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY"}
 
 
 def _today() -> str:
@@ -100,6 +103,13 @@ def analyze(sym: str, date=None, as_of=None) -> dict:
         if len(c):
             vol_series = c.groupby("ts")["volume"].sum().sort_index()
     f = fut[fut["symbol"] == sym].sort_values("ts") if fut is not None else None
+    # futures OI (from the NSE mirror — Fyers doesn't serve it)
+    foi = _read("futures_oi", date, as_of)
+    fo = None
+    if foi is not None and _NSE_UL.get(sym):
+        fo = foi[foi["symbol"] == _NSE_UL[sym]].sort_values("ts")
+        if not len(fo):
+            fo = None
 
     def price_at(ts_):
         s = t[t["ts"] <= ts_]
@@ -137,6 +147,13 @@ def analyze(sym: str, date=None, as_of=None) -> dict:
                 fpx = (float(fn["near_ltp"]) - float(fp["near_ltp"])) / float(fp["near_ltp"]) * 100
                 fvol = (float(fn["near_vol"] or 0) - float(fp["near_vol"] or 0)) / 1e5
                 fbasis = float(fn["near_basis"] or 0) - float(fp["near_basis"] or 0)
+        # futures OI delta over the window (clean buildup/covering)
+        foi_d = None; foi_build = 0
+        if fo is not None:
+            fo_prev = fo[fo["ts"] <= anchor]
+            base_oi = float(fo_prev.iloc[-1]["oi"]) if len(fo_prev) else float(fo.iloc[0]["oi"])
+            foi_d = (float(fo.iloc[-1]["oi"]) - base_oi) / 1e5
+            foi_build = int((foi_d > _OI_DB) - (foi_d < -_OI_DB))
         tag, texture, dir_sign = _regime(px, d_tot)       # dir_sign = bullish/bearish of regime
         oi_build = int((d_tot > _OI_DB) - (d_tot < -_OI_DB))   # +1 building, -1 closing
         pos_sign = int((net > _OI_DB) - (net < -_OI_DB))   # OI positioning direction
@@ -147,14 +164,17 @@ def analyze(sym: str, date=None, as_of=None) -> dict:
                       "pos_sign": pos_sign,
                       "fpx": round(fpx, 3) if fpx is not None else None,
                       "fvol": round(fvol, 1) if fvol is not None else None,
-                      "fbasis": round(fbasis, 0) if fbasis is not None else None})
+                      "fbasis": round(fbasis, 0) if fbasis is not None else None,
+                      "foi": round(foi_d, 1) if foi_d is not None else None,
+                      "foi_build": foi_build})
     if not cells:
         return {"sym": sym, "has_data": False, "note": "warming up"}
 
+    fut_oi_day = round(float(fo.iloc[-1]["chg_oi"]) / 1e5, 1) if fo is not None else None
     verdict = _synthesize(cells)
     return {"sym": sym, "label": LABELS.get(sym, sym), "has_data": True,
             "now": now_ts.strftime("%H:%M:%S"), "spot": round(float(t["ltp"].iloc[-1]), 2),
-            "cells": cells, **verdict}
+            "fut_oi_day": fut_oi_day, "cells": cells, **verdict}
 
 
 def _synthesize(cells: list[dict]) -> dict:
@@ -187,6 +207,15 @@ def _synthesize(cells: list[dict]) -> dict:
         if s_b > 0 and hour["oi_build"] < 0:
             flags.append(("warn", f"5–10m adding OI but {hour['tf']}m net closing — "
                                   f"late entries into a longer-TF exit"))
+
+    # 4. clean FUTURES-OI read: futures unwinding under a rising tape (or building under a fall)
+    if hour and hour.get("foi_build") is not None:
+        if up_short and hour["foi_build"] < 0:
+            flags.append(("warn", f"futures OI UNWINDING over {hour['tf']}m while price rises — "
+                                  f"longs closing, not fresh buying (clean futures read)"))
+        if dn_short and hour["foi_build"] > 0:
+            flags.append(("warn", f"futures SHORT BUILDUP over {hour['tf']}m as price falls — "
+                                  f"fresh shorts pressing"))
 
     # overall bias from OI positioning across TFs (magnitude-aware)
     net_bias = sum(c["net"] for c in cells)
