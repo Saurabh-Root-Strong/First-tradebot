@@ -1253,25 +1253,28 @@ app.layout = dbc.Container([
     dbc.Row([
         # ── Left pane: Intraday-TF footprint matrix + Today's Trades ─────────────
         dbc.Col([
+            # One index selector drives BOTH the TF footprint AND that index's trades.
             html.Div([
-                html.Span("📊 INTRADAY TF", style={"color": "#67e8f9", "fontWeight": "700",
+                html.Span("📊 INTRADAY DESK", style={"color": "#67e8f9", "fontWeight": "700",
                           "fontSize": "0.62rem", "letterSpacing": "0.1em"}),
+                html.Span("  footprint + trades", style={"color": "#475569", "fontSize": "0.5rem"}),
                 dcc.Dropdown(
                     id="itf-idx", clearable=False,
                     options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
                     value="NSE:NIFTY50-INDEX",
                     style={"fontSize": "0.62rem", "marginTop": "5px", "color": "#0b1320"}),
             ], style={"marginBottom": "6px"}),
+            # Footprint matrix + the SELECTED index's open/today trades (one cockpit).
             dcc.Loading(html.Div(id="itf-content"), type="circle", color="#67e8f9"),
-            # Today's Trades — moved here from the header; opens the Trade Book.
+            # Footer: all-indices day summary + open the full Trade Book.
             html.Div(id="nav-tradebook", n_clicks=0, children=[
-                html.Div("📒 TODAY'S TRADES", style={
+                html.Div("📒 ALL TRADES — TODAY", style={
                     "letterSpacing": "0.1em", "color": "#cbd5e1", "fontWeight": "700",
-                    "fontSize": "0.6rem", "marginBottom": "4px"}),
+                    "fontSize": "0.58rem", "marginBottom": "4px"}),
                 html.Div(id="sidebar-trades"),
-                html.Div("click to open ▸", style={
+                html.Div("open full book ▸", style={
                     "color": "#475569", "fontSize": "0.5rem", "marginTop": "4px"}),
-            ], style={"marginTop": "14px", "padding": "10px 12px", "borderRadius": "8px",
+            ], style={"marginTop": "12px", "padding": "10px 12px", "borderRadius": "8px",
                       "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #fbbf24",
                       "background": BG_CARD, "cursor": "pointer"}),
         ], md=3, lg=3, style={
@@ -3664,6 +3667,44 @@ _ITF_TAG_CLR = {"LONG BUILDUP": "#22c55e", "SHORT COVER": "#86efac",
 _ITF_BIAS_CLR = {"BULLISH": "#22c55e", "BEARISH": "#ef4444", "NEUTRAL": "#94a3b8"}
 
 
+def _render_index_trades(sym) -> "html.Div":
+    """Compact open + today's-resolved trades for the SELECTED index — the action
+    half of the cockpit, next to the footprint that informs it."""
+    try:
+        led = intraday_trades.get_ledger()
+        today = datetime.datetime.now(tz=IST).date().isoformat()
+        rows = [t for t in led.recent(60, today) if t.get("index_sym") == sym]
+    except Exception:
+        return html.Div()
+    if not rows:
+        return html.Div(f"no {LABELS.get(sym, sym)} trades today", style={
+            "color": "#475569", "fontSize": "0.52rem", "padding": "3px 0", **MONO})
+    # open positions first, then most recent
+    rows.sort(key=lambda t: (0 if (t.get("status") or "OPEN") == "OPEN" else 1,
+                             t.get("opened_ts") or ""))
+    items = []
+    for t in rows[:7]:
+        st = t.get("status") or "OPEN"
+        r = t.get("r_multiple")
+        dirn = t.get("direction"); strike = t.get("strike") or 0
+        tm = (t.get("opened_ts") or "")[11:16]
+        dclr = "#4ade80" if dirn == "CE" else "#f87171"
+        stclr = _TRADE_ST_CLR.get(st, "#94a3b8")
+        rtxt = f"{r:+.2f}R" if r is not None else "live"
+        rclr = "#4ade80" if (r or 0) > 0 else "#f87171" if (r or 0) < 0 else "#fbbf24"
+        items.append(html.Div([
+            html.Span(tm, style={"color": "#475569", "fontSize": "0.5rem",
+                      "minWidth": "30px", "display": "inline-block"}),
+            html.Span(f"{dirn} {strike:,.0f}", style={"color": dclr, "fontWeight": "700",
+                      "fontSize": "0.54rem"}),
+            html.Span(f" {st}", style={"color": stclr, "fontSize": "0.5rem"}),
+            html.Span(rtxt, style={"color": rclr, "fontSize": "0.54rem",
+                      "fontWeight": "700", "marginLeft": "auto"}),
+        ], style={"display": "flex", "alignItems": "center", "padding": "2px 0",
+                  "borderBottom": "1px solid #111d2e"}))
+    return html.Div(items)
+
+
 def _render_intraday_tf(sym) -> "html.Div":
     """Per-timeframe OI·Price·Volume matrix + divergence flags for one index.
     Shows whether each 5/10/15/60-min frame is fresh buildup or positions CLOSING,
@@ -3731,6 +3772,12 @@ def _render_intraday_tf(sym) -> "html.Div":
         html.Div("option OI·price·volume per TF · futures: price/vol/basis "
                  "(intraday futures OI not in the Fyers feed)",
                  style={"color": "#334155", "fontSize": "0.46rem", "marginTop": "5px"}),
+        # ── merged in: trades on THIS index (read ⊕ position, one cockpit) ──
+        html.Div(f"📒 {r['label']} TRADES", style={
+            "color": "#fbbf24", "fontWeight": "700", "fontSize": "0.54rem",
+            "letterSpacing": "0.06em", "marginTop": "9px", "paddingTop": "6px",
+            "borderTop": "1px solid #1e3a5f55"}),
+        _render_index_trades(sym),
     ], style={**MONO})
 
 
