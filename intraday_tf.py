@@ -22,7 +22,10 @@ close — that's distribution under a rising market. Or price up while net optio
 positioning is bearish (call-writing) = hidden distribution. Those are the
 "secretly closing/creating" tells you act on (avoid / fade), not the price alone.
 
-Futures show price + volume + basis (futures OI not captured yet — fast-follow).
+Futures show price + volume + basis. Intraday futures OI is NOT available from the
+Fyers data feed (verified: absent from both /data/quotes and /data/options-chain-v3),
+so the OI footprint here is option-based — which is the dominant signal for an index
+anyway. Futures OI exists only EOD, in the Daily_Cash_Market F&O bhavcopy.
 
 Reads lock-free mirrors with as_of/date, so it replays on any captured day.
 """

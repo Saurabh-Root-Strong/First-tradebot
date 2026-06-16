@@ -3711,7 +3711,8 @@ def _render_intraday_tf(sym) -> "html.Div":
         ], style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
         *flag_divs,
         html.Div(rows),
-        html.Div("OI·price·volume per TF · futures OI pending capture",
+        html.Div("option OI·price·volume per TF · futures: price/vol/basis "
+                 "(intraday futures OI not in the Fyers feed)",
                  style={"color": "#334155", "fontSize": "0.46rem", "marginTop": "5px"}),
     ], style={**MONO})
 
