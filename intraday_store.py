@@ -522,29 +522,19 @@ def build_oi_snapshot(
 
 # ── Session helpers ───────────────────────────────────────────────────────────
 
-def session_phase() -> tuple[str, float, str]:
-    """
-    Returns (phase_name, confidence_multiplier, caution_message).
+def session_phase(at=None) -> tuple[str, float, str]:
+    """(phase_name, confidence_multiplier, caution) — a thin projection of
+    session_strategy(), the single source of truth for the time-of-day phase.
 
-    Quant desk rule: the first 30 minutes and the lunch hour are noise.
-    The last 10 minutes are a premium graveyard for option buyers.
-    """
-    now = datetime.datetime.now(tz=IST).time()
-    if   now < datetime.time(9, 45):
-        return "OPENING",    0.65, "⚠ First 30 min — price discovery, wait for range to set"
-    elif now < datetime.time(12, 0):
-        return "MORNING",    1.00, ""
-    elif now < datetime.time(13, 0):
-        return "LUNCH",      0.70, "⚠ Lunch hour — low volume, signals unreliable, reduce size"
-    elif now < datetime.time(14, 30):
-        return "AFTERNOON",  1.00, ""
-    elif now < datetime.time(15, 20):
-        return "PRE-CLOSE",  0.85, "Pre-close: watch for institutional momentum or exit"
-    else:
-        return "CLOSE",      0.25, "⚠ Final 10 min — avoid option buys, theta collapsing fast"
+    Previously this carried its OWN divergent windows/multipliers (OPENING ended
+    09:45 here but 10:00 in session_strategy; conf-mult 0.65 vs 0.70), so the
+    overview panel and the Trade Book could disagree on the phase between 09:45 and
+    10:00. Now both derive from one table — no drift."""
+    s = session_strategy(at)
+    return s["phase"], s["conf_mult"], s["caution"]
 
 
-def session_strategy() -> dict:
+def session_strategy(at=None) -> dict:
     """
     Time-of-day STRATEGY profile — the richer sibling of session_phase().
 
@@ -564,7 +554,7 @@ def session_strategy() -> dict:
     10 is gap / opening-range territory, after 10 is established trend.
     """
     T   = datetime.time
-    now = datetime.datetime.now(tz=IST).time()
+    now = (at or datetime.datetime.now(tz=IST)).time()
     if   now < T(9, 20):
         return dict(phase="PRE-OPEN", conf_mult=0.40, allow_new_entry=False, min_conf=70,
                     stop_mult=1.25, target_mult=1.00, reentry_cooldown_min=10,

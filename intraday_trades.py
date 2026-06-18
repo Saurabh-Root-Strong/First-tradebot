@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import cost_model   # L4 transaction-cost overlay (gross R -> net R)
+
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 _DB = Path(__file__).parent / "data" / "intraday_trades.db"
 
@@ -261,15 +263,21 @@ class TradeLedger:
 
         status = exit_ltp = outcome = r = exit_ts = None
         if ltp <= sl:
-            # Stop hit. If T1 was already booked, SL has been raised to breakeven
-            # (≈entry), so the runner exits flat and realised R is just the booked
-            # half — a protected partial win, not a full loss.
+            # Stop hit. A stop fills at the next available price, so when the snapshot
+            # has GAPPED through the level the honest fill is the observed ltp, not
+            # exactly `sl`. Booking at `sl` would floor every loss at -1R and hide
+            # the left tail (gap-downs in cheap OTM premium are common) — overstating
+            # the strategy. Use the worse of (ltp, sl); realised R can exceed -1R.
+            fill = min(ltp, sl)
             if booked:
-                status, exit_ltp, exit_ts = "T1", sl, ts.isoformat()
-                r = round(0.5 * r_t1 + 0.5 * ((sl - entry) / risk), 2)
+                # T1 already booked, SL raised to breakeven (≈entry): the runner
+                # exits near flat — a protected partial win, not a full loss.
+                status, exit_ltp, exit_ts = "T1", fill, ts.isoformat()
+                r = round(0.5 * r_t1 + 0.5 * ((fill - entry) / risk), 2)
                 outcome = "WIN" if r > 0 else "SCRATCH" if r == 0 else "LOSS"
             else:
-                status, exit_ltp, outcome, r, exit_ts = "SL", sl, "LOSS", -1.0, ts.isoformat()
+                r = round((fill - entry) / risk, 2)        # honest: may be worse than -1R
+                status, exit_ltp, outcome, exit_ts = "SL", fill, "LOSS", ts.isoformat()
         elif t2 and ltp >= t2:
             # Final target. Blend the booked half with the runner half if T1 booked.
             r = (round(0.5 * r_t1 + 0.5 * ((t2 - entry) / risk), 2) if booked
@@ -389,11 +397,16 @@ class TradeLedger:
                 con.close()
 
     def stats(self, date: Optional[str] = None) -> dict:
-        """Honest track-record stats over RESOLVED trades."""
+        """Honest track-record stats over RESOLVED trades — GROSS and NET of cost.
+
+        Net applies the L4 cost_model per trade (round-trip premium cost in R), so a
+        gross win that costs more than it made flips to a net loss. Sizing decisions
+        should be made on NET — gross alone is the optimistic ceiling."""
         with self._lock:
             con = self._conn()
             try:
-                q = "SELECT direction, conviction, outcome, r_multiple FROM paper_trades WHERE status != 'OPEN'"
+                q = ("SELECT direction, conviction, outcome, r_multiple, entry_ltp, sl "
+                     "FROM paper_trades WHERE status != 'OPEN'")
                 params: list = []
                 if date:
                     q += " AND date=?"; params.append(date)
@@ -408,6 +421,12 @@ class TradeLedger:
         loss = sum(1 for r in rows if r["outcome"] == "LOSS")
         rs   = [r["r_multiple"] for r in rows if r["r_multiple"] is not None]
         decided = wins + loss
+        # ── Net-of-cost overlay (L4 cost_model) ───────────────────────────────────
+        net_rs = [cost_model.net_r(r["r_multiple"], r["entry_ltp"], r["sl"])
+                  for r in rows if r["r_multiple"] is not None]
+        net_wins = sum(1 for x in net_rs if x is not None and x > 0)
+        net_loss = sum(1 for x in net_rs if x is not None and x < 0)
+        net_decided = net_wins + net_loss
         by_dir: dict = {}
         for d in ("CE", "PE"):
             drs = [r["r_multiple"] for r in rows if r["direction"] == d and r["r_multiple"] is not None]
@@ -423,6 +442,11 @@ class TradeLedger:
             "best_r": round(max(rs), 2) if rs else None,
             "worst_r": round(min(rs), 2) if rs else None,
             "by_dir": by_dir,
+            # NET of transaction cost (the number to size on)
+            "net_avg_r":   round(sum(net_rs) / len(net_rs), 2) if net_rs else None,
+            "net_hit_rate": round(net_wins / net_decided * 100) if net_decided else None,
+            "net_wins": net_wins, "net_losses": net_loss,
+            "cost_bps": cost_model.DEFAULT_ROUND_TRIP_BPS,
         }
 
 

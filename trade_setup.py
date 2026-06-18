@@ -776,6 +776,7 @@ def build_recommendation(
     mp:          float,
     total_c_oi:  int,
     total_p_oi:  int,
+    now=None,     # evaluation instant — threads the virtual clock through replay
 ) -> dict | None:
     profile = TF_PROFILES.get(tf_key)
     if not profile or not spot or not strike_map:
@@ -831,7 +832,7 @@ def build_recommendation(
 
     # ── Session phase / strategy profile (time-of-day trade shaping) ──────────
     if _INTRADAY_STORE_AVAILABLE:
-        strat = session_strategy()
+        strat = session_strategy(at=now)
     else:
         strat = dict(phase="UNKNOWN", conf_mult=1.0, allow_new_entry=True, min_conf=0,
                      stop_mult=1.0, target_mult=1.0, reentry_cooldown_min=10,

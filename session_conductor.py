@@ -152,11 +152,15 @@ _STATE_OF = {"LONG": "LONG_DELTA", "SHORT": "SHORT_DELTA", "FLAT": "FLAT"}
 
 # ── Core ────────────────────────────────────────────────────────────────────────
 def conduct(sym: str, current_state: str | None = None,
-            as_of: datetime.datetime | None = None, date: str | None = None) -> dict:
+            as_of: datetime.datetime | None = None, date: str | None = None,
+            pb: dict | None = None, rf: dict | None = None, td: dict | None = None) -> dict:
+    # pb/rf/td may be injected by MarketSnapshot so the whole page reflects ONE
+    # market state and these primitives are computed once, not per panel. When not
+    # injected, compute them here exactly as before (backward compatible).
     now = as_of or datetime.datetime.now(tz=IST)
-    pb = OP.playbook_index(sym, as_of=as_of, date=date)
-    rf = RF.forecast_index(sym, as_of=as_of, date=date)
-    td = TD.analyze_index(sym, date=date, as_of=as_of)
+    pb = pb if pb is not None else OP.playbook_index(sym, as_of=as_of, date=date)
+    rf = rf if rf is not None else RF.forecast_index(sym, as_of=as_of, date=date)
+    td = td if td is not None else TD.analyze_index(sym, date=date, as_of=as_of)
 
     if not td.get("has_data"):
         return {"sym": sym, "label": LABELS.get(sym, sym), "has_data": False,
@@ -222,8 +226,8 @@ def conduct(sym: str, current_state: str | None = None,
     }
 
 
-def conduct_all() -> dict:
-    return {s: conduct(s) for s in INDEX_SYMBOLS}
+def conduct_all(as_of=None, date=None) -> dict:
+    return {s: conduct(s, as_of=as_of, date=date) for s in INDEX_SYMBOLS}
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────

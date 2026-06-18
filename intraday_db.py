@@ -47,6 +47,7 @@ _LIVE_DIR = _DB_DIR / "live"   # Parquet snapshots for concurrent reads during l
 _PARQUET_TABLES = (
     "ticks", "candles", "oi_snapshots",
     "futures_quotes", "signals", "trade_setups",
+    "chain_snapshots",
 )
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -178,6 +179,28 @@ CREATE TABLE IF NOT EXISTS trade_setups (
     atm_iv          DOUBLE,
     PRIMARY KEY (ts, symbol, timeframe)
 );
+
+-- ── Per-strike option-chain snapshots ─────────────────────────────────────────
+-- Written every ~3 min by the OI background poller for strikes near ATM.
+-- oich / ltpch are vs PREVIOUS SESSION CLOSE (raw Fyers chain fields), so the
+-- 4-quadrant OI-premium read (writing / buildup / covering / unwinding) can be
+-- reconstructed per strike for any moment of the session — the strike-level
+-- detail that total-OI aggregates hide (e.g. gap-up call unwinding).
+CREATE TABLE IF NOT EXISTS chain_snapshots (
+    ts      TIMESTAMPTZ NOT NULL,
+    date    DATE        NOT NULL,
+    symbol  VARCHAR     NOT NULL,
+    strike  INTEGER     NOT NULL,
+    side    VARCHAR     NOT NULL,
+    ltp     DOUBLE,
+    ltpch   DOUBLE,
+    oi      BIGINT,
+    oich    BIGINT,
+    volume  BIGINT,
+    delta   DOUBLE,
+    iv      DOUBLE,
+    PRIMARY KEY (ts, symbol, strike, side)
+);
 """
 
 _SENTINEL = object()   # poison pill sent by shutdown()
@@ -266,6 +289,15 @@ class IntradayDB:
     def write_signal(self, result: dict) -> None:
         self._push(("signal", result))
 
+    def write_chain(self, sym: str, ts, rows: list) -> None:
+        """
+        Persist per-strike chain legs for one index at one moment.
+        rows: [(strike, side, ltp, ltpch, oi, oich, volume), ...]
+        Non-blocking — drops silently if queue full.
+        """
+        if rows:
+            self._push(("chain", sym, ts, rows))
+
     def write_setup(
         self,
         sym: str, tf: str, signal: str,
@@ -333,7 +365,7 @@ class IntradayDB:
     def session_stats(self, date: datetime.date | None = None) -> dict[str, int]:
         target = date or datetime.datetime.now(tz=IST).date()
         counts: dict[str, int] = {}
-        for tbl in ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals", "trade_setups"):
+        for tbl in ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals", "trade_setups", "chain_snapshots"):
             df = self.query(f"SELECT COUNT(*) AS n FROM {tbl}", target)
             counts[tbl] = int(df.iloc[0]["n"]) if not df.empty else 0
         return counts
@@ -425,6 +457,13 @@ class IntradayDB:
             path = _DB_DIR / f"{today}.duckdb"
             self._conn = self._duckdb.connect(str(path))
             self._conn.execute(_DDL)
+            # Migrate today's existing db (CREATE IF NOT EXISTS won't add columns):
+            # greeks for faithful replay (Phase 4.1). Old rows stay NULL.
+            for _col in ("delta DOUBLE", "iv DOUBLE"):
+                try:
+                    self._conn.execute(f"ALTER TABLE chain_snapshots ADD COLUMN IF NOT EXISTS {_col}")
+                except Exception:
+                    pass
             self._date = today
             self._tick_prev_vol.clear()   # new session — reset volume baselines
         return self._conn
@@ -555,6 +594,21 @@ class IntradayDB:
                  int(snap.call_wall), int(snap.put_wall), int(snap.max_pain),
                  int(snap.near_call_oi), int(snap.near_put_oi),
                  round(float(snap.put_skew), 3)],
+            )
+
+        elif kind == "chain":
+            _, sym, ts, rows = rec
+            if hasattr(ts, "tzinfo") and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=IST)
+            con.executemany(
+                """INSERT INTO chain_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT DO NOTHING""",
+                [[ts, today, sym, int(sp), side,
+                  round(float(ltp or 0), 2), round(float(ltpch or 0), 2),
+                  int(oi or 0), int(oich or 0), int(vol or 0),
+                  (round(float(delta), 4) if delta is not None else None),
+                  (round(float(iv), 3) if iv is not None else None)]
+                 for sp, side, ltp, ltpch, oi, oich, vol, delta, iv in rows],
             )
 
         elif kind == "futures":

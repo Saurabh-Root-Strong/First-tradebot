@@ -35,6 +35,8 @@ data/
 # ── Log files ─────────────────────────────────────────────────────────────────
 *.log
 logs/
+logs_*.txt
+fyersDataSocket.log
 
 # ── Claude Code local memory (machine-specific, not project code) ─────────────
 .claude/

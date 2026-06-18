@@ -21,6 +21,8 @@ from trade_setup import build_recommendation, TF_PROFILES
 from intraday_store import candle_store, oi_store, build_oi_snapshot, session_phase, session_strategy, record_tick
 import intraday_oi_intel
 import intraday_trades
+import signal_types as sig   # canonical Direction/Bias vocabulary (one language)
+import engine                # L4 headless trading engine (feed-driven open/track/resolve)
 try:
     import intraday_shock
     _SHOCK_AVAILABLE = True
@@ -56,6 +58,16 @@ try:
     _TREND_AVAILABLE = True
 except Exception:
     _TREND_AVAILABLE = False
+try:
+    import smart_money
+    _SM_AVAILABLE = True
+except Exception:
+    _SM_AVAILABLE = False
+try:
+    from market_snapshot import MarketSnapshot   # L2: one market state per render
+    _SNAPSHOT_OK = True
+except Exception:
+    _SNAPSHOT_OK = False
 try:
     from dcm_prediction import get_dcm_reader as _get_dcm_reader
     _DCM_OK = True
@@ -363,6 +375,19 @@ def _fmt_oi(v) -> str:
     if a >= 1_000_000: return f"{sign}{a / 1_000_000:.2f}M"
     if a >= 1_000:     return f"{sign}{a / 1_000:.1f}K"
     return f"{sign}{int(a)}"
+
+
+def _fmt_futoi(v) -> str:
+    """Signed futures-OI day change with ADAPTIVE units (L at index scale, K below a
+    lakh, raw below 1K). Thin index futures (BANKNIFTY/FINNIFTY/MIDCPNIFTY — their
+    liquidity is in options, not futures) build only ~thousands of contracts/day, so
+    a whole-lakh format collapses them to '+0L'. Shows the real number instead."""
+    if v is None: return ""
+    a = abs(int(v)); s = "+" if v >= 0 else "-"
+    if   a >= 100_000: body = f"{a / 1e5:.1f}L"
+    elif a >= 1_000:   body = f"{a / 1e3:.0f}K"
+    else:              body = f"{a}"
+    return f"  ·  futOI {s}{body} today"
 
 
 def compute_prediction(strike_map: dict, spot: float, pcr: float, mp: float) -> dict:
@@ -708,10 +733,12 @@ def _oi_background_poller():
                                 for side in ("CE", "PE"):
                                     e = strike_map[sp].get(side)
                                     if e:
+                                        g = e.get("greeks") or {}
                                         legs.append((sp, side,
                                                      e.get("ltp"), e.get("ltpch"),
                                                      e.get("oi"), e.get("oich"),
-                                                     e.get("volume")))
+                                                     e.get("volume"),
+                                                     g.get("delta"), g.get("iv")))
                             idb.write_chain(sym, datetime.datetime.now(tz=IST), legs)
                         except Exception:
                             pass
@@ -744,47 +771,77 @@ def _fetch_quotes(symbols: list[str]) -> dict:
     return out
 
 
-def _trade_tracker_poller():
-    """
-    Component C: follow each open paper trade's option LTP to resolution.
+class LiveFeed:
+    """Feed adapter for the headless engine — wraps the live WS store + Fyers
+    helpers. Parsing that used to live in the poller now lives here, so the engine
+    consumes one normalized shape whether the data is live or replayed."""
 
-    Every ~20s during market hours: fetch quotes for all open trades' option
-    symbols, update MFE/MAE and resolve on SL/T1/T2. After 15:31 IST, close any
-    still-open trades at last price (mark-to-close).
-    """
-    led = intraday_trades.get_ledger()
+    def now(self):
+        return datetime.datetime.now(tz=IST)
+
+    def spot(self, sym):
+        with _lock:
+            return (_latest.get(sym) or {}).get("ltp", 0)
+
+    def chain(self, sym):
+        oc = fetch_option_chain(sym)
+        if oc.get("s") != "ok":
+            return None
+        d   = oc.get("data", {})
+        raw = d.get("optionsChain", [])
+        if not raw:
+            return None
+        sm: dict = {}
+        for e in raw:
+            sp = e.get("strike_price", -1)
+            if sp > 0 and e.get("option_type") in ("CE", "PE"):
+                sm.setdefault(sp, {})[e["option_type"]] = e
+        tot_c = d.get("callOi", 0); tot_p = d.get("putOi", 0)
+        mp_ch = [{"strike_price": sp,
+                  "call_options": {"oi": sm[sp].get("CE", {}).get("oi", 0)},
+                  "put_options":  {"oi": sm[sp].get("PE", {}).get("oi", 0)}}
+                 for sp in sorted(sm)]
+        return {"sm": sm, "expiry_data": d.get("expiryData", []),
+                "tot_c": tot_c, "tot_p": tot_p,
+                "pcr": (tot_p / tot_c if tot_c else 0),
+                "mp": (compute_max_pain(mp_ch) if mp_ch else 0)}
+
+    def futures(self, sym):
+        return fetch_futures(sym)
+
+    def quotes(self, option_syms):
+        return _fetch_quotes(option_syms)
+
+    def eod_context(self, sym):
+        try:
+            from daily_context_bridge import get_bridge
+            return get_bridge().get_panel_data(sym) or {}
+        except Exception:
+            return {}
+
+    def shock_against(self, index_sym, direction):
+        if not _SHOCK_AVAILABLE:
+            return None
+        try:
+            return intraday_shock.shock_against(index_sym, direction)
+        except Exception:
+            return None
+
+
+def _trade_tracker_poller():
+    """Drive engine.track_and_resolve every ~20s during market hours; mark-to-close
+    once after 15:31. The lifecycle logic lives in engine.py (feed-driven, testable);
+    this loop is just the live clock + gate."""
+    led  = intraday_trades.get_ledger()
+    feed = LiveFeed()
     eod_done_for: str = ""
     while True:
         try:
             now = datetime.datetime.now(tz=IST)
-            opens = led.open_trades()
-            syms  = [t["option_sym"] for t in opens if t.get("option_sym")]
-            if syms and datetime.time(9, 14) <= now.time() <= datetime.time(15, 45):
-                prices = _fetch_quotes(syms)
-                if prices:
-                    led.update_open_trades(prices)
-                # Adaptive Layer-10 overlay: if a sudden shock now fires AGAINST an
-                # open trade, flag it and tighten the stop to lock risk (no forced
-                # exit — the next price tick still resolves it via the normal path).
-                if _SHOCK_AVAILABLE:
-                    for t in led.open_trades():        # re-read: some may have resolved above
-                        try:
-                            sh = intraday_shock.shock_against(t["index_sym"], t.get("direction"))
-                            if not sh:
-                                continue
-                            head = sh["signals"][0][1] if sh.get("signals") else "opposing market shock"
-                            note = f"⚠ REGIME SHIFT — {head}"
-                            last = t.get("last_ltp") or t.get("entry_ltp") or 0
-                            risk = t.get("risk") or 0
-                            # Lock half the remaining risk: raise SL toward last price.
-                            new_sl = (last - 0.5 * risk) if (last and risk) else None
-                            led.flag_regime_shift(t["trade_id"], note, new_sl)
-                        except Exception:
-                            pass
-            # End-of-session mark-to-close (once per day)
+            if datetime.time(9, 14) <= now.time() <= datetime.time(15, 45):
+                engine.track_and_resolve(feed, led)
             if now.time() >= datetime.time(15, 31) and eod_done_for != now.date().isoformat():
-                still = [t["option_sym"] for t in led.open_trades() if t.get("option_sym")]
-                led.close_eod(_fetch_quotes(still) if still else {})
+                engine.close_eod(feed, led)
                 eod_done_for = now.date().isoformat()
         except Exception:
             pass
@@ -792,62 +849,16 @@ def _trade_tracker_poller():
 
 
 def _auto_signal_poller():
-    """
-    Autonomous signal eval for ALL 4 indices (Component C — track-record coverage).
-
-    The UI callback only logs trades for the index you're viewing; this evaluates
-    every index every 60s during market hours and opens tracked trades, so the
-    Today's-Trades section reflects the whole book, not just the active panel.
-    Uses the 15-min intraday profile (same as the UI default).
-    """
-    led = intraday_trades.get_ledger()
+    """Drive engine.eval_and_open across all 4 indices every 60s during market hours
+    (track-record coverage for the whole book, not just the viewed panel). Logic in
+    engine.py; this loop is just the live clock + gate."""
+    led  = intraday_trades.get_ledger()
+    feed = LiveFeed()
     while True:
         try:
             now = datetime.datetime.now(tz=IST)
             if datetime.time(9, 16) <= now.time() <= datetime.time(15, 25):
-                for sym in INDEX_SYMBOLS:
-                    try:
-                        with _lock:
-                            spot = (_latest.get(sym) or {}).get("ltp", 0)
-                        if not spot:
-                            continue
-                        oc = fetch_option_chain(sym)
-                        if oc.get("s") != "ok":
-                            continue
-                        d   = oc.get("data", {})
-                        raw = d.get("optionsChain", [])
-                        if not raw:
-                            continue
-                        expiry_data = d.get("expiryData", [])
-                        sm: dict = {}
-                        for e in raw:
-                            sp = e.get("strike_price", -1)
-                            if sp > 0 and e.get("option_type") in ("CE", "PE"):
-                                sm.setdefault(sp, {})[e["option_type"]] = e
-                        tot_c = d.get("callOi", 0); tot_p = d.get("putOi", 0)
-                        pcr   = tot_p / tot_c if tot_c else 0
-                        mp_ch = [{"strike_price": sp,
-                                  "call_options": {"oi": sm[sp].get("CE", {}).get("oi", 0)},
-                                  "put_options":  {"oi": sm[sp].get("PE", {}).get("oi", 0)}}
-                                 for sp in sorted(sm)]
-                        mp  = compute_max_pain(mp_ch) if mp_ch else 0
-                        rec = build_recommendation(
-                            sym=sym, tf_key="15min", spot=spot, strike_map=sm,
-                            expiry_data=expiry_data, futures=fetch_futures(sym),
-                            pcr=pcr, mp=mp, total_c_oi=tot_c, total_p_oi=tot_p,
-                        )
-                        # A/B intelligence for the trade's edge reason
-                        oi_dyn = intraday_oi_intel.analyze_oi_dynamics(sm, spot)
-                        _lv = {}
-                        try:
-                            from daily_context_bridge import get_bridge
-                            _lv = get_bridge().get_panel_data(sym) or {}
-                        except Exception:
-                            _lv = {}
-                        cont = intraday_oi_intel.analyze_continuity(sm, spot, _lv)
-                        led.maybe_open(sym, rec, oi_dyn=oi_dyn, cont=cont)
-                    except Exception:
-                        pass
+                engine.eval_and_open(feed, led, INDEX_SYMBOLS, tf_key="15min")
         except Exception:
             pass
         time.sleep(60)
@@ -1267,6 +1278,9 @@ app.layout = dbc.Container([
                 html.Div("📒 ALL TRADES — TODAY", style={
                     "letterSpacing": "0.1em", "color": "#cbd5e1", "fontWeight": "700",
                     "fontSize": "0.58rem", "marginBottom": "4px"}),
+                # All-index smart-money footprint (OI×vol×premium) sits in the head,
+                # so the trade book opens on who's really positioning across all 4.
+                html.Div(id="sm-footprint"),
                 html.Div(id="sidebar-trades"),
                 html.Div("open full book ▸", style={
                     "color": "#475569", "fontSize": "0.5rem", "marginTop": "4px"}),
@@ -3298,6 +3312,13 @@ def _render_track_record() -> "html.Div":
             stat_line.append(html.Span(f"{hit:.0f}% hit  ", style={"color": hit_clr, "fontWeight": "700"}))
         if avg_r is not None:
             stat_line.append(html.Span(f"avg {avg_r:+.2f}R", style={"color": "#4ade80" if avg_r >= 0 else "#f87171"}))
+        net = s.get("net_avg_r"); nhit = s.get("net_hit_rate"); bps = s.get("cost_bps")
+        if net is not None:
+            stat_line.append(html.Span(f"  ·  net {net:+.2f}R", style={
+                "color": "#4ade80" if net >= 0 else "#f87171", "fontWeight": "700"}))
+            stat_line.append(html.Span(
+                (f" ({nhit:.0f}% @{bps:.0f}bps)" if nhit is not None else f" @{bps:.0f}bps"),
+                style={"color": "#64748b"}))
 
     _ST = {"OPEN": "#fbbf24", "T1": "#4ade80", "T2": "#22c55e", "SL": "#f87171", "EOD": "#94a3b8"}
     rows = []
@@ -3361,10 +3382,66 @@ def _render_sidebar_trades() -> "html.Div":
                                 "fontWeight": "700", "fontSize": "0.55rem"}))
         if avgr is not None:
             parts.append(html.Span(f"{avgr:+.1f}R ",
-                         style={"color": "#4ade80" if avgr >= 0 else "#f87171", "fontSize": "0.55rem"}))
+                         style={"color": "#94a3b8", "fontSize": "0.55rem"}))
+        net = s.get("net_avg_r")
+        if net is not None:
+            parts.append(html.Span(f"net {net:+.1f}R ", style={
+                "color": "#4ade80" if net >= 0 else "#f87171",
+                "fontSize": "0.55rem", "fontWeight": "700"}))
     if n_open:
         parts.append(html.Span(f"· {n_open} open", style={"color": "#fbbf24", "fontSize": "0.55rem"}))
     return html.Div(parts, style=MONO)
+
+
+_SM_DIR_CLR   = {"BULLISH": "#22c55e", "BEARISH": "#ef4444", "NEUTRAL": "#94a3b8", "THIN": "#475569"}
+_SM_DIR_ARROW = {"BULLISH": "▲", "BEARISH": "▼", "NEUTRAL": "•", "THIN": "·"}
+_SM_DIR_SHORT = {"BULLISH": "BULL", "BEARISH": "BEAR", "NEUTRAL": "NEUT", "THIN": "THIN"}
+
+
+def _render_smart_money_footprint() -> "html.Div":
+    """All-index smart-money footprint (option+futures flow: OI×volume×premium) for
+    the ALL TRADES head. One tight row per index — direction · conviction · net OI
+    build · whether the footprint LEADS price (institutions positioned before the
+    move = the high-value tell). This is the institutional read across all 4 indices,
+    distinct from the per-TF matrix above which is the SELECTED index only."""
+    if not _SM_AVAILABLE:
+        return html.Div()
+    rows = []
+    for s in INDEX_SYMBOLS:
+        lbl = _IDX_ABBR.get(s, LABELS.get(s, s))
+        try:
+            r = smart_money.footprint_index(s)
+        except Exception:
+            r = None
+        if not r or not r.get("has_data"):
+            rows.append(html.Div([
+                html.Span(lbl, style={"color": "#64748b", "fontSize": "0.5rem",
+                          "minWidth": "48px", "display": "inline-block"}),
+                html.Span((r or {}).get("note", "warming up") if r else "warming up",
+                          style={"color": "#334155", "fontSize": "0.48rem"}),
+            ], style={"display": "flex", "alignItems": "center", "padding": "1px 0"}))
+            continue
+        d   = r["direction"]
+        clr = _SM_DIR_CLR.get(d, "#94a3b8")
+        rows.append(html.Div([
+            html.Span(lbl, style={"color": "#94a3b8", "fontSize": "0.5rem",
+                      "minWidth": "48px", "display": "inline-block"}),
+            html.Span(f"{_SM_DIR_ARROW.get(d, '•')}{_SM_DIR_SHORT.get(d, d)}", style={
+                      "color": clr, "fontWeight": "700", "fontSize": "0.5rem",
+                      "minWidth": "42px", "display": "inline-block"}),
+            html.Span(f"{r['conviction']}%", style={"color": clr, "fontSize": "0.5rem",
+                      "minWidth": "30px", "display": "inline-block"}),
+            html.Span(f"{r['build_L']:.1f}L", style={"color": "#475569", "fontSize": "0.46rem"}),
+            html.Span("⚡leads" if r.get("leads") else "", style={"color": "#fbbf24",
+                      "fontSize": "0.46rem", "fontWeight": "700", "marginLeft": "auto"}),
+        ], style={"display": "flex", "alignItems": "center", "padding": "1px 0"}))
+    return html.Div([
+        html.Div("smart-money footprint · OI×vol×premium", style={
+            "color": "#67e8f9", "fontSize": "0.46rem", "letterSpacing": "0.04em",
+            "opacity": 0.85, "marginBottom": "2px"}),
+        *rows,
+    ], style={"marginBottom": "6px", "paddingBottom": "6px",
+              "borderBottom": "1px solid #1e293b", **MONO})
 
 
 def _trade_levels_bar(t) -> "html.Div":
@@ -3413,7 +3490,7 @@ def _regime_risk_badge(t, fc=None):
         "border": f"1px solid {clr}66", "borderRadius": "3px", "padding": "3px 5px"})
 
 
-def _render_regime_radar(asof_value=None) -> "html.Div":
+def _render_regime_radar(asof_value=None, snap=None) -> "html.Div":
     """
     Forward-looking Regime Radar with a 30-min time-machine dropdown.
     Selecting a checkpoint reconstructs the market regime + change-forecast as it
@@ -3425,14 +3502,9 @@ def _render_regime_radar(asof_value=None) -> "html.Div":
     opts = [{"label": "● Now (live)", "value": "now"}] + \
            [{"label": t.strftime("%H:%M"), "value": t.isoformat()} for t in marks]
     val = asof_value or "now"
-    as_of = None
-    if val and val != "now":
-        try:
-            as_of = datetime.datetime.fromisoformat(val)
-        except Exception:
-            as_of = None
+    as_of = _parse_asof(val)
 
-    m = regime_forecast.market_forecast(as_of)
+    m = snap.market if snap is not None else regime_forecast.market_forecast(as_of)
     stage = m.get("stage", "—") if m.get("has_data") else "—"
     sclr  = _STAGE_CLR.get(stage, "#64748b")
 
@@ -3484,27 +3556,16 @@ _PB_ACTION_CLR = {"BUY CE": "#4ade80", "BUY PE": "#f87171", "WRITE PE": "#fbbf24
                   "WRITE CE": "#fbbf24", "BUY FUT": "#60a5fa", "SELL FUT": "#60a5fa",
                   "NO TRADE": "#64748b"}
 _PB_TONE_CLR = {"bull": "#4ade80", "bear": "#f87171", "flat": "#475569"}
-# Direction tag + stance clarifier — so a WRITE PE (a bullish premium-sell) never
-# reads as a bearish "put" trade at a glance.
-_PB_DIR_TAG = {"BULLISH": ("▲ BULLISH", "#4ade80"),
-               "BEARISH": ("▼ BEARISH", "#f87171"),
-               "NEUTRAL": ("● NEUTRAL", "#94a3b8")}
-_PB_STANCE_HINT = {"WRITE PE": "sell puts · bullish", "WRITE CE": "sell calls · bearish",
-                   "BUY FUT": "long futures", "SELL FUT": "short futures"}
+# Direction tag + the "WRITE PE is bullish" stance clarifier now come from
+# signal_types (one canonical source — see sig.arrow/color/action_hint).
 
 
-def _render_opening_playbook(asof_value=None) -> "html.Div":
+def _render_opening_playbook(asof_value=None, snap=None) -> "html.Div":
     """Opening Playbook — the first-20-min F&O morning call, one card per index."""
     if not _PLAYBOOK_AVAILABLE:
         return html.Div()
-    as_of = None
-    if asof_value and asof_value != "now":
-        try:
-            as_of = datetime.datetime.fromisoformat(asof_value)
-        except Exception:
-            as_of = None
     try:
-        pb = opening_playbook.playbook_all(as_of)
+        pb = snap.playbook_all if snap is not None else opening_playbook.playbook_all(_parse_asof(asof_value))
     except Exception:
         return html.Div()
 
@@ -3530,8 +3591,8 @@ def _render_opening_playbook(asof_value=None) -> "html.Div":
         strike_txt = f" {p['strike']:,}" if p.get("strike") else ""
         flip = p.get("flip") or {}
         dirn = p.get("direction", "NEUTRAL")
-        dtag, dclr = _PB_DIR_TAG.get(dirn, ("● NEUTRAL", "#94a3b8"))
-        hint = _PB_STANCE_HINT.get(act, "")
+        dclr = sig.color(dirn); dtag = f"{sig.arrow(dirn)} {dirn}"
+        hint = sig.action_hint(act)
         cards.append(dbc.Col([
             # Headline (always visible): label · conviction · direction stance
             html.Div([
@@ -3579,21 +3640,20 @@ def _render_opening_playbook(asof_value=None) -> "html.Div":
 
 
 # ── Session Conductor panel — the unified, evolving stance per index ────────────
-_COND_DIR_CLR   = {"LONG": "#4ade80", "SHORT": "#f87171", "FLAT": "#94a3b8"}
-_COND_DIR_ARROW = {"LONG": "▲", "SHORT": "▼", "FLAT": "•"}
+# (LONG/SHORT/FLAT arrow + colour now from signal_types — one canonical source)
 
 
 def _cond_drv_clr(v: float) -> str:
     return "#4ade80" if v > 0.05 else "#f87171" if v < -0.05 else "#475569"
 
 
-def _render_conductor() -> "html.Div":
+def _render_conductor(asof_value=None, snap=None) -> "html.Div":
     """One fused, evolving stance per index — resolves the stale-opening-vs-live
     dissonance into a single directive. Decision-support (does not auto-execute)."""
     if not _CONDUCTOR_AVAILABLE:
         return html.Div()
     try:
-        per = session_conductor.conduct_all()
+        per = snap.stances() if snap is not None else session_conductor.conduct_all(as_of=_parse_asof(asof_value))
     except Exception:
         return html.Div()
     head = html.Div([
@@ -3613,20 +3673,24 @@ def _render_conductor() -> "html.Div":
                 html.Div(r.get("note", "warming up"), style={"color": "#475569", "fontSize": "0.52rem"})],
                 md=3, style={"padding": "0 8px"}))
             continue
-        dirn = r["direction"]; dclr = _COND_DIR_CLR.get(dirn, "#94a3b8")
+        dirn = r["direction"]; dclr = sig.color(dirn)
         inst = r["instrument"]; aclr = _PB_ACTION_CLR.get(inst["action"], "#94a3b8")
         strike = f" {inst['strike']:,}" if inst.get("strike") else ""
+        a_hint = sig.action_hint(inst["action"])   # 'WRITE PE → sell puts · bullish'
         cards.append(dbc.Col([
             html.Div([
                 html.Span(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
                           "fontSize": "0.6rem", "letterSpacing": "0.06em"}),
-                html.Span(f"  {_COND_DIR_ARROW[dirn]} {dirn}", style={"color": dclr,
+                html.Span(f"  {sig.arrow(dirn)} {dirn}", style={"color": dclr,
                           "fontWeight": "700", "fontSize": "0.56rem"}),
                 html.Span(f"{r['conviction']}%", style={"color": "#94a3b8", "fontSize": "0.54rem",
                           "marginLeft": "auto"}),
             ], style={"display": "flex", "alignItems": "center"}),
-            html.Div(f"{inst['action']}{strike}", style={"color": aclr, "fontWeight": "700",
-                     "fontSize": "0.8rem", "margin": "2px 0"}),
+            html.Div([
+                html.Span(f"{inst['action']}{strike}", style={"color": aclr, "fontWeight": "700",
+                          "fontSize": "0.8rem"}),
+                html.Span(f"  · {a_hint}", style={"color": dclr, "fontSize": "0.5rem"}) if a_hint else None,
+            ], style={"margin": "2px 0"}),
             html.Div(f"{r['transition']}" + ("" if r["act_now"] else " · wait"),
                      style={"color": "#cbd5e1" if r["act_now"] else "#64748b", "fontSize": "0.5rem",
                             "fontWeight": "700" if r["act_now"] else "400", "marginBottom": "2px"}),
@@ -3662,7 +3726,62 @@ def _render_conductor() -> "html.Div":
 # ── Intraday-TF footprint matrix (left pane) ────────────────────────────────────
 _ITF_TAG_CLR = {"LONG BUILDUP": "#22c55e", "SHORT COVER": "#86efac",
                 "SHORT BUILDUP": "#ef4444", "LONG UNWIND": "#fca5a5", "BALANCED": "#64748b"}
-_ITF_BIAS_CLR = {"BULLISH": "#22c55e", "BEARISH": "#ef4444", "NEUTRAL": "#94a3b8"}
+# OI-bias colour (BULLISH/BEARISH/NEUTRAL) now from signal_types.color()
+
+
+def _parse_asof(asof_value):
+    """Regime-Radar dropdown value → as_of datetime (None = live 'now'). One parser
+    so every Trade-Book panel reconstructs the SAME instant — no mixing a past
+    review mark with live (future-relative) conductor/footprint/forecast data."""
+    if asof_value and asof_value != "now":
+        try:
+            return datetime.datetime.fromisoformat(asof_value)
+        except Exception:
+            return None
+    return None
+
+# ── Hover-tooltip copy for the footprint (native browser `title` on each element) ──
+_TF_TAG_DESC = {
+    "LONG BUILDUP":  "price UP + option OI BUILDING -> fresh longs adding (sustainable up-move)",
+    "SHORT COVER":   "price UP + OI FALLING -> shorts buying back to exit (up, but not fresh demand - can fade)",
+    "SHORT BUILDUP": "price DOWN + OI BUILDING -> fresh shorts adding (sustainable down-move)",
+    "LONG UNWIND":   "price DOWN + OI FALLING -> longs exiting (down from position-closing, not fresh selling)",
+    "BALANCED":      "no confirmed regime - the price move and/or the OI build is below the noise threshold",
+}
+_GRADE_DESC = {
+    "aligned":   "ALIGNED (star) - a higher timeframe AGREES and an independent flow (OI positioning or "
+                 "futures) CONFIRMS it, and the move persisted. The only grade meant to be traded.",
+    "confirmed": "confirmed (check) - persisted with ONE corroboration (higher-TF or flow), not both. "
+                 "A solid single-frame read.",
+    "tentative": "tentative (~) - a significant move that is not yet corroborated or did not persist. "
+                 "Watch only; do not act.",
+}
+_STACK_TIP = ("STACK = multi-timeframe consensus direction (longer timeframes weighted heavier). "
+              "'N/M TFs agree' = how many directional frames point this way. "
+              "'star K tradeable' = frames that are fully stack-confirmed (safe to act on). "
+              "'no confirmed entry' = nothing is corroborated yet -> stand aside.")
+_BIAS_TIP = ("OI BIAS = net option POSITIONING across frames (put-writing vs call-writing). "
+             "BULLISH = put-writers dominant (a floor is being built); BEARISH = call-writers dominant "
+             "(a ceiling). This is positioning, separate from the price-regime tag on each line.")
+
+
+def _tf_tooltip(c: dict) -> str:
+    """Per-frame hover text: what the regime tag means + WHY it is showing now,
+    derived from the live z-score / OI build / confirmation grade."""
+    z = c.get("z", 0.0); tag = c["tag"]; grade = c.get("grade", "balanced")
+    out = [f"{c['tf']}-MINUTE FRAME", "",
+           f"{tag} - {_TF_TAG_DESC.get(tag, '')}", "", "WHY THIS LABEL NOW:"]
+    zsig = ">=1 sigma -> significant" if abs(z) >= 1 else "<1 sigma -> within noise (NOT a real move)"
+    out.append(f"- price moved {z:+.1f} sigma  ({zsig})")
+    out.append("- OI build is significant" if c.get("oi_build")
+               else "- OI build is below the significance bar")
+    if tag == "BALANCED":
+        out.append("- => BALANCED until BOTH a >=1 sigma move AND a material OI build line up")
+    else:
+        out.append("- " + _GRADE_DESC.get(grade, ""))
+        if c.get("confirms"):
+            out.append("- confirmed by: " + " - ".join(c["confirms"]))
+    return "\n".join(out)
 
 
 def _render_index_trades(sym) -> "html.Div":
@@ -3703,14 +3822,16 @@ def _render_index_trades(sym) -> "html.Div":
     return html.Div(items)
 
 
-def _render_intraday_tf(sym) -> "html.Div":
+def _render_intraday_tf(sym, asof_value=None, snap=None) -> "html.Div":
     """Per-timeframe OI·Price·Volume matrix + divergence flags for one index.
     Shows whether each 5/10/15/60-min frame is fresh buildup or positions CLOSING,
-    so a rally on closing (distribution) or hidden call-writing is visible early."""
+    so a rally on closing (distribution) or hidden call-writing is visible early.
+    asof_value (Trade-Book replay) reconstructs the read at a past instant; `snap`
+    is the shared MarketSnapshot so the footprint isn't recomputed per panel."""
     if not _ITF_AVAILABLE:
         return html.Div()
     try:
-        r = intraday_tf.analyze(sym)
+        r = snap.footprint(sym) if snap is not None else intraday_tf.analyze(sym, as_of=_parse_asof(asof_value))
     except Exception:
         return html.Div("—", style={"color": "#475569", "fontSize": "0.55rem"})
     if not r.get("has_data"):
@@ -3719,25 +3840,46 @@ def _render_intraday_tf(sym) -> "html.Div":
 
     rows = []
     for c in r["cells"]:
-        up = c["px"] > 0.03; dn = c["px"] < -0.03
-        pcl = "#22c55e" if up else "#ef4444" if dn else "#94a3b8"
-        parr = "▲" if up else "▼" if dn else "·"
+        pu = c.get("pu", 0); z = c.get("z", 0.0)
+        # colour by SIGNIFICANCE (>=1σ), not raw sign — a sub-σ wiggle stays grey
+        pcl = "#22c55e" if pu > 0 else "#ef4444" if pu < 0 else "#94a3b8"
+        parr = "▲" if c["px"] > 0 else "▼" if c["px"] < 0 else "·"
         bld = c["oi_build"]
         boi = ("↑ build" if bld > 0 else "↓ close" if bld < 0 else "· flat")
         bclr = "#4ade80" if bld > 0 else "#f87171" if bld < 0 else "#64748b"
         tclr = _ITF_TAG_CLR.get(c["tag"], "#64748b")
+        is_dir = c["tag"] != "BALANCED"
+        grade = c.get("grade", "balanced")
+        # grade badge: ★ aligned (stack-confirmed, tradeable) · ✓ confirmed (solid 1-TF)
+        # · ~ tentative (significant but uncorroborated — watch only)
+        badge = {"aligned": " ★", "confirmed": " ✓"}.get(grade, "")
+        pre   = "~" if (is_dir and grade == "tentative") else ""
+        tag_txt = f"{pre}{c['tag']}{badge}" if is_dir else c["tag"]
+        tag_style = {"color": tclr, "fontSize": "0.55rem", "fontWeight": "700",
+                     "marginLeft": "auto"}
+        if grade == "tentative":
+            tag_style["opacity"] = 0.4
+        elif grade == "confirmed":
+            tag_style["opacity"] = 0.8
         ovol = "" if c["ovol"] is None else f" vol {c['ovol']:.0f}L"
         farr = ("fut▲" if (c["fpx"] or 0) > 0.03 else "fut▼" if (c["fpx"] or 0) < -0.03 else "fut·")
         foi = c.get("foi"); fb = c.get("foi_build", 0)
         foi_txt = "" if foi is None else f" OI{'↑' if fb>0 else '↓' if fb<0 else '·'}{foi:+.0f}L"
         fclr = "#4ade80" if fb > 0 else "#f87171" if fb < 0 else "#475569"
+        # confirm trail — which higher TFs / flows back an aligned or confirmed call
+        trail = []
+        if grade in ("aligned", "confirmed") and c.get("confirms"):
+            tclr2 = "#4ade80" if grade == "aligned" else "#64748b"
+            trail = [html.Div(("★ stack: " if grade == "aligned" else "✓ ")
+                              + " · ".join(c["confirms"]),
+                              style={"color": tclr2, "fontSize": "0.46rem", "opacity": 0.85})]
         rows.append(html.Div([
             html.Div([
                 html.Span(f"{c['tf']}m", style={"color": "#cbd5e1", "fontWeight": "700",
                           "fontSize": "0.58rem", "minWidth": "26px", "display": "inline-block"}),
                 html.Span(f"{parr}{c['px']:+.2f}%", style={"color": pcl, "fontSize": "0.58rem"}),
-                html.Span(f"  {c['tag']}", style={"color": tclr, "fontSize": "0.55rem",
-                          "fontWeight": "700", "marginLeft": "auto"}),
+                html.Span(f" {z:+.1f}σ", style={"color": "#475569", "fontSize": "0.5rem"}),
+                html.Span(f"  {tag_txt}", style=tag_style),
             ], style={"display": "flex", "alignItems": "center"}),
             html.Div([
                 html.Span(f"optOI {boi} {c['d_tot']:+.0f}L", style={"color": bclr, "fontSize": "0.52rem"}),
@@ -3746,7 +3888,21 @@ def _render_intraday_tf(sym) -> "html.Div":
                            html.Span(ovol, style={"color": "#475569"})],
                           style={"fontSize": "0.5rem"}),
             ], style={"display": "flex", "justifyContent": "space-between"}),
-        ], style={"padding": "4px 0", "borderBottom": "1px solid #111d2e"}))
+            *trail,
+        ], title=_tf_tooltip(c),
+           style={"padding": "4px 0", "borderBottom": "1px solid #111d2e", "cursor": "help"}))
+
+    # Greyed placeholders for timeframes that can't be computed yet (their lookback
+    # predates capture-start). Shows the slot is warming up + when it unlocks, rather
+    # than vanishing silently — e.g. the 1h frame before ~60 min of ticks exist.
+    for pc in r.get("pending", []):
+        rows.append(html.Div([
+            html.Span(f"{pc['tf']}m", style={"color": "#475569", "fontWeight": "700",
+                      "fontSize": "0.58rem", "minWidth": "26px", "display": "inline-block"}),
+            html.Span(f"needs {pc['tf']}m of capture · ~{pc['eta']}", style={
+                      "color": "#334155", "fontSize": "0.52rem", "fontStyle": "italic"}),
+        ], style={"display": "flex", "alignItems": "center",
+                  "padding": "4px 0", "borderBottom": "1px solid #111d2e", "opacity": 0.7}))
 
     flag_divs = [html.Div(("⚠ " if t == "warn" else "✓ ") + m, style={
         "color": "#fb923c" if t == "warn" else "#4ade80", "fontSize": "0.52rem",
@@ -3755,16 +3911,34 @@ def _render_intraday_tf(sym) -> "html.Div":
         "border": f"1px solid {'#7c2d12' if t == 'warn' else '#14532d'}",
         "borderRadius": "3px", "padding": "3px 5px"}) for t, m in r.get("flags", [])]
 
+    stk = r.get("stack", {}) or {}
+    sdir = stk.get("dir", 0)
+    sclr = "#22c55e" if sdir > 0 else "#ef4444" if sdir < 0 else "#64748b"
+    sarr = "▲" if sdir > 0 else "▼" if sdir < 0 else "•"
+    sword = "BULLISH" if sdir > 0 else "BEARISH" if sdir < 0 else "NO TREND"
+    n_aligned = len(stk.get("aligned", []))
     return html.Div([
         html.Div([
             html.Span(f"OI bias ", style={"color": "#64748b", "fontSize": "0.52rem"}),
-            html.Span(r["bias"], style={"color": _ITF_BIAS_CLR.get(r["bias"], "#94a3b8"),
+            html.Span(r["bias"], style={"color": sig.color(r["bias"]),
                       "fontWeight": "700", "fontSize": "0.56rem"}),
-            html.Span((f"  ·  futOI {r['fut_oi_day']:+.0f}L today" if r.get("fut_oi_day") is not None else ""),
+            html.Span(_fmt_futoi(r.get("fut_oi_chg")),
                       style={"color": "#67e8f9", "fontSize": "0.5rem"}),
             html.Span(f"  {r['now']}", style={"color": "#475569", "fontSize": "0.5rem",
                       "marginLeft": "auto"}),
-        ], style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
+        ], title=_BIAS_TIP,
+           style={"display": "flex", "alignItems": "center", "marginBottom": "2px", "cursor": "help"}),
+        # Multi-TF stack consensus — the stable cross-timeframe direction. ★N = how
+        # many frames are stack-confirmed (tradeable), not lone-TF noise.
+        html.Div([
+            html.Span("stack ", style={"color": "#64748b", "fontSize": "0.52rem"}),
+            html.Span(f"{sarr} {sword}", style={"color": sclr, "fontWeight": "700",
+                      "fontSize": "0.56rem"}),
+            html.Span(f"  {stk.get('agree', 0)}/{stk.get('total', 0)} TFs agree"
+                      + (f"  ·  ★{n_aligned} tradeable" if n_aligned else "  ·  no confirmed entry"),
+                      style={"color": "#475569", "fontSize": "0.5rem"}),
+        ], title=_STACK_TIP,
+           style={"display": "flex", "alignItems": "center", "marginBottom": "4px", "cursor": "help"}),
         *flag_divs,
         html.Div(rows),
         html.Div("option OI·price·volume per TF · futures: price/vol/basis "
@@ -3773,7 +3947,7 @@ def _render_intraday_tf(sym) -> "html.Div":
     ], style={**MONO})
 
 
-def _render_trade_book_footprint() -> "html.Div":
+def _render_trade_book_footprint(asof_value=None, snap=None) -> "html.Div":
     """The footprint for all 4 indices, as a strip inside the Trade Book cockpit —
     so the OI·price·volume read sits next to the conductor stance and the trades."""
     if not _ITF_AVAILABLE:
@@ -3788,7 +3962,7 @@ def _render_trade_book_footprint() -> "html.Div":
         html.Div(LABELS.get(s, s), style={"color": COLORS.get(s, "#67e8f9"),
                  "fontWeight": "700", "fontSize": "0.58rem", "letterSpacing": "0.06em",
                  "marginBottom": "3px"}),
-        _render_intraday_tf(s),
+        _render_intraday_tf(s, asof_value, snap),
     ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {COLORS.get(s, '#67e8f9')}33"})
         for s in INDEX_SYMBOLS]
     return html.Div([head, dbc.Row(cols, className="gx-0")], style={
@@ -3895,26 +4069,38 @@ def _render_trade_book(asof_value=None) -> "html.Div":
     with _lock:
         spots = {x: dict(_latest.get(x) or {}) for x in INDEX_SYMBOLS}
 
-    # Live (now) regime forecasts — computed once per render, reused by every card.
+    # ONE market state for the whole page (L2). Every panel reads its primitives
+    # from this snapshot — the regime forecast / playbook / footprint / conductor
+    # stance are each computed once at the SELECTED instant, not 3-4x per render,
+    # and can never disagree on the instant they describe.
+    _asof = _parse_asof(asof_value)
+    snap = MarketSnapshot(_asof) if _SNAPSHOT_OK else None
     forecasts = {}
-    if _REGIME_AVAILABLE:
+    if snap is not None:
+        forecasts = {x: snap.forecast(x) for x in INDEX_SYMBOLS}
+    elif _REGIME_AVAILABLE:
         for x in INDEX_SYMBOLS:
             try:
-                forecasts[x] = regime_forecast.forecast_index(x)
+                forecasts[x] = regime_forecast.forecast_index(x, as_of=_asof)
             except Exception:
                 forecasts[x] = {}
-    regime_radar = _render_regime_radar(asof_value)
+    regime_radar = _render_regime_radar(asof_value, snap)
 
     hdr_stats = []
     if s.get("n"):
         hit = s.get("hit_rate"); avgr = s.get("avg_r")
+        net = s.get("net_avg_r"); nhit = s.get("net_hit_rate"); bps = s.get("cost_bps")
         hdr_stats = [
             html.Span(f"{s['n']} trades   ", style={"color": "#94a3b8"}),
             html.Span(f"{s['wins']}W / {s['losses']}L   ", style={"color": "#cbd5e1"}),
             html.Span(f"{hit:.0f}% hit   " if hit is not None else "",
                       style={"color": "#4ade80" if (hit or 0) >= 50 else "#f87171", "fontWeight": "700"}),
-            html.Span(f"avg {avgr:+.2f}R" if avgr is not None else "",
-                      style={"color": "#4ade80" if (avgr or 0) >= 0 else "#f87171"}),
+            html.Span(f"gross {avgr:+.2f}R" if avgr is not None else "",
+                      style={"color": "#94a3b8"}),
+            html.Span(f"   net {net:+.2f}R" if net is not None else "",
+                      style={"color": "#4ade80" if (net or 0) >= 0 else "#f87171", "fontWeight": "700"}),
+            html.Span((f" ({nhit:.0f}% @{bps:.0f}bps)" if (net is not None and nhit is not None) else ""),
+                      style={"color": "#64748b"}),
         ]
     header = html.Div([
         html.Span("📒 TRADE BOOK — TODAY   ", style={
@@ -3941,9 +4127,9 @@ def _render_trade_book(asof_value=None) -> "html.Div":
               **MONO})
 
     pred_dropdown = _prediction_dropdown(is_open=False)
-    conductor = _render_conductor()
-    footprint = _render_trade_book_footprint()
-    playbook = _render_opening_playbook(asof_value)
+    conductor = _render_conductor(asof_value, snap)
+    footprint = _render_trade_book_footprint(asof_value, snap)
+    playbook = _render_opening_playbook(asof_value, snap)
 
     if not rows:
         return html.Div([header, strat_banner, conductor, footprint, playbook, regime_radar, pred_dropdown, html.Div(
@@ -3981,6 +4167,14 @@ def _render_trade_book(asof_value=None) -> "html.Div":
 )
 def update_sidebar_trades(_):
     return _render_sidebar_trades()
+
+
+@app.callback(
+    Output("sm-footprint", "children"),
+    Input("setup-tick",    "n_intervals"),
+)
+def update_sm_footprint(_):
+    return _render_smart_money_footprint()
 
 
 @app.callback(
