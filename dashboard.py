@@ -3677,12 +3677,22 @@ def _render_conductor(asof_value=None, snap=None) -> "html.Div":
         inst = r["instrument"]; aclr = _PB_ACTION_CLR.get(inst["action"], "#94a3b8")
         strike = f" {inst['strike']:,}" if inst.get("strike") else ""
         a_hint = sig.action_hint(inst["action"])   # 'WRITE PE → sell puts · bullish'
+        # Move-quality badge: ≥2σ CONFIRMED carries forward edge; 0.7-2σ is drift
+        # (no fwd edge — the whipsaw zone). swing_classifier_backtest.py.
+        confd = bool(r.get("mom_confirmed")); zmax = r.get("zmax", 0.0)
+        badge_clr = "#22c55e" if confd else "#64748b"
+        badge_txt = f"✓ {zmax:.1f}σ" if confd else f"~ {zmax:.1f}σ drift"
         cards.append(dbc.Col([
             html.Div([
                 html.Span(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
                           "fontSize": "0.6rem", "letterSpacing": "0.06em"}),
                 html.Span(f"  {sig.arrow(dirn)} {dirn}", style={"color": dclr,
                           "fontWeight": "700", "fontSize": "0.56rem"}),
+                html.Span(badge_txt, title=("≥2σ move — has forward edge" if confd
+                          else "0.7-2σ — no forward edge, don't chase the flip"),
+                          style={"color": badge_clr, "fontSize": "0.5rem", "fontWeight": "700",
+                                 "marginLeft": "6px", "padding": "0 4px", "borderRadius": "3px",
+                                 "border": f"1px solid {badge_clr}66"}),
                 html.Span(f"{r['conviction']}%", style={"color": "#94a3b8", "fontSize": "0.54rem",
                           "marginLeft": "auto"}),
             ], style={"display": "flex", "alignItems": "center"}),

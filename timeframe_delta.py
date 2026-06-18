@@ -126,6 +126,12 @@ def _oi_delta(oi: pd.DataFrame, now_ts, T: int) -> dict:
 
 
 _Z_FLAT = 0.7        # |sigma-move| below this is indistinguishable from noise
+# Confirmation tier (swing_classifier_backtest.py, 130k bars / 4 indices): moves in
+# the 0.7-2σ band carry ZERO forward edge (1-2σ → 48.9% continue, +0.018σ over 30m) —
+# that band is exactly where the committed bias whipsaws. Forward continuation only
+# appears at |z|≥2σ (2-3σ → 51.9%, +0.077σ). So 0.7σ is "drift" (soft display arrow),
+# 2σ is "CONFIRMED" (the only tier that should flip a committed stance).
+_Z_CONFIRM = 2.0
 
 
 def _sigma_1min(ts: np.ndarray, price: np.ndarray) -> float | None:
@@ -221,8 +227,14 @@ def _synthesize(rows: list[dict], incr: dict | None = None) -> dict:
         verdict = f"ALIGNED DOWN ({dn} TF)"
     else:
         verdict = "MIXED / TRANSITION"
+    # Confirmation: a move is only "real" (forward-edge-bearing) at |z|≥2σ and when
+    # the timeframes don't disagree. The 0.7-2σ drift band is the whipsaw zone — show
+    # it, but never treat it as a committed directional break.
+    zmax = max((abs(r.get("z", 0.0)) for r in rows), default=0.0)
+    confirmed = bool(zmax >= _Z_CONFIRM and not (up and dn))
     return {"verdict": verdict, "texture": texture, "up": up, "down": dn,
-            "accel": accel, "dirs": dirs, "long_d": long_d}
+            "accel": accel, "dirs": dirs, "long_d": long_d,
+            "zmax": round(zmax, 2), "confirmed": confirmed}
 
 
 # ── Public API ──────────────────────────────────────────────────────────────────

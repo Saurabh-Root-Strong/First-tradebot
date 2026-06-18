@@ -202,22 +202,28 @@ def conduct(sym: str, current_state: str | None = None,
     breached = bool(inval and spot and (
         (cur == "LONG_DELTA" and spot < inval) or (cur == "SHORT_DELTA" and spot > inval)))
     shock = (td.get("syn", {}).get("verdict", "").startswith("FRESH"))
+    # A conviction-driven flip also needs the move to be CONFIRMED (|z|≥2σ). The
+    # 0.7-2σ drift band carries zero forward edge (swing_classifier_backtest.py), so
+    # flipping a committed stance on it is pure whipsaw cost. Hard invalidations
+    # (breach / fresh-impulse shock) still flip regardless.
+    mom_confirmed = bool(td.get("syn", {}).get("confirmed", False))
     if cur == tgt:
         transition, act_now = "HOLD", False
     elif tgt == "FLAT":
         transition, act_now = "CLOSE", (conviction >= _ENTRY_CONF or breached)
     elif cur == "FLAT":
         transition, act_now = f"OPEN {direction}", conviction >= _ENTRY_CONF
-    else:  # opposite → flip; needs the higher bar
-        confirmed = breached or shock or conviction >= _FLIP_CONF
-        transition = f"FLIP {cur}→{tgt}" if confirmed else f"CLOSE {cur} (wait to flip)"
-        act_now = confirmed
+    else:  # opposite → flip; needs the higher bar AND a confirmed move
+        flip_ok = breached or shock or (conviction >= _FLIP_CONF and mom_confirmed)
+        transition = f"FLIP {cur}→{tgt}" if flip_ok else f"CLOSE {cur} (wait to flip)"
+        act_now = flip_ok
 
     return {
         "sym": sym, "label": LABELS.get(sym, sym), "has_data": True, "now": now.strftime("%H:%M:%S"),
         "fused": round(fused, 3), "direction": direction, "conviction": conviction,
         "w_open": round(wo, 2), "target_state": tgt, "current_state": cur,
         "transition": transition, "act_now": act_now, "agree": agree,
+        "mom_confirmed": mom_confirmed, "zmax": td.get("syn", {}).get("zmax", 0.0),
         "instrument": rec, "drivers": drivers, "invalidation": inval, "spot": spot,
         "iv_regime": iv_reg, "regime_eta": (f"{rf.get('next_dir')} {rf.get('eta')}"
                     if rf.get("stage") in ("BUILDING", "IMMINENT") and rf.get("next_dir") else ""),
@@ -240,8 +246,10 @@ def _print(r: dict) -> None:
         return
     inst = r["instrument"]
     strike = f" {inst['strike']:,}" if inst.get("strike") else ""
+    move_tag = (f"CONFIRMED {r.get('zmax',0):.1f}σ" if r.get("mom_confirmed")
+                else f"drift {r.get('zmax',0):.1f}σ (<2σ — no fwd edge)")
     print(f"\n  {r['label']:<13} {_DIR_CLR[r['direction']]} {r['direction']:<5} "
-          f"conv {r['conviction']:>2}%   w_open {r['w_open']:.2f}   {r['now']}")
+          f"conv {r['conviction']:>2}%   w_open {r['w_open']:.2f}   {move_tag}   {r['now']}")
     print(f"     ACTION  {inst['action']}{strike}   ({inst['why']})")
     # evolution: opening thesis → now
     if r.get("opening_action"):
