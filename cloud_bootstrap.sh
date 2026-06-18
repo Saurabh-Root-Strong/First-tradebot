@@ -38,6 +38,10 @@ if [ ! -f .env ]; then
   read -rsp  "  Dashboard password: " PW; echo
   echo "▶ Hashing password…"
   HASH=$($SUDO docker run --rm caddy caddy hash-password --plaintext "$PW")
+  # bcrypt hashes contain '$' (e.g. $2a$14$…). docker-compose interpolates the
+  # project .env, so a literal '$' becomes a (blank) variable and CORRUPTS the
+  # hash → you'd be locked out. Escape every '$' as '$$' so compose yields it back.
+  HASH=${HASH//\$/\$\$}
   umask 077
   cat > .env <<EOF
 FYERS_APP_ID=$APP_ID

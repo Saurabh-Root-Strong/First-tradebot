@@ -77,7 +77,7 @@ def _post(url: str, payload: dict, headers: dict | None = None) -> dict:
 
 def _login_to_authcode() -> str:
     # 1. send OTP request
-    r1 = _post(f"{_VAGATOR}/send_login_otp", {"fy_id": _b64(FY_ID), "app_id": "2"})
+    r1 = _post(f"{_VAGATOR}/send_login_otp_v2", {"fy_id": _b64(FY_ID), "app_id": "2"})
     rk = r1.get("request_key")
     if not rk:
         raise RuntimeError(f"send_login_otp failed: {r1}")

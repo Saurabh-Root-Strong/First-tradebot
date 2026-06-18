@@ -80,6 +80,19 @@ docker compose logs -f tradebot        # watch it auth + connect the WebSocket
 Open **https://trade.yourdomain.com** (or `https://<VM-IP>`), enter your password →
 the live dashboard, captured on the VM, viewable from anywhere.
 
+## ⚠️ Fyers headless TOTP is currently anti-bot blocked
+As of 2026-06, Fyers' internal TOTP login endpoints reject programmatic logins
+(`code -1025 invalid request`) — confirmed from both residential and datacenter
+IPs, and widely reported in their community. So unattended `fyers_auth_headless.py`
+does **not** work right now. Use the **morning token push** instead:
+
+- Run **`morning_token.bat`** on your laptop each trading morning (before 09:00 IST):
+  it opens a browser for a normal Fyers login, then SSH-uploads the fresh
+  `access_token.txt` to the VM and restarts capture. ~20 seconds, then close the
+  laptop — the VM captures and serves all session.
+- This needs the VM's SSH open to your laptop (key-only) and `./access_token.txt`
+  mounted into the container (see `docker-compose.yml`).
+
 ## 6. Fresh token every trading morning (cron)
 A clean restart just before the open forces a fresh headless auth:
 ```bash

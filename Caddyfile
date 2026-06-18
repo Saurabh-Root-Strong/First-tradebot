@@ -3,6 +3,12 @@
 #   - or ":443"                       → Caddy serves the VM IP with an internal cert
 #                                       (browser shows a one-time "not trusted" warning)
 {$SITE_ADDRESS} {
+	# IP- or ":443"-only access (no domain): Let's Encrypt can't issue a cert for a
+	# bare IP/port, so use Caddy's internal CA (browser shows a one-time "not private"
+	# warning you click through). DELETE this line if SITE_ADDRESS is a real domain —
+	# then Caddy auto-issues a publicly-trusted Let's Encrypt cert instead.
+	tls internal
+
 	# HTTP basic auth — the password gate. BASIC_AUTH_HASH is a bcrypt hash:
 	#   docker run --rm caddy caddy hash-password --plaintext 'your-password'
 	basic_auth {
