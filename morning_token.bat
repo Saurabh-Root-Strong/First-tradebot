@@ -42,8 +42,8 @@ if errorlevel 1 ( echo  RESTART FAILED & pause & exit /b 1 )
 
 echo.
 echo [4/4] Done. The VM is now capturing with a fresh token.
-echo       Open  https://13.233.88.148   (user: admin)
+echo       Open  https://13.233.88.148.sslip.io   (user: admin)
 echo       You can close the laptop now.
 echo.
-start "" https://13.233.88.148
+start "" https://13.233.88.148.sslip.io
 pause

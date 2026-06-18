@@ -60,8 +60,12 @@ nano .env          # fill Fyers creds + SITE_ADDRESS + BASIC_AUTH_USER/HASH
 **SITE_ADDRESS**:
 - Have a domain? Point an A-record at the VM IP and set `SITE_ADDRESS=trade.yourdomain.com`
   → Caddy auto-issues a real Let's Encrypt cert. Cleanest for office access.
-- No domain? Set `SITE_ADDRESS=:443` → Caddy serves the VM IP with an internal cert
-  (browser shows a one-time "not private" warning you click through). Works fine.
+- No domain? Use the **free `sslip.io` wildcard DNS**: set
+  `SITE_ADDRESS=<your-VM-IP>.sslip.io` (e.g. `13.233.88.148.sslip.io`). It resolves
+  straight back to your IP, so Caddy gets a **real, browser-trusted Let's Encrypt
+  cert** — no warnings, works in every browser. (A bare `:443`/IP can't get a public
+  cert, and Chrome/Edge reject Caddy's self-signed IP cert with `ERR_SSL_PROTOCOL_ERROR`,
+  so prefer the sslip.io hostname.)
 
 ## 4. Verify the headless login once (before trusting the schedule)
 ```bash

@@ -32,8 +32,14 @@ if [ ! -f .env ]; then
   read -rsp  "  Fyers PIN: " PIN; echo
   read -rsp  "  Fyers TOTP base32 secret: " TOTP; echo
   read -rp   "  Redirect URI [http://127.0.0.1:8085]: " v; RURI=${v:-http://127.0.0.1:8085}
-  echo       "  Public address: a domain pointed at this VM, or ':443' to use the IP."
-  read -rp   "  SITE_ADDRESS [:443]: " v; SITE=${v:-:443}
+  # Default to <public-IP>.sslip.io — resolves back to this IP so Caddy can get a
+  # real, browser-trusted Let's Encrypt cert (a bare IP/':443' only gets a self-signed
+  # cert that Chrome/Edge reject with ERR_SSL_PROTOCOL_ERROR).
+  DEFIP=$(curl -s --max-time 5 https://api.ipify.org || true)
+  DEFSITE="${DEFIP:+${DEFIP}.sslip.io}"; DEFSITE="${DEFSITE:-:443}"
+  echo       "  Public address: your own domain pointed here, or press Enter for the"
+  echo       "  free trusted-cert default ($DEFSITE via sslip.io)."
+  read -rp   "  SITE_ADDRESS [$DEFSITE]: " v; SITE=${v:-$DEFSITE}
   read -rp   "  Dashboard username [admin]: " v; AUSER=${v:-admin}
   read -rsp  "  Dashboard password: " PW; echo
   echo "▶ Hashing password…"
