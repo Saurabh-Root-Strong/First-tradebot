@@ -46,7 +46,7 @@ try:
 except Exception:
     _NEWS_AVAILABLE = False
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+from core.constants import IST   # single source of truth  # noqa: E402
 
 
 # ── DB helper (non-blocking; lazy-import avoids circular deps) ────────────────
@@ -883,6 +883,9 @@ def build_recommendation(
     mp_score, mp_signals = _max_pain_analysis(spot, mp)
 
     # ── Layer 8: Institutional (FII futures + FAO smart-money + PE) ───────────
+    # CAVEAT: scores FII futures net SAME-direction, but fii_positioning_backtest
+    # found FII index-futures positioning is CONTRARIAN (IC −0.13/−0.16). Sign kept
+    # (bounded to 10% weight) pending an OOS-validated flip — see _b3_fii note.
     inst_score, inst_signals = get_institutional_bias(sym, spot)
 
     # ── Layer 9: Daily Context (EOD structural setup from Daily_Cash_Market) ──

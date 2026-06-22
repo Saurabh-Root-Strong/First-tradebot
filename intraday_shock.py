@@ -36,7 +36,7 @@ try:
     _STORE_AVAILABLE = True
 except Exception:                       # pragma: no cover
     _STORE_AVAILABLE = False
-    IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    from core.constants import IST   # single source of truth
 
 try:
     from signals import _fmt_oi

@@ -18,7 +18,7 @@ import pandas as pd
 # ── Config ─────────────────────────────────────────────────────────────────────
 APP_ID     = "WVDZUTO6HL-100"
 TOKEN_FILE = Path("access_token.txt")
-IST        = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+from core.constants import IST   # single source of truth  # noqa: E402
 
 HISTORY_URL = "https://api-t1.fyers.in/data/history"
 

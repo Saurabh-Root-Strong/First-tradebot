@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-IST    = ZoneInfo("Asia/Kolkata")
+from core.constants import IST   # single source of truth (fixed +5:30, no DST)
 DB_DIR = Path(__file__).parent / "data" / "intraday"
 
 try:

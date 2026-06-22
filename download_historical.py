@@ -55,7 +55,7 @@ APP_ID       = "WVDZUTO6HL-100"
 TOKEN_FILE   = Path("access_token.txt")
 DATA_DIR     = Path("data") / "historical"
 HISTORY_URL  = "https://api-t1.fyers.in/data/history"
-IST          = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+from core.constants import IST   # single source of truth  # noqa: E402
 
 # Full F&O universe (indices + stock futures) sourced from fno_universe.py.
 SYMBOLS      = ALL_SYMBOLS

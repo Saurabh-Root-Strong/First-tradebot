@@ -114,12 +114,14 @@ def report(df: pd.DataFrame, reps: int, rng) -> None:
             if len(d) < 5:
                 print(f"   {hcol:7}: n<5"); continue
             score = d["score"].to_numpy(float); ret = d[hcol].to_numpy(float)
-            ic, iclo, ichi = _boot_ci(_spearman, score, ret, reps=reps, rng=rng)
+            ic, iclo, ichi = _boot_ci(_spearman, score, ret, reps=reps, rng=rng,
+                                      groups=d["date"].to_numpy())
             act = d[d.score.abs() >= BAND]
             if len(act) >= 5:
                 call = np.sign(act["score"].to_numpy())
                 hit = (call == np.sign(act[hcol].to_numpy())).astype(float)
-                hr, hlo, hhi = _boot_ci(lambda a: a.mean(), hit, reps=reps, rng=rng)
+                hr, hlo, hhi = _boot_ci(lambda a: a.mean(), hit, reps=reps, rng=rng,
+                                        groups=act["date"].to_numpy())
                 hit_s = f"hit {100*hr:4.1f}% [{100*hlo:4.1f},{100*hhi:4.1f}] n={len(act)}"
                 hv = "EDGE" if hlo > 0.5 else ("anti" if hhi < 0.5 else "—")
             else:
@@ -128,12 +130,11 @@ def report(df: pd.DataFrame, reps: int, rng) -> None:
             print(f"   {hcol:7}: IC {ic:+.3f} [{iclo:+.3f},{ichi:+.3f}] {icv:4} | {hit_s} {hv}")
 
     print("\n" + "=" * 78)
-    print("READ: 'EDGE' = row-bootstrap 95% CI excludes null — but rows WITHIN a day")
-    print(f"share one overnight baseline + drift, so they are NOT independent. With")
-    print(f"only {len(days)} captured days, an 'EDGE' on a small bucket is almost")
-    print("certainly a small-sample / autocorrelation artifact, NOT a real signal.")
-    print("The honest unit is the DAY (~%d here). Trust nothing until a day-block" % len(days))
-    print("bootstrap over many wide-strike days agrees. Old days are ±15-strike too.")
+    print("READ: 'EDGE' = DAY-BLOCK bootstrap 95% CI excludes null. Days (not intraday")
+    print("rows) are resampled, so within-day correlation no longer fabricates")
+    print(f"significance — but with only {len(days)} captured days the CI is necessarily")
+    print("WIDE, so an 'EDGE' on a small bucket is still fragile. Trust nothing until")
+    print("the CI holds over many wide-strike days. Old days are ±15-strike too.")
 
 
 def main() -> None:

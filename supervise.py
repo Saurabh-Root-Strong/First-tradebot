@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+from core.constants import IST   # single source of truth
 HERE = Path(__file__).parent
 PY   = HERE / ".venv" / "Scripts" / "python.exe"
 PY   = PY if PY.exists() else Path(sys.executable)

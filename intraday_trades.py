@@ -31,8 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 import cost_model   # L4 transaction-cost overlay (gross R -> net R)
-
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+from core.constants import IST   # single source of truth
 _DB = Path(__file__).parent / "data" / "intraday_trades.db"
 
 # Don't re-enter the same (index, direction) within this window after a close.

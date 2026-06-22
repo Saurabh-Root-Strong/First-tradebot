@@ -28,8 +28,8 @@ from pathlib import Path
 import pandas as pd
 
 from daily_context_bridge import get_bridge
+from core.constants import IST   # single source of truth
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 HERE = Path(__file__).parent
 LIVE = HERE / "data" / "intraday" / "live"
 TODAY = datetime.datetime.now(tz=IST).date().isoformat()

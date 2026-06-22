@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-IST = ZoneInfo("Asia/Kolkata")
+from core.constants import IST   # single source of truth (fixed +5:30, no DST)
 
 # resolution name → seconds per candle
 RESOLUTIONS = {

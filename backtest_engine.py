@@ -33,6 +33,13 @@ FIDELITY GUARANTEES
     NEXT bar onward; if a bar's range spans both stop and target, the stop is taken
     first (pessimistic).
 
+FIDELITY GAP — why this is an UPPER BOUND on live
+  Live signals.fetch_ohlcv appends the FORMING (partial, still-moving) candle so the
+  dashboard reacts intra-bar. This harness scores only CLOSED bars. So live takes
+  some entries on partial-bar signals that later flip, which this backtest never
+  sees. Read any positive expectancy here as a CEILING the live engine approaches
+  from below — not a like-for-like estimate of live fills.
+
 Usage
   .venv\\Scripts\\python.exe backtest_engine.py --symbols NIFTY               # quick single
   .venv\\Scripts\\python.exe backtest_engine.py --symbols NIFTY,RELIANCE,BANKNIFTY
@@ -60,7 +67,7 @@ from fno_universe import ALL_SYMBOLS, LABELS
 
 DATA_DIR = Path("data") / "historical"
 OUT_DIR  = Path("data") / "backtest"
-IST      = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+from core.constants import IST   # single source of truth  # noqa: E402
 
 # ── Consensus config — kept IN SYNC with signals.analyze_index ──────────────────
 # (signals.py: TIMEFRAMES, weights at analyze_index, overall bands)

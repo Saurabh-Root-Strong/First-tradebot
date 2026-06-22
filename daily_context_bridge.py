@@ -1004,6 +1004,12 @@ class DailyContextBridge:
     # Layer 4 (market_data_bridge, 10% weight) already scores TODAY's FII flow.
     # B3 owns the multi-day structural trend by stripping today out, so each
     # layer measures a distinct time window with no double-count.
+    #
+    # CONTRARIAN CAVEAT (measure before flipping): fii_positioning_backtest found
+    # FII index-futures positioning is CONTRARIAN to forward Nifty (IC −0.13/−0.16,
+    # hedging-driven), i.e. the "FII buying → bullish" sign below is likely
+    # backwards. It is kept as-is (bounded: ±2 here, one of 8 ctx sub-signals) until
+    # a sign-flip is validated OOS — do NOT invert it untested.
 
     def _b3_fii(self, data: dict, signals: list) -> float:
         today_cr = data.get("fii_today_cr",    0.0) or 0.0

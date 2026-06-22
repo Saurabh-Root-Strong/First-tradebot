@@ -1757,7 +1757,9 @@ def _render_sidebar_pred() -> html.Div:
                 html.Span(f"{raw_score:+.1f}", style={
                     "color": "#334155", "fontSize": "0.48rem", **MONO,
                 }),
-                html.Span(f"  {confidence}", style={
+                html.Span(f"  {confidence}", title=(
+                    "Conviction = signal agreement × strength, NOT a win probability."),
+                    style={
                     "color": "#1e2d40", "fontSize": "0.42rem",
                 }),
             ], style={"marginBottom": "4px"}),
@@ -1989,7 +1991,11 @@ def _rp_card(sym: str, d: dict) -> dbc.Col:
             html.Span(f"{'▲' if day_pct >= 0 else '▼'} {abs(day_pct):.2f}%",
                       style={"color": "#22c55e" if day_pct >= 0 else "#ef4444",
                              "fontSize": "0.72rem", "fontWeight": "600", **MONO}),
-            html.Span(f"  {confidence} CONF", style={
+            html.Span(f"  {confidence} CONF", title=(
+                "Model confidence bucket from the DCM prediction engine. Its next-day "
+                "directional edge is weak (≈coin-flip in backtest) — read as context, "
+                "not a win rate."),
+                style={
                 "color": conf_clr, "fontSize": "0.48rem",
                 "padding": "2px 7px", "borderRadius": "3px",
                 "background": conf_bg, "border": f"1px solid {conf_clr}44",
@@ -2586,7 +2592,8 @@ def _render_signal_panel(results: dict, updated: str) -> html.Div:
                 html.Div([
                     html.Span(label, style={"color":color,"fontWeight":"800",
                                             "fontSize":"0.68rem",**MONO}),
-                    html.Span(f"  {conf:.0f}% conf",
+                    html.Span(f"  {conf:.0f}% conv",
+                              title=("Conviction = signal agreement × strength, NOT a win probability."),
                               style={"color":"#475569","fontSize":"0.55rem",**MONO}),
                 ], style={"marginBottom":"5px"}),
                 html.Div(direction, style={

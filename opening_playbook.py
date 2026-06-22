@@ -47,7 +47,7 @@ try:
 except Exception:                       # pragma: no cover
     _PANDAS = False
 
-IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+from core.constants import IST   # single source of truth  # noqa: E402
 _LIVE_DIR = Path(__file__).parent / "data" / "intraday" / "live"
 
 INDEX_SYMBOLS = [

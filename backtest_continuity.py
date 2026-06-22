@@ -176,15 +176,34 @@ def _spearman(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(rx, ry)[0, 1])
 
 
-def _boot_ci(fn, *arrs, reps: int, rng) -> tuple[float, float, float]:
+def _boot_ci(fn, *arrs, reps: int, rng, groups=None) -> tuple[float, float, float]:
+    """Bootstrap 95% CI of fn(*arrs).
+
+    `groups` (one label per row, e.g. the trading date) switches to a DAY-BLOCK
+    bootstrap: whole days are resampled with replacement, not individual rows.
+    Intraday rows within a day share one overnight baseline + the same price
+    drift, so they are NOT independent — a plain row bootstrap treats them as if
+    they were and fabricates significance. The honest sampling unit is the day.
+    """
     base = fn(*arrs)
     n = len(arrs[0])
     if n < 3:
         return base, float("nan"), float("nan")
     vals = []
-    for _ in range(reps):
-        idx = rng.integers(0, n, n)
-        vals.append(fn(*[a[idx] for a in arrs]))
+    if groups is not None:
+        g = np.asarray(groups)
+        uniq = np.unique(g)
+        if len(uniq) < 2:                       # only one day → CI is meaningless
+            return base, float("nan"), float("nan")
+        idx_by = {u: np.where(g == u)[0] for u in uniq}
+        for _ in range(reps):
+            chosen = rng.choice(uniq, size=len(uniq), replace=True)
+            idx = np.concatenate([idx_by[c] for c in chosen])
+            vals.append(fn(*[a[idx] for a in arrs]))
+    else:
+        for _ in range(reps):
+            idx = rng.integers(0, n, n)
+            vals.append(fn(*[a[idx] for a in arrs]))
     vals = np.array([v for v in vals if v == v])
     if not len(vals):
         return base, float("nan"), float("nan")
@@ -269,13 +288,15 @@ def report(df: pd.DataFrame, reps: int, rng) -> None:
                 print(f"   {hcol:7}: n<5"); continue
             score = d["score"].to_numpy(float)
             ret = d[hcol].to_numpy(float)
-            ic, iclo, ichi = _boot_ci(_spearman, score, ret, reps=reps, rng=rng)
+            ic, iclo, ichi = _boot_ci(_spearman, score, ret, reps=reps, rng=rng,
+                                      groups=d["date"].to_numpy())
             # actionable sign-hit
             act = d[d.score.abs() >= BAND]
             if len(act) >= 5:
                 call = np.sign(act["score"].to_numpy())
                 hit = (call == np.sign(act[hcol].to_numpy())).astype(float)
-                hr, hlo, hhi = _boot_ci(lambda a: a.mean(), hit, reps=reps, rng=rng)
+                hr, hlo, hhi = _boot_ci(lambda a: a.mean(), hit, reps=reps, rng=rng,
+                                        groups=act["date"].to_numpy())
                 hit_s = f"hit {100*hr:4.1f}% [{100*hlo:4.1f},{100*hhi:4.1f}] n={len(act)}"
                 hv = "EDGE" if hlo > 0.5 else ("anti" if hhi < 0.5 else "—")
             else:
@@ -296,7 +317,9 @@ def report(df: pd.DataFrame, reps: int, rng) -> None:
             print(f"      {act:13} n={int(r['count']):3}  {1e4*r['mean']:+7.1f} bps")
 
     print("\n" + "=" * 78)
-    print("READ: 'EDGE' = bootstrap 95% CI excludes the null (IC>0 / hit>50%).")
+    print("READ: 'EDGE' = DAY-BLOCK bootstrap 95% CI excludes the null (IC>0 / hit>50%).")
+    print("Days (not intraday rows) are the resampling unit, so the CI is honest about")
+    print("within-day correlation — it will be WIDE on few captured days, by design.")
     print("Small sample — a pass = wire it in capped + keep watching; a fail = keep")
     print("it as display-only context (same shelf as max pain).")
 

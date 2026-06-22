@@ -115,11 +115,13 @@ class ReplayFeed:
         return out
 
     def eod_context(self, sym: str) -> dict:
-        try:
-            from daily_context_bridge import get_bridge
-            return get_bridge().get_panel_data(sym) or {}
-        except Exception:
-            return {}
+        # LOOKAHEAD GUARD: the daily-context bridge cache is latest-only (not
+        # date-addressable), so calling it during replay would feed the engine
+        # TODAY's EOD context into a PAST day → future leak. Disable it here;
+        # Layer 9 (EOD context) degrades gracefully (build_recommendation wraps
+        # every layer in try/except). Faithful as-of replay of Layer 9 needs a
+        # date-keyed bridge read — deferred until the bridge is parameterized.
+        return {}
 
     def shock_against(self, index_sym, direction):
         return None   # intraday shock not reconstructed in replay
