@@ -40,6 +40,7 @@ from backtest_continuity import _spearman, _boot_ci
 
 SEED = 7
 SAMPLE_TIMES = ["09:40", "10:00", "10:30", "11:00"]   # >= PLAYBOOK_READY (09:35)
+HORIZONS = [15, 30, 45, 60]        # the "valid for ~15-60 min" decay test
 EOD_CUT = datetime.time(15, 25)
 # intraday-only weights (drop the lookahead-contaminated EOD factor), renormalised
 _INTRA_W = {"or": 0.20, "gap": 0.10, "oi": 0.25, "prem": 0.15, "fut": 0.10}
@@ -75,7 +76,10 @@ def collect(days: list[str]) -> pd.DataFrame:
                 spot_t = _spot_at(ticks, t)
                 if not spot_t:
                     continue
-                f60 = _spot_at(ticks, t + datetime.timedelta(minutes=60))
+                fwd = {}
+                for h in HORIZONS:
+                    fh = _spot_at(ticks, t + datetime.timedelta(minutes=h))
+                    fwd[f"fwd{h}"] = (fh / spot_t - 1.0) if (fh and fh != spot_t) else np.nan
                 feod = _spot_at(ticks, datetime.datetime.combine(d0, EOD_CUT, tzinfo=IST))
                 rows.append({
                     "date": date, "sym": sym, "t": hhmm,
@@ -83,7 +87,7 @@ def collect(days: list[str]) -> pd.DataFrame:
                     "conviction": p.get("conviction", 0), "direction": p.get("direction"),
                     **{f"f_{k}": parts.get(k, 0.0) for k in
                        ("or", "gap", "oi", "prem", "fut", "eod")},
-                    "fwd60": (f60 / spot_t - 1.0) if (f60 and f60 != spot_t) else np.nan,
+                    **fwd,
                     "fwd_eod": (feod / spot_t - 1.0) if (feod and feod != spot_t) else np.nan,
                 })
     return pd.DataFrame(rows)
@@ -108,27 +112,34 @@ def report(df: pd.DataFrame, reps: int, rng) -> None:
     print(f"  rows={len(df)}  days={len(days)} ({days[0]}..{days[-1]})  "
           f"indices={df.sym.nunique()}  samples/day~{len(SAMPLE_TIMES)}")
 
-    for hcol in ["fwd60", "fwd_eod"]:
-        print(f"\n── outcome={hcol} " + "-" * 44)
-        dates = df["date"].to_numpy()
-        print(_ic_line("composite", df["composite"].to_numpy(float), df[hcol].to_numpy(float), dates, reps, rng)
-              + "   <- full (EOD-leak optimistic)")
-        print(_ic_line("intra-only", df["intra"].to_numpy(float), df[hcol].to_numpy(float), dates, reps, rng)
-              + "  <- clean read")
-        # directional sign-hit on the actionable (non-neutral) calls
-        act = df[df.direction.isin(["BULLISH", "BEARISH"])].dropna(subset=[hcol])
+    dates = df["date"].to_numpy()
+    # ── DECAY: does the call hold for ~15-60 min then fade? (intra-only composite)
+    print("\n── HORIZON DECAY  (intra-only composite vs forward spot) " + "-" * 16)
+    for hcol in [f"fwd{h}" for h in HORIZONS] + ["fwd_eod"]:
+        d = df.dropna(subset=[hcol])
+        if len(d) < 5 or d["date"].nunique() < 2:
+            print(f"   {hcol:8} n<5"); continue
+        ic, ilo, ihi = _boot_ci(_spearman, d["intra"].to_numpy(float),
+                                d[hcol].to_numpy(float), reps=reps, rng=rng,
+                                groups=d["date"].to_numpy())
+        act = d[d.direction.isin(["BULLISH", "BEARISH"])]
         if len(act) >= 5 and act["date"].nunique() >= 2:
             call = np.where(act.direction == "BULLISH", 1.0, -1.0)
             hit = (call == np.sign(act[hcol].to_numpy())).astype(float)
-            hr, lo, hi = _boot_ci(lambda a: a.mean(), hit, reps=reps, rng=rng,
-                                  groups=act["date"].to_numpy())
-            v = "EDGE" if lo > 0.5 else ("anti" if hi < 0.5 else "—")
-            print(f"   dir-hit   : {100*hr:4.1f}% [{100*lo:4.1f},{100*hi:4.1f}] {v}  (n={len(act)})")
-        print("   per-factor IC:")
-        for k in ("or", "gap", "oi", "prem", "fut", "eod"):
-            tag = " (leak)" if k == "eod" else ""
-            print("    " + _ic_line(k, df[f"f_{k}"].to_numpy(float),
-                                    df[hcol].to_numpy(float), dates, reps, rng).strip() + tag)
+            hr, hlo, hhi = _boot_ci(lambda a: a.mean(), hit, reps=reps, rng=rng,
+                                    groups=act["date"].to_numpy())
+            hs = f"dir-hit {100*hr:4.1f}% [{100*hlo:4.0f},{100*hhi:4.0f}] n={len(act)}"
+        else:
+            hs = "dir-hit n<5"
+        flag = "EDGE" if ilo > 0 else ("anti" if ihi < 0 else "—")
+        print(f"   {hcol:8} IC {ic:+.3f} [{ilo:+.3f},{ihi:+.3f}] {flag:4}  {hs}")
+
+    # ── per-factor IC at the short horizon the user cares about (30 min)
+    print("\n── per-factor IC @ fwd30 " + "-" * 30)
+    for k in ("or", "gap", "oi", "prem", "fut", "eod"):
+        tag = " (leak)" if k == "eod" else ""
+        print(_ic_line(k, df[f"f_{k}"].to_numpy(float),
+                       df["fwd30"].to_numpy(float), dates, reps, rng) + tag)
 
     print("\n" + "=" * 74)
     print("READ: 'EDGE' = day-block 95% CI excludes null. With few captured days the")
