@@ -59,7 +59,8 @@ def collect(days: list[str], con, walls: dict) -> pd.DataFrame:
                     sm = feed.strike_map(sym)
                     if not spot or not sm:
                         continue
-                    r = orc.analyze_reconciliation(sm, spot, baseline, gap=gap)
+                    anchor = feed.pa_anchor(sym)   # session open (volume-free trend ref)
+                    r = orc.analyze_reconciliation(sm, spot, baseline, gap=gap, vwap=anchor)
                     if not r.has_data:
                         continue
                     fwd = {}
@@ -79,6 +80,7 @@ def collect(days: list[str], con, walls: dict) -> pd.DataFrame:
                         "date": date, "sym": sym, "t": hhmm, "gap": gap,
                         "score": r.score, "verdict": r.verdict,
                         "regime_shift": r.regime_shift, "n_strikes": len(r.rows),
+                        "pa_dir": r.pa_dir, "pa_confirmed": r.pa_confirmed,
                         "fwd30": fwd.get(30, np.nan), "fwd60": fwd.get(60, np.nan),
                         "fwd_eod": fwd_eod,
                     })
@@ -99,6 +101,8 @@ def report(df: pd.DataFrame, reps: int, rng) -> None:
     print(f"  actionable band |score|>={BAND}")
 
     subsets = [("ALL", df),
+               ("PA-CONFIRMED (score agrees w/ VWAP)", df[df.pa_confirmed]),
+               ("PA-DIVERGENT (score vs VWAP)", df[(df.score.abs() >= BAND) & (~df.pa_confirmed) & (df.pa_dir != 0)]),
                (f"GAP (|gap|>{GAP_THRESH*100:.2f}%)", df[df.gap.abs() > GAP_THRESH]),
                ("REGIME-SHIFT", df[df.regime_shift])]
     for label, sub in subsets:
@@ -124,8 +128,12 @@ def report(df: pd.DataFrame, reps: int, rng) -> None:
             print(f"   {hcol:7}: IC {ic:+.3f} [{iclo:+.3f},{ichi:+.3f}] {icv:4} | {hit_s} {hv}")
 
     print("\n" + "=" * 78)
-    print("READ: 'EDGE' = bootstrap 95% CI excludes the null. Old captured days only")
-    print("have ±15 strikes (floor walls clipped) — re-run as wide-strike days accrue.")
+    print("READ: 'EDGE' = row-bootstrap 95% CI excludes null — but rows WITHIN a day")
+    print(f"share one overnight baseline + drift, so they are NOT independent. With")
+    print(f"only {len(days)} captured days, an 'EDGE' on a small bucket is almost")
+    print("certainly a small-sample / autocorrelation artifact, NOT a real signal.")
+    print("The honest unit is the DAY (~%d here). Trust nothing until a day-block" % len(days))
+    print("bootstrap over many wide-strike days agrees. Old days are ±15-strike too.")
 
 
 def main() -> None:

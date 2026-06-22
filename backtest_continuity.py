@@ -88,6 +88,15 @@ class DuckFeed:
             "order by ts desc limit 1", [sym, self._te]).fetchone()
         return float(r[0]) if r and r[0] is not None else 0.0
 
+    def pa_anchor(self, sym: str) -> float:
+        """Price-action anchor = the session OPEN. Indices carry no traded volume
+        (tick_vol is 0), so VWAP is undefined; spot vs the day's open (green/red)
+        is the robust volume-free trend reference."""
+        r = self.con.execute(
+            "select any_value(day_open) from ticks where symbol=? and epoch(ts)<=?",
+            [sym, self._te]).fetchone()
+        return float(r[0]) if r and r[0] is not None else 0.0
+
     def strike_map(self, sym: str) -> dict:
         ts = self.con.execute(
             "select max(epoch(ts)) from chain_snapshots where symbol=? and epoch(ts)<=?",

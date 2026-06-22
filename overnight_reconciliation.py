@@ -78,6 +78,8 @@ class ReconResult:
     score:         float = 0.0          # [-4, +4]
     regime_shift:  bool = False
     overnight_bias: int = 0             # +1 if floors > ceilings overnight, etc.
+    pa_dir:        int = 0              # price-action direction at read time (+1/-1/0)
+    pa_confirmed:  bool = False         # OI score agrees with price action
     verdict:       str = "NEUTRAL"
     headline:      str = ""
     note:          str = ""
@@ -143,12 +145,17 @@ def _classify_effect(leg: str, today_oich: float, today_ltpch: float,
 
 
 def analyze_reconciliation(strike_map: dict, spot: float, baseline: dict,
-                           gap: float = 0.0) -> ReconResult:
+                           gap: float = 0.0, vwap: float = 0.0) -> ReconResult:
     """Reconcile today's live per-strike oich against last night's positioned map.
 
     strike_map : {strike: {"CE": {oich, ltpch, oi, volume}, "PE": {...}}}  (live)
     baseline   : output of eod_baseline()                                   (frozen)
     gap        : (open - prev_close)/prev_close, for the regime-shift gate.
+    vwap       : session VWAP — price-action anchor. When given, the OI verdict
+                 is flagged pa_confirmed only if spot sits the right side of VWAP
+                 (above for bullish, below for bearish), and a regime shift further
+                 requires that confirmation (OI saying 'shift' while price fades =
+                 likely trap, so we don't confirm it).
     """
     res = ReconResult(spot=spot, gap=gap)
     if not strike_map or not spot or not baseline:
@@ -206,15 +213,23 @@ def analyze_reconciliation(strike_map: dict, spot: float, baseline: dict,
     res.score = round(max(-4.0, min(4.0, score * 1.5)), 2)
     res.overnight_bias = 1 if floor_w > ceil_w else (-1 if ceil_w > floor_w else 0)
 
+    # price-action confirmation: spot vs session VWAP must agree with the OI score
+    s = res.score
+    if vwap and spot:
+        res.pa_dir = 1 if spot > vwap else (-1 if spot < vwap else 0)
+    score_dir = 1 if s >= _NEUTRAL_BAND else (-1 if s <= -_NEUTRAL_BAND else 0)
+    res.pa_confirmed = bool(score_dir != 0 and res.pa_dir == score_dir)
+
     # regime shift: gap contradicts overnight bias AND contradicted side abandoned
+    # AND (when VWAP supplied) price action confirms the new direction — no trap.
     if abs(gap) >= _GAP_MIN and res.overnight_bias != 0:
         gap_dir = 1 if gap > 0 else -1
         contradicts = gap_dir != res.overnight_bias
         abandoned_net = sum(r.contrib for r in rows if r.effect == "ABANDONED")
-        if contradicts and (abandoned_net * gap_dir) > 0:
+        pa_ok = (res.pa_dir == gap_dir) if vwap else True
+        if contradicts and (abandoned_net * gap_dir) > 0 and pa_ok:
             res.regime_shift = True
 
-    s = res.score
     res.verdict = "BULLISH" if s >= _NEUTRAL_BAND else "BEARISH" if s <= -_NEUTRAL_BAND else "NEUTRAL"
     res.headline = _headline(res)
     return res

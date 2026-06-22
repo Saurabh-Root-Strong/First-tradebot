@@ -3689,7 +3689,7 @@ def _render_opening_playbook(asof_value=None, snap=None) -> "html.Div":
     head = html.Div([
         html.Span("⚡ OPENING PLAYBOOK", style={"color": "#fbbf24", "fontWeight": "700",
                   "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
-        html.Span("  first-20-min F&O read · OI · premium · basis · EOD memory",
+        html.Span("  first-20-min F&O read · OI · premium · basis · EOD memory · % = conviction, not win-rate",
                   style={"color": "#64748b", "fontSize": "0.55rem"}),
         html.Span(f"  · {pb.get('coherence', '')}", style={"color": "#94a3b8", "fontSize": "0.55rem"}),
     ], style={"marginBottom": "6px"})
@@ -3715,7 +3715,10 @@ def _render_opening_playbook(asof_value=None, snap=None) -> "html.Div":
             html.Div([
                 html.Span(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
                           "fontSize": "0.6rem", "letterSpacing": "0.06em"}),
-                html.Span(f" {p['conviction']}%", style={"color": "#94a3b8", "fontSize": "0.55rem"}),
+                html.Span(f" {p['conviction']}% conv",
+                          title="Conviction = weighted agreement of OR/gap/OI/premium/futures/EOD "
+                                "factors. NOT a win probability — unvalidated for forward edge.",
+                          style={"color": "#94a3b8", "fontSize": "0.55rem"}),
                 html.Span(dtag, style={"color": dclr, "fontWeight": "700",
                           "fontSize": "0.52rem", "marginLeft": "auto"}),
             ], style={"display": "flex", "alignItems": "center"}),
@@ -3777,7 +3780,8 @@ def _render_conductor(asof_value=None, snap=None) -> "html.Div":
         html.Span("🎛 SESSION CONDUCTOR", style={"color": "#a78bfa", "fontWeight": "700",
                   "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
         html.Span("  fused stance — opening thesis (decaying) ⊕ regime ⊕ momentum ⊕ OI"
-                  "  ·  decision-support", style={"color": "#64748b", "fontSize": "0.55rem"}),
+                  "  ·  decision-support · % = conviction (signal agreement), NOT win-rate",
+                  style={"color": "#64748b", "fontSize": "0.55rem"}),
     ], style={"marginBottom": "6px"})
 
     cards = []
@@ -3810,8 +3814,11 @@ def _render_conductor(asof_value=None, snap=None) -> "html.Div":
                           style={"color": badge_clr, "fontSize": "0.5rem", "fontWeight": "700",
                                  "marginLeft": "6px", "padding": "0 4px", "borderRadius": "3px",
                                  "border": f"1px solid {badge_clr}66"}),
-                html.Span(f"{r['conviction']}%", style={"color": "#94a3b8", "fontSize": "0.54rem",
-                          "marginLeft": "auto"}),
+                html.Span(f"{r['conviction']}% conv",
+                          title="Conviction = agreement across opening thesis ⊕ regime ⊕ momentum ⊕ OI. "
+                                "NOT a win probability — this fused layer has no measured forward edge "
+                                "(conductor_replay.py validates stability only).",
+                          style={"color": "#94a3b8", "fontSize": "0.54rem", "marginLeft": "auto"}),
             ], style={"display": "flex", "alignItems": "center"}),
             html.Div([
                 html.Span(f"{inst['action']}{strike}", style={"color": aclr, "fontWeight": "700",
