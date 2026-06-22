@@ -4778,60 +4778,73 @@ def _update_news_panel(date, _n):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import os, webbrowser
+    # VIEWER MODE (DASH_VIEWER=1): a read-only client. Starts NO capture threads —
+    # no WebSocket, no pollers, no mirror writes — so it never CLOBBERS the parquet
+    # mirrors synced from the VM (sync_from_vm.py). This splits the capturer role
+    # (VM, 24/7) from the viewer role (a part-time laptop), so the laptop sees the
+    # VM's full session instead of overwriting it with its own partial capture.
+    VIEWER = os.environ.get("DASH_VIEWER") == "1"
+
     print(SEP)
-    print("  NSE INDEX LIVE DASHBOARD  +  OPTION CHAIN")
+    print("  NSE INDEX " + ("VIEWER (read-only, synced mirrors)" if VIEWER
+                            else "LIVE DASHBOARD  +  OPTION CHAIN"))
     print(SEP)
 
-    raw_token     = _validate_token()
-    _access_token = raw_token
+    if VIEWER:
+        print("  VIEWER MODE — capture disabled. Reading data/intraday/live/ mirrors.")
+        print("  Refresh them from the VM with:  python sync_from_vm.py  (or --watch).")
+    else:
+        raw_token     = _validate_token()
+        _access_token = raw_token
 
-    threading.Thread(
-        target=_start_ws, args=(f"{APP_ID}:{raw_token}",),
-        daemon=True, name="ws",
-    ).start()
-    print("  WebSocket started — connecting...")
-
-    threading.Thread(
-        target=_oi_background_poller,
-        daemon=True, name="oi-poller",
-    ).start()
-    print("  OI snapshot poller started — 30s intervals")
-
-    # NSE intraday futures-OI poller (Fyers doesn't serve it). May 403 from a
-    # datacenter IP — degrades gracefully (the panel just omits futures OI).
-    # 60s poll + timestamp-dedupe → catches each NSE refresh without storing dups.
-    if _NSE_OI_AVAILABLE:
         threading.Thread(
-            target=lambda: nse_oi.poll_loop(60),
-            daemon=True, name="nse-oi",
+            target=_start_ws, args=(f"{APP_ID}:{raw_token}",),
+            daemon=True, name="ws",
         ).start()
-        print("  NSE futures-OI poller started — 60s intervals")
+        print("  WebSocket started — connecting...")
 
-    threading.Thread(
-        target=_trade_tracker_poller,
-        daemon=True, name="trade-tracker",
-    ).start()
-    print("  Trade tracker started — paper-trade outcomes every 20s")
-
-    threading.Thread(
-        target=_auto_signal_poller,
-        daemon=True, name="auto-signal",
-    ).start()
-    print("  Auto signal eval started — all 4 indices every 60s")
-
-    # News / event-impact poller — NSE filings + RBI releases, scored to −10..+10.
-    # All-day window (filings land pre-open/post-close); may 403 from a datacenter IP.
-    if _NEWS_AVAILABLE:
         threading.Thread(
-            target=lambda: news_events.poll_loop(60),
-            daemon=True, name="news",
+            target=_oi_background_poller,
+            daemon=True, name="oi-poller",
         ).start()
-        print("  News/event poller started — 60s intervals")
+        print("  OI snapshot poller started — 30s intervals")
 
-    threading.Thread(
-        target=_heartbeat_writer,
-        daemon=True, name="heartbeat",
-    ).start()
+        # NSE intraday futures-OI poller (Fyers doesn't serve it). May 403 from a
+        # datacenter IP — degrades gracefully (the panel just omits futures OI).
+        # 60s poll + timestamp-dedupe → catches each NSE refresh without storing dups.
+        if _NSE_OI_AVAILABLE:
+            threading.Thread(
+                target=lambda: nse_oi.poll_loop(60),
+                daemon=True, name="nse-oi",
+            ).start()
+            print("  NSE futures-OI poller started — 60s intervals")
+
+        threading.Thread(
+            target=_trade_tracker_poller,
+            daemon=True, name="trade-tracker",
+        ).start()
+        print("  Trade tracker started — paper-trade outcomes every 20s")
+
+        threading.Thread(
+            target=_auto_signal_poller,
+            daemon=True, name="auto-signal",
+        ).start()
+        print("  Auto signal eval started — all 4 indices every 60s")
+
+        # News / event-impact poller — NSE filings + RBI releases, scored to −10..+10.
+        # All-day window (filings land pre-open/post-close); may 403 from a datacenter IP.
+        if _NEWS_AVAILABLE:
+            threading.Thread(
+                target=lambda: news_events.poll_loop(60),
+                daemon=True, name="news",
+            ).start()
+            print("  News/event poller started — 60s intervals")
+
+        threading.Thread(
+            target=_heartbeat_writer,
+            daemon=True, name="heartbeat",
+        ).start()
 
     print(f"  Open  →  http://127.0.0.1:8050")
     print(SEP)
@@ -4839,7 +4852,6 @@ if __name__ == "__main__":
     # Auto-open the dashboard in the default browser once the server is up.
     # Suppressed via TRADEBOT_NO_BROWSER=1 (the supervisor sets it on auto-restarts
     # so a crash/WS-stall recovery doesn't spawn a fresh tab each time).
-    import os, webbrowser
     if not os.environ.get("TRADEBOT_NO_BROWSER"):
         threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
 
