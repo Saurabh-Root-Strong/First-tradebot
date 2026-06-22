@@ -3589,9 +3589,11 @@ def _render_opening_playbook(asof_value=None, snap=None) -> "html.Div":
              "X/4 bullish (header) = breadth: how many indices agree.",
              "wrong below/above N = invalidation level.",
              "why & factors = click for the per-factor breakdown + flip alert.",
-             "Backtest (7 days, backtest_playbook.py): hold it ~30–60 min then re-assess — EOD is the WORST "
-             "horizon (the call decays). OI flow is the strongest factor; OR/gap fade (breakouts & gaps "
-             "mean-revert by close).",
+             "BEST horizon: 30–60 min after the 9:35 call (highest hit-rate ~60%). WORST: holding to EOD "
+             "(decayed, points slightly wrong) and the first <15 min (still a coin-flip).",
+             "Strongest factor = OI flow; OR/gap are weakest (breakouts & gaps mean-revert by close).",
+             "LESS RELIABLE: after ~11am (call is stale), low % conv, NEUTRAL / NO-TRADE reads, while "
+             "'warming up' (thin capture), and on big-gap / breakout days (those tend to fade).",
              "OI walls are NOT intraday targets (level_touch_backtest.py): the nearest call/put wall sits "
              "~4.8σ away and is touched at/BELOW random-walk chance — read walls as context, not a level to aim at."],
             "Decision-support; forward edge UNPROVEN on 7 days (short-horizon dir-hit ~60% but the CI still "
