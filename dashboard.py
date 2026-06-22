@@ -3582,15 +3582,21 @@ def _render_opening_playbook(asof_value=None, snap=None) -> "html.Div":
         _panel_help(
             "The first-20-min F&O morning call. The open (gap, opening range, first OI flow, ATM "
             "premium, last-night EOD) sets the day's structure → it issues ONE concrete morning "
-            "trade. Sharp ~9:40, stale by ~11.",
+            "trade. A SHORT-horizon read: sharpest ~9:40, best held 30–60 min, gone by close.",
             ["% conv = weighted agreement of OR/gap/OI/premium/futures/EOD. NOT a win-rate.",
              "BULLISH / BEARISH / NEUTRAL = direction.",
              "WRITE PE = sell puts (bullish, collect premium when IV is pumped); BUY CE = pay for the call.",
              "X/4 bullish (header) = breadth: how many indices agree.",
              "wrong below/above N = invalidation level.",
-             "why & factors = click for the per-factor breakdown + flip alert."],
-            "Decision-support; standalone edge unvalidated. The Conductor consumes this — so they "
-            "agree by design (one signal, two views, not two confirmations)."),
+             "why & factors = click for the per-factor breakdown + flip alert.",
+             "Backtest (7 days, backtest_playbook.py): hold it ~30–60 min then re-assess — EOD is the WORST "
+             "horizon (the call decays). OI flow is the strongest factor; OR/gap fade (breakouts & gaps "
+             "mean-revert by close).",
+             "OI walls are NOT intraday targets (level_touch_backtest.py): the nearest call/put wall sits "
+             "~4.8σ away and is touched at/BELOW random-walk chance — read walls as context, not a level to aim at."],
+            "Decision-support; forward edge UNPROVEN on 7 days (short-horizon dir-hit ~60% but the CI still "
+            "straddles 50%). Read it as a STRUCTURE MAP — gap / range / who's-writing / invalidation — not a "
+            "direction or target bet. The Conductor consumes this (one signal, two views, not two confirmations)."),
     ], style={"marginBottom": "6px"})
 
     cards = []
