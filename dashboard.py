@@ -12,9 +12,11 @@ from collections import deque
 import requests
 import pandas as pd
 import dash
-from dash import dcc, html, Input, Output, State, no_update
+from dash import dcc, html, Input, Output, State, no_update, ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import footprint_chart   # full-session OI/Volume/ATM-premium series for the popup chart
 from fyers_apiv3.FyersWebsocket import data_ws
 from signals import run_full_analysis, fetch_ohlcv, _vwap
 from trade_setup import build_recommendation, TF_PROFILES
@@ -1388,6 +1390,12 @@ app.layout = dbc.Container([
     # is rendered dynamically inside the Trade Book, and a callback may not use a
     # dynamically-created component as an Input before it exists in the DOM.
     dcc.Store(id="regime-asof", data="now"),
+
+    # Click-to-popup footprint chart (OI · volume · ATM premium per timeframe)
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("", id="fp-modal-title"), close_button=True),
+        dbc.ModalBody(dcc.Graph(id="fp-modal-graph", config={"displayModeBar": False})),
+    ], id="fp-modal", is_open=False, size="xl", scrollable=True),
 
     # Intervals
     dcc.Interval(id="fast-tick",   interval=1000,  n_intervals=0),
@@ -3862,7 +3870,51 @@ def _render_index_trades(sym) -> "html.Div":
     return html.Div(items)
 
 
-def _render_intraday_tf(sym, asof_value=None, snap=None) -> "html.Div":
+def _footprint_fig(sym, tf_min: int, asof_value=None) -> "go.Figure":
+    """3-panel popup chart for one index/timeframe: ATM-straddle premium, CE/PE OI,
+    traded volume — full session, tf-minute bars, with the clicked window shaded."""
+    d = footprint_chart.build_series(sym, int(tf_min), as_of=_parse_asof(asof_value))
+    if not d.get("has_data"):
+        fig = go.Figure()
+        fig.add_annotation(text=d.get("note", "no data"), showarrow=False,
+                           font=dict(color="#64748b", size=13))
+        fig.update_layout(template="plotly_dark", height=300,
+                          paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD,
+                          xaxis=dict(visible=False), yaxis=dict(visible=False))
+        return fig
+    ts = d["ts"]
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        row_heights=[0.40, 0.34, 0.26],
+        subplot_titles=("ATM straddle premium (₹)", "Option OI — CE vs PE (lakh)",
+                        "Traded option volume per bar (lakh)"))
+    fig.add_trace(go.Scatter(x=ts, y=d["premium"], mode="lines", name="ATM straddle",
+                             line=dict(color="#fbbf24", width=2),
+                             connectgaps=True), row=1, col=1)
+    fig.add_trace(go.Scatter(x=ts, y=d["oi_ce"], mode="lines", name="CE OI (ceiling)",
+                             line=dict(color="#ef4444", width=1.6)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=ts, y=d["oi_pe"], mode="lines", name="PE OI (floor)",
+                             line=dict(color="#22c55e", width=1.6)), row=2, col=1)
+    fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
+                         marker_color="#22d3ee", opacity=0.75), row=3, col=1)
+    # Shade the clicked lookback window (the delta the footprint row reports).
+    if d.get("last_ts"):
+        x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
+        for rr in (1, 2, 3):
+            fig.add_vrect(x0=x0, x1=d["last_ts"], fillcolor="#67e8f9",
+                          opacity=0.08, line_width=0, row=rr, col=1)
+    fig.update_layout(template="plotly_dark", height=640,
+                      margin=dict(l=54, r=18, t=46, b=28),
+                      paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD,
+                      bargap=0.15, showlegend=True,
+                      legend=dict(orientation="h", y=1.10, x=0, font=dict(size=9)),
+                      font=dict(size=10))
+    for a in fig["layout"]["annotations"]:        # subplot titles
+        a["font"] = dict(size=11, color="#94a3b8")
+    return fig
+
+
+def _render_intraday_tf(sym, asof_value=None, snap=None, clickable=False) -> "html.Div":
     """Per-timeframe OI·Price·Volume matrix + divergence flags for one index.
     Shows whether each 5/10/15/60-min frame is fresh buildup or positions CLOSING,
     so a rally on closing (distribution) or hidden call-writing is visible early.
@@ -3913,12 +3965,17 @@ def _render_intraday_tf(sym, asof_value=None, snap=None) -> "html.Div":
             trail = [html.Div(("★ stack: " if grade == "aligned" else "✓ ")
                               + " · ".join(c["confirms"]),
                               style={"color": tclr2, "fontSize": "0.46rem", "opacity": 0.85})]
+        row_kw: dict = {}
+        if clickable:
+            row_kw["id"] = {"type": "fp-tf", "sym": sym, "tf": c["tf"]}
+            row_kw["n_clicks"] = 0
         rows.append(html.Div([
             html.Div([
                 html.Span(f"{c['tf']}m", style={"color": "#cbd5e1", "fontWeight": "700",
                           "fontSize": "0.58rem", "minWidth": "26px", "display": "inline-block"}),
                 html.Span(f"{parr}{c['px']:+.2f}%", style={"color": pcl, "fontSize": "0.58rem"}),
                 html.Span(f" {z:+.1f}σ", style={"color": "#475569", "fontSize": "0.5rem"}),
+                html.Span("  📈" if clickable else "", style={"fontSize": "0.5rem", "opacity": 0.6}),
                 html.Span(f"  {tag_txt}", style=tag_style),
             ], style={"display": "flex", "alignItems": "center"}),
             html.Div([
@@ -3929,8 +3986,9 @@ def _render_intraday_tf(sym, asof_value=None, snap=None) -> "html.Div":
                           style={"fontSize": "0.5rem"}),
             ], style={"display": "flex", "justifyContent": "space-between"}),
             *trail,
-        ], title=_tf_tooltip(c),
-           style={"padding": "4px 0", "borderBottom": "1px solid #111d2e", "cursor": "help"}))
+        ], title=(_tf_tooltip(c) + ("  ·  click → OI/volume/premium chart" if clickable else "")),
+           style={"padding": "4px 0", "borderBottom": "1px solid #111d2e",
+                  "cursor": "pointer" if clickable else "help"}, **row_kw))
 
     # Greyed placeholders for timeframes that can't be computed yet (their lookback
     # predates capture-start). Shows the slot is warming up + when it unlocks, rather
@@ -4013,7 +4071,7 @@ def _render_trade_book_footprint(asof_value=None, snap=None) -> "html.Div":
         html.Div(LABELS.get(s, s), style={"color": COLORS.get(s, "#67e8f9"),
                  "fontWeight": "700", "fontSize": "0.58rem", "letterSpacing": "0.06em",
                  "marginBottom": "3px"}),
-        _render_intraday_tf(s, asof_value, snap),
+        _render_intraday_tf(s, asof_value, snap, clickable=True),
     ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {COLORS.get(s, '#67e8f9')}33"})
         for s in INDEX_SYMBOLS]
     return html.Div([head, dbc.Row(cols, className="gx-0")], style={
@@ -4405,6 +4463,34 @@ def _render_liveoi(sym: str) -> "html.Div":
         g(f1), g(f2), g(f3),
     ], style={"background": BG_CARD, "border": "1px solid #111d2e",
               "borderRadius": "10px", "padding": "14px 16px"})
+
+
+@app.callback(
+    Output("fp-modal",       "is_open"),
+    Output("fp-modal-graph", "figure"),
+    Output("fp-modal-title", "children"),
+    Input({"type": "fp-tf", "sym": ALL, "tf": ALL}, "n_clicks"),
+    State("regime-asof", "data"),
+    prevent_initial_call=True,
+)
+def open_footprint_modal(clicks, asof_value):
+    # A footprint TF row was clicked -> pop the OI/volume/premium chart for that
+    # (index, timeframe). triggered_id carries which row; ignore the initial/no-op
+    # fire where every n_clicks is still 0/None.
+    if not clicks or not any(clicks):
+        return no_update, no_update, no_update
+    trig = dash.callback_context.triggered
+    pid = trig[0]["prop_id"].rsplit(".n_clicks", 1)[0] if trig else ""
+    if not pid:
+        return no_update, no_update, no_update
+    try:
+        ident = json.loads(pid)
+        sym, tf = ident["sym"], int(ident["tf"])
+    except Exception:
+        return no_update, no_update, no_update
+    fig = _footprint_fig(sym, tf, asof_value)
+    title = f"{LABELS.get(sym, sym)} · {tf}m footprint — ATM premium · OI · volume"
+    return True, fig, title
 
 
 @app.callback(
