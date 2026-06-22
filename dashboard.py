@@ -3607,6 +3607,27 @@ def _regime_risk_badge(t, fc=None):
         "border": f"1px solid {clr}66", "borderRadius": "3px", "padding": "3px 5px"})
 
 
+def _panel_help(what: str, read: list[str], caveat: str = "") -> "html.Details":
+    """A click-to-open, scrollable 'what is this / how to read / why' explainer
+    embedded in a panel heading. Keeps the surface clean; the full plain-English
+    guide is one click away (and survives on mobile — it's a real expander, not a
+    hover tooltip)."""
+    body = [html.Div(what, style={"color": "#cbd5e1", "fontSize": "0.56rem",
+                                  "lineHeight": "1.5", "marginBottom": "5px", "whiteSpace": "normal"})]
+    body += [html.Div("• " + r, style={"color": "#94a3b8", "fontSize": "0.54rem",
+                                       "lineHeight": "1.5", "whiteSpace": "normal"}) for r in read]
+    if caveat:
+        body.append(html.Div("⚠ " + caveat, style={"color": "#fbbf24", "fontSize": "0.54rem",
+                    "lineHeight": "1.45", "marginTop": "5px", "whiteSpace": "normal"}))
+    return html.Details([
+        html.Summary("ℹ what is this · how to read", style={
+            "color": "#67e8f9", "fontSize": "0.54rem", "cursor": "pointer", "marginLeft": "8px"}),
+        html.Div(body, style={"maxHeight": "230px", "overflowY": "auto", "marginTop": "5px",
+                 "padding": "7px 9px", "background": "#0a0f1a", "border": "1px solid #1e2d40",
+                 "borderRadius": "4px", "maxWidth": "640px"}),
+    ], style={"display": "inline-block", "verticalAlign": "middle"})
+
+
 def _render_regime_radar(asof_value=None, snap=None) -> "html.Div":
     """
     Forward-looking Regime Radar with a 30-min time-machine dropdown.
@@ -3631,7 +3652,16 @@ def _render_regime_radar(asof_value=None, snap=None) -> "html.Div":
         html.Span("  forecast as of", style={"color": "#64748b", "fontSize": "0.55rem"}),
         dcc.Dropdown(id="regime-checkpoint", options=opts, value=val, clearable=False,
                      style={"width": "130px", "fontSize": "0.62rem", "color": "#0b1320"}),
-    ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "6px"})
+        _panel_help(
+            "Per-index regime label + stability + a forecast of the next shift. The 'what mode is "
+            "the market in' layer (trend vs chop, holding vs turning).",
+            ["MARKET … = overall regime + breadth (how many of 4 indices agree).",
+             "per index: regime (BULLISH/BEARISH/NEUTRAL) + STABLE (holding) or BUILDING → X (shifting, with ~ETA).",
+             "the 'as of' dropdown = a time machine — rewind ALL trade-book panels to a past instant.",
+             "switch back to 'Now (live)' to return to real-time."],
+            "Regime is a label, not a direction call. No standalone edge — use it to frame, not to enter."),
+    ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "6px",
+              "flexWrap": "wrap"})
 
     if not m.get("has_data"):
         body = html.Div("Regime data warming up — need ~12 min of snapshots.",
@@ -3692,6 +3722,18 @@ def _render_opening_playbook(asof_value=None, snap=None) -> "html.Div":
         html.Span("  first-20-min F&O read · OI · premium · basis · EOD memory · % = conviction, not win-rate",
                   style={"color": "#64748b", "fontSize": "0.55rem"}),
         html.Span(f"  · {pb.get('coherence', '')}", style={"color": "#94a3b8", "fontSize": "0.55rem"}),
+        _panel_help(
+            "The first-20-min F&O morning call. The open (gap, opening range, first OI flow, ATM "
+            "premium, last-night EOD) sets the day's structure → it issues ONE concrete morning "
+            "trade. Sharp ~9:40, stale by ~11.",
+            ["% conv = weighted agreement of OR/gap/OI/premium/futures/EOD. NOT a win-rate.",
+             "BULLISH / BEARISH / NEUTRAL = direction.",
+             "WRITE PE = sell puts (bullish, collect premium when IV is pumped); BUY CE = pay for the call.",
+             "X/4 bullish (header) = breadth: how many indices agree.",
+             "wrong below/above N = invalidation level.",
+             "why & factors = click for the per-factor breakdown + flip alert."],
+            "Decision-support; standalone edge unvalidated. The Conductor consumes this — so they "
+            "agree by design (one signal, two views, not two confirmations)."),
     ], style={"marginBottom": "6px"})
 
     cards = []
@@ -3782,6 +3824,21 @@ def _render_conductor(asof_value=None, snap=None) -> "html.Div":
         html.Span("  fused stance — opening thesis (decaying) ⊕ regime ⊕ momentum ⊕ OI"
                   "  ·  decision-support · % = conviction (signal agreement), NOT win-rate",
                   style={"color": "#64748b", "fontSize": "0.55rem"}),
+        _panel_help(
+            "ONE evolving stance per index, all session. Fuses the opening call (fading by "
+            "~11am) + live regime + momentum + OI into a single 'where are we now' directive — "
+            "the Opening Playbook kept current instead of going stale.",
+            ["LONG / SHORT / FLAT = net directional stance.",
+             "~0.9σ drift vs ✓2.0σ = move quality. Under 2σ = whipsaw zone, NO edge — don't chase. ≥2σ = confirmed.",
+             "% conv = how much the sub-signals agree. NOT a win-rate.",
+             "WRITE PE / WRITE CE / BUY CE = the instrument expressing the stance (WRITE = sell that wall, collect premium).",
+             "HOLD·wait vs act now = is the entry window open right now.",
+             "opened X → Y = how the stance evolved since the open (shows flips).",
+             "wrong below/above N = invalidation; thesis dead past it.",
+             "⏳ regime → … = forecast of the next regime shift + ETA.",
+             "drivers & why = click for each factor's signed push (+bull / −bear)."],
+            "Decision-support. No measured forward edge (conductor_replay.py validates stability "
+            "only). Read it as structure, not a buy button."),
     ], style={"marginBottom": "6px"})
 
     cards = []
@@ -4091,6 +4148,17 @@ def _render_trade_book_footprint(asof_value=None, snap=None) -> "html.Div":
                   "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
         html.Span("  OI · price · volume per timeframe — who's building vs closing",
                   style={"color": "#64748b", "fontSize": "0.55rem"}),
+        _panel_help(
+            "Per-timeframe OI · price · volume (5m → 60m) — shows who's building vs closing "
+            "positions at each horizon via the live 4-quadrant footprint (long buildup / writing / "
+            "short cover / unwind).",
+            ["OI bias + futOI today = net option + futures OI lean for the day.",
+             "stack ▲/▼ N/4 TFs agree = how many timeframes line up (the confirmation count).",
+             "per-TF row: price Δ% + σ-move, optOI build/flat, futures OI·vol.",
+             "BALANCED vs SHORT/LONG BUILDUP = that timeframe's footprint label.",
+             "★ = confirmed/tradeable. Intraday futures OI isn't in the Fyers feed (shown where available)."],
+            "Descriptive read of flow. The technical layer has a thin ~+0.04R edge with a "
+            "mean-reversion tilt — context, not a signal on its own."),
     ], style={"marginBottom": "6px"})
     cols = [dbc.Col([
         html.Div(LABELS.get(s, s), style={"color": COLORS.get(s, "#67e8f9"),
