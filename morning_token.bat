@@ -36,12 +36,19 @@ scp -i "%PEM%" -o StrictHostKeyChecking=accept-new access_token.txt %VM%:/home/u
 if errorlevel 1 ( echo  UPLOAD FAILED & pause & exit /b 1 )
 
 echo.
-echo [3/4] Restarting capture on the VM...
+echo [3/5] Restarting capture on the VM...
 ssh -i "%PEM%" %VM% "cd ~/tradebot && docker compose restart tradebot"
 if errorlevel 1 ( echo  RESTART FAILED & pause & exit /b 1 )
 
 echo.
-echo [4/4] Done. The VM is now capturing with a fresh token.
+echo [4/5] Pushing fresh NSE news to the VM (it can't reach NSE itself)...
+REM NSE blocks the VM's datacenter IP, so seed the cloud news from here. Non-fatal:
+REM a news-push hiccup must not abort the (already-done) token refresh.
+call "%REPO%\push_news.bat"
+if errorlevel 1 echo   (news push had an issue -- token is still refreshed; rerun push_news.bat later)
+
+echo.
+echo [5/5] Done. The VM is capturing with a fresh token + seeded news.
 echo       Open  https://13.233.88.148.sslip.io   (user: admin)
 echo       You can close the laptop now.
 echo.

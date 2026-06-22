@@ -251,13 +251,18 @@ def _analyze(df: pd.DataFrame, min_candles: int) -> dict:
     else:
         reasons.append(("neut", f"RSI {rn:.1f} — neutral zone"))
 
-    # 5. VWAP
-    if c > vwn:
-        score += 1
-        reasons.append(("bull", f"Price ({c:.1f}) above VWAP ({vwn:.1f}) — buyers in control"))
+    # 5. VWAP — only score when VWAP is defined. A volume-less session (pre-open, or
+    #    any instrument Fyers serves without volume) yields NaN VWAP; `c > NaN` is
+    #    False, which would silently score a spurious bearish −1 every such bar.
+    if pd.notna(vwn):
+        if c > vwn:
+            score += 1
+            reasons.append(("bull", f"Price ({c:.1f}) above VWAP ({vwn:.1f}) — buyers in control"))
+        else:
+            score -= 1
+            reasons.append(("bear", f"Price ({c:.1f}) below VWAP ({vwn:.1f}) — sellers in control"))
     else:
-        score -= 1
-        reasons.append(("bear", f"Price ({c:.1f}) below VWAP ({vwn:.1f}) — sellers in control"))
+        reasons.append(("neut", "VWAP undefined (no volume) — skipped"))
 
     # 6. Volume confirmation
     if cur_vol > avg_vol * 1.5 and c > cp:
@@ -364,82 +369,10 @@ def analyze_index(sym: str) -> dict:
     return result
 
 
-# ── Option recommendation ─────────────────────────────────────────────────────
-def recommend_option(analysis: dict, spot: float, strike_map: dict,
-                     expiry_label: str = "") -> dict | None:
-    """
-    Pick the best option contract to trade based on signal direction.
-    Uses delta targeting: ATM (0.45) for high conviction, 1-OTM (0.30) for moderate.
-    """
-    score = analysis.get("weighted_score", 0)
-    if abs(score) < 0.3 or not spot or not strike_map:
-        return None
-
-    direction = "CE" if score > 0 else "PE"
-    confidence = min(abs(score) / 5 * 100, 95)
-
-    # High conviction → ATM delta 0.45, lower → 1-OTM delta 0.30
-    target_delta = 0.45 if confidence > 55 else 0.30
-
-    best_strike = None
-    best_diff   = 999.0
-    for sp, opts in strike_map.items():
-        opt    = opts.get(direction, {})
-        greeks = opt.get("greeks") or {}
-        delta  = abs(greeks.get("delta") or 0)
-        if delta and abs(delta - target_delta) < best_diff:
-            best_diff   = abs(delta - target_delta)
-            best_strike = sp
-
-    if not best_strike:
-        return None
-
-    opt  = strike_map[best_strike].get(direction, {})
-    ltp  = opt.get("ltp") or 0
-    iv   = (opt.get("greeks") or {}).get("iv") or 0
-    delt = abs((opt.get("greeks") or {}).get("delta") or 0)
-
-    if not ltp or ltp < 5:
-        return None
-
-    # Risk management (option premium based)
-    entry  = ltp
-    sl     = round(entry * 0.70, 2)   # 30% SL
-    tgt1   = round(entry * 1.50, 2)   # +50%
-    tgt2   = round(entry * 2.00, 2)   # +100%
-    rr     = round((tgt1 - entry) / (entry - sl), 2)
-
-    # Trade type recommendation
-    tfs = analysis["timeframes"]
-    if tfs["daily"]["score"] * score > 0 and tfs["60min"]["score"] * score > 0:
-        trade_type = "POSITIONAL / BTST"
-    elif tfs["60min"]["score"] * score > 0:
-        trade_type = "BTST (Buy Today Sell Tomorrow)"
-    elif tfs["15min"]["score"] * score > 0:
-        trade_type = "INTRADAY SWING"
-    else:
-        trade_type = "INTRADAY SCALP"
-
-    # Key reasons from strongest timeframe
-    best_tf = max(tfs.items(), key=lambda x: abs(x[1].get("score", 0)))[1]
-    top_reasons = [r for _, r in best_tf["reasons"][:3]] if best_tf.get("reasons") else []
-
-    return {
-        "direction":  direction,
-        "strike":     best_strike,
-        "entry":      entry,
-        "sl":         sl,
-        "target1":    tgt1,
-        "target2":    tgt2,
-        "rr":         rr,
-        "iv":         iv,
-        "delta":      delt,
-        "confidence": round(confidence, 0),
-        "trade_type": trade_type,
-        "reasons":    top_reasons,
-        "expiry":     expiry_label,
-        "ltp":        ltp,
-    }
+# NOTE: the legacy `recommend_option()` (hardcoded 30%/+50%/+100% premium geometry)
+# was removed in the 2026-06-20 audit. The single authoritative recommender is
+# trade_setup.build_recommendation (session-phase-shaped SL/targets, 11 layers).
+# Do not reintroduce a second recommender here — one engine, one risk model.
 
 
 # ── Full analysis for all 4 indices ──────────────────────────────────────────

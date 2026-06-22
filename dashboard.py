@@ -16,7 +16,7 @@ from dash import dcc, html, Input, Output, State, no_update
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from fyers_apiv3.FyersWebsocket import data_ws
-from signals import run_full_analysis, recommend_option, fetch_ohlcv, _vwap
+from signals import run_full_analysis, fetch_ohlcv, _vwap
 from trade_setup import build_recommendation, TF_PROFILES
 from intraday_store import candle_store, oi_store, build_oi_snapshot, session_phase, session_strategy, record_tick
 import intraday_oi_intel
@@ -54,6 +54,11 @@ try:
 except Exception:
     _NSE_OI_AVAILABLE = False
 try:
+    import news_events
+    _NEWS_AVAILABLE = True
+except Exception:
+    _NEWS_AVAILABLE = False
+try:
     import trend_matrix
     _TREND_AVAILABLE = True
 except Exception:
@@ -64,7 +69,7 @@ try:
 except Exception:
     _SM_AVAILABLE = False
 try:
-    from market_snapshot import MarketSnapshot   # L2: one market state per render
+    from market_snapshot import MarketSnapshot, get_snapshot  # L2: one shared state/tick
     _SNAPSHOT_OK = True
 except Exception:
     _SNAPSHOT_OK = False
@@ -109,7 +114,17 @@ _ws     = None
 _seen:  set[str] = set()
 
 _oc_lock  = threading.Lock()
-_oc_cache: dict = {"sym": None, "expiry": "", "data": None, "ts": 0.0}
+# Per-(sym, expiry) option-chain cache. The Fyers option-chain endpoint is
+# rate/quota limited ("request limit reached"); the poller AND every UI callback
+# call fetch_option_chain independently, so a single-slot 2s cache (one sym at a
+# time) collapsed to ~zero hits across 4 rotating indices → each callback hit
+# Fyers fresh → burst → limit tripped mid-morning. A keyed cache with a TTL that
+# matches the genuine OI refresh cadence (~25s) lets all callers share one fetch
+# per index per window. Errors are cached briefly so a hit limit backs off instead
+# of being re-hammered every refresh.
+_oc_cache: dict = {}          # (sym, expiry) -> {"data":.., "ts":.., "ttl":..}
+_OC_TTL     = 25.0            # seconds to reuse a good chain (matches 30s poll)
+_OC_ERR_TTL = 8.0            # back-off after a failed/limited fetch
 
 
 # ── Token validation ───────────────────────────────────────────────────────────
@@ -151,10 +166,12 @@ def _get_auth() -> str:
 
 
 def fetch_option_chain(sym: str, expiry: str = "", n_strikes: int = 15) -> dict:
+    key = (sym, expiry)
+    now = time.time()
     with _oc_lock:
-        c = _oc_cache
-        if c["sym"] == sym and c["expiry"] == expiry and c["ts"] and time.time() - c["ts"] < 2:
-            return c["data"]
+        e = _oc_cache.get(key)
+        if e and now - e["ts"] < e["ttl"]:
+            return e["data"]
     try:
         resp = requests.get(
             OC_URL,
@@ -177,8 +194,9 @@ def fetch_option_chain(sym: str, expiry: str = "", n_strikes: int = 15) -> dict:
             data = {"s": "error", "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
     except Exception as e:
         data = {"s": "error", "message": str(e)}
+    ttl = _OC_TTL if data.get("s") == "ok" else _OC_ERR_TTL
     with _oc_lock:
-        _oc_cache.update({"sym": sym, "expiry": expiry, "data": data, "ts": time.time()})
+        _oc_cache[key] = {"data": data, "ts": time.time(), "ttl": ttl}
     return data
 
 
@@ -678,7 +696,21 @@ def _oi_background_poller():
     """
     OPEN  = datetime.time(9, 14)
     CLOSE = datetime.time(15, 31)
-    POLL  = 30   # seconds between snapshots
+    # Adaptive cadence: the Fyers option-chain REST endpoint has a daily call
+    # budget (empirically ~exhausted by ~11:05 at a flat 30s × 4 indices, after
+    # which capture silently died while WS ticks ran to close). The morning is
+    # where the gap/overnight-unwinding read lives, so keep it fast there and
+    # stretch the budget across the afternoon: 30s until 11:30, 90s after.
+    POLL_FAST, POLL_SLOW = 30, 90
+    SLOW_AFTER = datetime.time(11, 30)
+    # Strikes: fetch/persist a WIDE band so last night's OI WALLS (often well OTM,
+    # the put floor especially) are actually in the captured chain — at ±15 the
+    # floor wall fell outside the map on ~90% of samples, blinding the continuity/
+    # reconciliation read. One REST call regardless of strikecount, so this is free
+    # on the quota; only the payload grows.
+    CHAIN_STRIKES  = 25     # ± strikes Fyers returns around ATM
+    CHAIN_PERSIST  = 60     # max legs persisted per index per snapshot
+    _oc_ok = {s: None for s in INDEX_SYMBOLS}   # last fetch state, for transition logging
 
     while True:
         try:
@@ -691,8 +723,21 @@ def _oi_background_poller():
                     if not spot:
                         continue
                     try:
-                        data = fetch_option_chain(sym)
-                        if data.get("s") != "ok":
+                        data = fetch_option_chain(sym, n_strikes=CHAIN_STRIKES)
+                        ok = data.get("s") == "ok"
+                        # Log only on state TRANSITION so we measure exactly when /
+                        # why chain capture dies (quota? auth? expiry roll) without
+                        # spamming. This is the diagnostic for the ~11am cutoff.
+                        if ok != _oc_ok.get(sym):
+                            _oc_ok[sym] = ok
+                            if not ok:
+                                print(f"  [chain] {LABELS.get(sym, sym)} fetch FAILED @ "
+                                      f"{datetime.datetime.now(tz=IST):%H:%M:%S} — "
+                                      f"{str(data.get('message'))[:120]}", flush=True)
+                            else:
+                                print(f"  [chain] {LABELS.get(sym, sym)} recovered @ "
+                                      f"{datetime.datetime.now(tz=IST):%H:%M:%S}", flush=True)
+                        if not ok:
                             continue
                         d   = data.get("data", {})
                         raw = d.get("optionsChain", [])
@@ -727,7 +772,7 @@ def _oi_background_poller():
                         # and reach the parquet mirrors for playbook/replay.
                         try:
                             from intraday_db import idb
-                            near = sorted(strike_map, key=lambda sp: abs(sp - spot))[:17]
+                            near = sorted(strike_map, key=lambda sp: abs(sp - spot))[:CHAIN_PERSIST]
                             legs = []
                             for sp in near:
                                 for side in ("CE", "PE"):
@@ -746,7 +791,7 @@ def _oi_background_poller():
                         pass
         except Exception:
             pass
-        time.sleep(POLL)
+        time.sleep(POLL_FAST if datetime.datetime.now(tz=IST).time() < SLOW_AFTER else POLL_SLOW)
 
 
 def _fetch_quotes(symbols: list[str]) -> dict:
@@ -872,6 +917,60 @@ MONO    = {"fontFamily": "'Courier New', Courier, monospace"}
 
 def _slug(sym: str) -> str:
     return sym.replace(":", "-").replace(".", "-")
+
+
+# ── Live news / event-impact panel ──────────────────────────────────────────────
+def _render_news_panel(data: dict) -> html.Div:
+    """Event-impact alerts: scope tag · impact score (−10..+10) · ticker · headline.
+    Driven by news_events.analyze_news(); colour = canonical bias green/red/grey."""
+    if not data:
+        return html.Div("news layer offline", style={"color": "#475569", "fontSize": "0.55rem"})
+    alerts = data.get("alerts", [])
+    mb     = data.get("macro_bias", "NEUTRAL")
+    mb_clr = sig.color(mb)
+    by     = data.get("by_scope", {})
+    cur    = data.get("date", "")
+    header = html.Div([
+        html.Span("📰 NEWS / EVENT IMPACT", style={
+            "color": "#fbbf24", "fontWeight": "700", "fontSize": "0.62rem",
+            "letterSpacing": "0.1em"}),
+        html.Span(f"  macro ", style={"color": "#475569", "fontSize": "0.5rem"}),
+        html.Span(mb, style={"color": mb_clr, "fontWeight": "700", "fontSize": "0.56rem"}),
+        html.Span(f"  ·  {data.get('n_alerts',0)} alerts  ·  {cur}  ·  {data.get('as_of','')}",
+                  style={"color": "#475569", "fontSize": "0.5rem"}),
+    ], style={"marginBottom": "6px", "display": "flex", "alignItems": "center"})
+    rows = []
+    for e in alerts:                                  # scrollable container below
+        sc  = e["score"]
+        clr = sig.color(e["bias"])
+        chip = {"MACRO": "#a78bfa", "SECTOR": "#38bdf8", "STOCK": "#94a3b8"}.get(e["scope"], "#94a3b8")
+        rows.append(html.Div([
+            html.Span(f"{sc:+d}", style={
+                "color": clr, "fontWeight": "800", "fontSize": "0.7rem",
+                "width": "32px", "textAlign": "right", "marginRight": "8px",
+                **MONO}),
+            html.Span(e["scope"][:3], style={
+                "color": chip, "fontSize": "0.48rem", "fontWeight": "700",
+                "width": "26px", "letterSpacing": "0.05em"}),
+            html.Span((e["ticker"] or "—")[:11], style={
+                "color": "#cbd5e1", "fontSize": "0.55rem", "fontWeight": "700",
+                "width": "78px", **MONO}),
+            html.Span(e["event_type"], style={
+                "color": clr, "fontSize": "0.52rem", "width": "120px"}),
+            html.Span(e["headline"][:90], style={
+                "color": "#64748b", "fontSize": "0.5rem", "flex": "1 1 auto",
+                "overflow": "hidden", "textOverflow": "ellipsis", "whiteSpace": "nowrap"}),
+        ], style={"display": "flex", "alignItems": "center", "gap": "2px",
+                  "padding": "3px 0", "borderBottom": "1px solid #111d2e"}))
+    if not rows:
+        rows = [html.Div("no market-moving events this day (feeds quiet or IP-blocked)",
+                         style={"color": "#475569", "fontSize": "0.52rem", "padding": "4px 0"})]
+    body = html.Div(rows, style={"maxHeight": "168px", "overflowY": "auto",
+                                 "paddingRight": "4px"})
+    return html.Div([header, body], style={
+        "padding": "10px 12px", "borderRadius": "8px", "background": BG_CARD,
+        "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #fbbf24",
+        "marginBottom": "12px"})
 
 
 # ── Sidebar card (always visible, clickable) ───────────────────────────────────
@@ -1254,6 +1353,23 @@ app.layout = dbc.Container([
             _header_action_chip("nav-liveoi", "📡", "LIVE OI", "#40c4ff"),
         ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px",
                   "alignItems": "center", "marginTop": "10px"}),
+        # Live news / event-impact ticker — always visible across all panels.
+        # Static date nav (◀ ▶) drives the news-date Store; the panel below renders rows.
+        dcc.Store(id="news-date"),
+        html.Div([
+            html.Span("◀", id="news-prev", n_clicks=0, style={
+                "color": "#67e8f9", "fontSize": "0.7rem", "fontWeight": "700",
+                "cursor": "pointer", "padding": "0 8px", "userSelect": "none"}),
+            html.Span(id="news-date-label", style={
+                "color": "#cbd5e1", "fontSize": "0.56rem", "fontWeight": "700",
+                "minWidth": "92px", "textAlign": "center", **MONO}),
+            html.Span("▶", id="news-next", n_clicks=0, style={
+                "color": "#67e8f9", "fontSize": "0.7rem", "fontWeight": "700",
+                "cursor": "pointer", "padding": "0 8px", "userSelect": "none"}),
+            html.Span("scroll dates ◂▸", style={
+                "color": "#475569", "fontSize": "0.46rem", "marginLeft": "8px"}),
+        ], style={"display": "flex", "alignItems": "center", "marginTop": "10px"}),
+        html.Div(id="news-panel", style={"marginTop": "4px"}),
     ], style={"padding": "14px 16px 10px"}),
     html.Div(className="header-line"),
 
@@ -1436,6 +1552,7 @@ app.layout = dbc.Container([
     dcc.Interval(id="oc-tick",    interval=2000,  n_intervals=0),
     dcc.Interval(id="signal-tick",interval=60000, n_intervals=0),
     dcc.Interval(id="setup-tick", interval=30000, n_intervals=0),
+    dcc.Interval(id="news-tick",  interval=60000, n_intervals=0),
 
 ], fluid=True, style={"background": BG, "minHeight": "100vh", "padding": "0"})
 
@@ -4084,7 +4201,7 @@ def _render_trade_book(asof_value=None) -> "html.Div":
     # stance are each computed once at the SELECTED instant, not 3-4x per render,
     # and can never disagree on the instant they describe.
     _asof = _parse_asof(asof_value)
-    snap = MarketSnapshot(_asof) if _SNAPSHOT_OK else None
+    snap = get_snapshot(_asof) if _SNAPSHOT_OK else None
     forecasts = {}
     if snap is not None:
         forecasts = {x: snap.forecast(x) for x in INDEX_SYMBOLS}
@@ -4193,7 +4310,11 @@ def update_sm_footprint(_):
     Input("setup-tick", "n_intervals"),
 )
 def update_intraday_tf(sym, _):
-    return _render_intraday_tf(sym or "NSE:NIFTY50-INDEX")
+    # Route through the canonical snapshot so the sidebar footprint shares the
+    # Trade Book's one-instant computation (live, ~1-tick TTL) instead of a
+    # redundant intraday_tf.analyze recompute.
+    snap = get_snapshot(None) if _SNAPSHOT_OK else None
+    return _render_intraday_tf(sym or "NSE:NIFTY50-INDEX", None, snap)
 
 
 @app.callback(
@@ -4595,6 +4716,56 @@ def update_signals(_, sel):
     return _render_signal_panel(results, now)
 
 
+_NEWS_NAV_ON  = {"color": "#67e8f9", "fontSize": "0.7rem", "fontWeight": "700",
+                 "cursor": "pointer", "padding": "0 8px", "userSelect": "none"}
+_NEWS_NAV_OFF = {**_NEWS_NAV_ON, "color": "#334155", "cursor": "default", "opacity": 0.5}
+
+
+@app.callback(
+    Output("news-date", "data"),
+    Output("news-date-label", "children"),
+    Output("news-prev", "style"),
+    Output("news-next", "style"),
+    Input("news-prev", "n_clicks"),
+    Input("news-next", "n_clicks"),
+    Input("news-tick", "n_intervals"),
+    State("news-date", "data"),
+)
+def _news_nav(_p, _n, _tick, cur):
+    """◀ older / ▶ newer across captured days. Tick only refreshes the date list
+    (so a brand-new day appears) without moving the user off their chosen date.
+    Buttons grey out at the ends (oldest / newest=today)."""
+    if not _NEWS_AVAILABLE:
+        return no_update, no_update, no_update, no_update
+    dates = news_events.available_dates()            # newest first
+    if not dates:
+        return None, "—", _NEWS_NAV_OFF, _NEWS_NAV_OFF
+    cur = cur if cur in dates else dates[0]
+    idx = dates.index(cur)
+    trig = dash.callback_context.triggered
+    src  = trig[0]["prop_id"].split(".")[0] if trig else ""
+    if src == "news-prev":
+        idx = min(idx + 1, len(dates) - 1)           # older
+    elif src == "news-next":
+        idx = max(idx - 1, 0)                         # newer
+    new = dates[idx]
+    tag = " (today)" if idx == 0 else ""
+    prev_style = _NEWS_NAV_OFF if idx >= len(dates) - 1 else _NEWS_NAV_ON   # at oldest
+    next_style = _NEWS_NAV_OFF if idx <= 0 else _NEWS_NAV_ON                # at newest
+    return new, f"{new}{tag}", prev_style, next_style
+
+
+@app.callback(Output("news-panel", "children"),
+              Input("news-date", "data"), Input("news-tick", "n_intervals"))
+def _update_news_panel(date, _n):
+    if not _NEWS_AVAILABLE:
+        return no_update
+    try:
+        return _render_news_panel(news_events.analyze_news(date=date))
+    except Exception:
+        return no_update
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(SEP)
@@ -4637,6 +4808,15 @@ if __name__ == "__main__":
         daemon=True, name="auto-signal",
     ).start()
     print("  Auto signal eval started — all 4 indices every 60s")
+
+    # News / event-impact poller — NSE filings + RBI releases, scored to −10..+10.
+    # All-day window (filings land pre-open/post-close); may 403 from a datacenter IP.
+    if _NEWS_AVAILABLE:
+        threading.Thread(
+            target=lambda: news_events.poll_loop(60),
+            daemon=True, name="news",
+        ).start()
+        print("  News/event poller started — 60s intervals")
 
     threading.Thread(
         target=_heartbeat_writer,

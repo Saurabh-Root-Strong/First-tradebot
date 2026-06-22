@@ -40,6 +40,12 @@ try:
 except Exception:
     _SHOCK_AVAILABLE = False
 
+try:
+    import news_events
+    _NEWS_AVAILABLE = True
+except Exception:
+    _NEWS_AVAILABLE = False
+
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 
@@ -737,6 +743,75 @@ def apply_shock_override(composite: float, confidence: float, shock: dict
     return composite, confidence, False, notes
 
 
+def apply_news_override(sym: str, composite: float, confidence: float
+                        ) -> tuple[float, float, bool, list]:
+    """Layer 11 — event-impact veto for INDEX trades.
+
+    Two sources fold into one signed tilt (≈ −10..+10 scale):
+      • MACRO/SECTOR events (RBI, CPI, Fed, crude, China) — move the whole tape.
+      • CONSTITUENT stock-news (news_events.index_news_tilt) — a weighted cluster of
+        bad bank filings tilts BANKNIFTY; heavyweight-weighted so a minor name can't
+        veto an index. NIFTY uses a damped broad-market net; MIDCAP has no basket map.
+
+    An OPPOSING tilt slashes confidence and, on a weak base setup, stands the trade
+    down — same discipline as the shock override, on a slower (event) clock.
+    LIVE-SAFETY: an aligned tilt only CONFIRMS (a note); it never raises confidence,
+    so a false-positive keyword match cannot inflate conviction → position size.
+
+    Decision-support modulator, NOT new alpha. Returns (composite, confidence,
+    forced_neutral, notes).
+    """
+    notes: list = []
+    if not _NEWS_AVAILABLE:
+        return composite, confidence, False, notes
+    try:
+        a = news_events.analyze_news(min_abs=6)
+        tilt = news_events.index_news_tilt(sym, min_abs=6)
+    except Exception:
+        return composite, confidence, False, notes
+
+    macro_net = a.get("macro_net", 0)                 # market-wide (macro+sector), raw sum
+    cons_net  = tilt.get("net", 0.0)                  # this index's constituents, weighted
+    net = macro_net + cons_net                        # combined signed tilt
+    # Separate gates: raw macro scores run large (sum of −10..+10), but a weighted
+    # constituent tilt of −4.7 already means ~half the index by weight has a −9 event
+    # — that must fire. So macro gates at 5, constituents at 2.5.
+    macro_hit = abs(macro_net) >= 5
+    cons_hit  = abs(cons_net)  >= 2.5
+    if not (macro_hit or cons_hit):
+        return composite, confidence, False, notes
+
+    news_dir = "CE" if net > 0 else "PE"
+    comp_dir = "CE" if composite > 0 else "PE" if composite < 0 else ""
+    aligned  = news_dir == comp_dir and comp_dir != ""
+    strong   = abs(macro_net) >= 9 or abs(cons_net) >= 4   # heavy macro, or 2 megacaps
+    # Headline for the note: prefer the dominant constituent, else a macro alert.
+    head = ""
+    if tilt.get("top") and abs(cons_net) >= abs(macro_net):
+        tk, sc, et = tilt["top"]
+        head = f"{tk} {et}"
+    if not head:
+        for e in a.get("alerts", []):
+            if e.get("scope") in ("MACRO", "SECTOR"):
+                head = e.get("event_type", "macro event")
+                break
+    head = head or "macro/constituent event"
+
+    if aligned:
+        # LIVE-SAFETY: news only CONFIRMS (a note) — it never raises confidence. A
+        # false-positive keyword match must not inflate conviction → position size.
+        # Asymmetric by design: news can stand a trade down, never lever it up.
+        notes.append(f"✓ NEWS CONFIRMS — {head} (net {net:+.0f})")
+    else:
+        confidence = round(confidence * (0.45 if strong else 0.70))
+        notes.append(f"⚠ NEWS OPPOSES — {head} (net {net:+.0f})")
+        if strong and abs(composite) < 1.0:
+            notes.append("Signal stood down — strong opposing macro event vs a weak setup")
+            return 0.0, min(confidence, 25), True, notes
+
+    return composite, confidence, False, notes
+
+
 # ── Expiry selection ──────────────────────────────────────────────────────────
 def select_expiry(expiry_data: list, tf_key: str) -> tuple[str, str]:
     if not expiry_data:
@@ -882,6 +957,14 @@ def build_recommendation(
     composite, confidence, forced_neutral, shock_notes = apply_shock_override(
         composite, confidence, shock,
     )
+
+    # ── Layer 11: News / event-impact veto (macro+sector events vs the signal) ──
+    if not forced_neutral:
+        composite, confidence, news_neutral, news_notes = apply_news_override(
+            sym, composite, confidence,
+        )
+        forced_neutral = forced_neutral or news_neutral
+        shock_notes = list(shock_notes) + news_notes
 
     # Neutral — no clear edge (or signal stood down by an opposing shock).
     # Threshold matches _composite()'s neutral band (±0.40) exactly,

@@ -87,3 +87,33 @@ class MarketSnapshot:
 
     def stances(self) -> dict:
         return {s: self.stance(s) for s in INDEX_SYMBOLS}
+
+
+# ── Canonical accessor (cross-callback de-dup) ──────────────────────────────────
+# Dash callbacks are independent functions: the Trade Book, the sidebar footprint,
+# and any other panel that fires in the same tick would each build their OWN
+# MarketSnapshot and recompute the same primitives. get_snapshot() is the single
+# entry point — for LIVE (as_of=None) it hands back one shared instance within a
+# short TTL, so every panel in a tick describes ONE instant and the heavy reads
+# (forecast / playbook / footprint / conductor) run once. A past as_of always
+# builds fresh (exact + cheap; replay/time-machine must not share a mutable cache).
+import threading as _threading
+import time as _time
+
+_LIVE_TTL = 2.0                                  # seconds ≈ one render tick
+_live_lock = _threading.Lock()
+_live_cache: dict = {"snap": None, "ts": 0.0}
+
+
+def get_snapshot(as_of: Optional[datetime.datetime] = None) -> "MarketSnapshot":
+    """Canonical way to obtain a MarketSnapshot. Live snapshots are shared across
+    callbacks for ~one tick; historical (as_of set) snapshots are always fresh."""
+    if as_of is not None:
+        return MarketSnapshot(as_of)
+    now = _time.time()
+    with _live_lock:
+        c = _live_cache["snap"]
+        if c is None or now - _live_cache["ts"] > _LIVE_TTL:
+            c = MarketSnapshot(None)
+            _live_cache["snap"], _live_cache["ts"] = c, now
+        return c
