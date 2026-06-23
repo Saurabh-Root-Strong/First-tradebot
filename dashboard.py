@@ -130,29 +130,63 @@ _OC_ERR_TTL = 8.0            # back-off after a failed/limited fetch
 
 
 # ── Token validation ───────────────────────────────────────────────────────────
-def _validate_token() -> str:
-    if not TOKEN_FILE.exists():
-        print("\n  ERROR  access_token.txt not found.")
-        print("  FIX    .venv\\Scripts\\python.exe fyers_auth.py\n")
-        sys.exit(1)
-    raw = TOKEN_FILE.read_text(encoding="utf-8").strip()
+def _token_remaining(raw: str) -> "float | None":
+    """Seconds left on the JWT, or None if unparseable."""
     try:
         payload = raw.split(".")[1]
         payload += "=" * (4 - len(payload) % 4)
-        claims    = json.loads(base64.urlsafe_b64decode(payload))
-        remaining = claims.get("exp", 0) - time.time()
-        if remaining <= 0:
-            exp_dt = datetime.datetime.fromtimestamp(claims["exp"], tz=IST)
-            print(f"\n  ERROR  Token EXPIRED  ({exp_dt:%Y-%m-%d %H:%M IST})")
-            print("  FIX    .venv\\Scripts\\python.exe fyers_auth.py\n")
-            sys.exit(1)
-        h, m = int(remaining // 3600), int((remaining % 3600) // 60)
-        print(f"  Token  OK  —  fy_id: {claims.get('fy_id','?')}  expires in {h}h {m}m")
-    except SystemExit:
-        raise
-    except Exception as e:
-        print(f"  Token  WARNING: {e}")
-    return raw
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims.get("exp", 0) - time.time()
+    except Exception:
+        return None
+
+
+def _run_auth() -> None:
+    """Launch the Fyers auth flow (browser login, or headless TOTP if FYERS_HEADLESS=1)
+    and block until it finishes writing access_token.txt."""
+    import os
+    script = "fyers_auth_headless.py" if os.environ.get("FYERS_HEADLESS") == "1" else "fyers_auth.py"
+    print(f"  AUTO   launching {script} — "
+          + ("headless TOTP login…" if script.endswith("headless.py") else "log in via the browser…"))
+    try:
+        import subprocess
+        subprocess.run([sys.executable, str(Path(__file__).parent / script)],
+                       cwd=str(Path(__file__).parent))
+    except Exception as exc:
+        print(f"  AUTO   {script} failed: {exc}")
+
+
+def _validate_token() -> str:
+    # On a missing/expired token, auto-run the auth flow once and re-check, instead
+    # of erroring out — so launching dashboard.py directly self-heals like supervise.py.
+    for attempt in (1, 2):
+        if not TOKEN_FILE.exists():
+            print("\n  Token  missing (access_token.txt not found).")
+        else:
+            raw = TOKEN_FILE.read_text(encoding="utf-8").strip()
+            rem = _token_remaining(raw)
+            if rem is None:
+                print("  Token  WARNING: could not parse — proceeding with stored token.")
+                return raw
+            if rem > 0:
+                claims_fy = ""
+                try:
+                    p = raw.split(".")[1]; p += "=" * (4 - len(p) % 4)
+                    claims_fy = json.loads(base64.urlsafe_b64decode(p)).get("fy_id", "?")
+                except Exception:
+                    pass
+                h, m = int(rem // 3600), int((rem % 3600) // 60)
+                print(f"  Token  OK  —  fy_id: {claims_fy}  expires in {h}h {m}m")
+                return raw
+            exp_dt = datetime.datetime.fromtimestamp(time.time() + rem, tz=IST)
+            print(f"\n  Token  EXPIRED  ({exp_dt:%Y-%m-%d %H:%M IST})")
+        if attempt == 1:
+            _run_auth()      # try once, then re-loop to re-validate
+            continue
+        print("  ERROR  still no valid token after auth.")
+        print("  FIX    run  .venv\\Scripts\\python.exe fyers_auth.py  manually, then relaunch.\n")
+        sys.exit(1)
+    return TOKEN_FILE.read_text(encoding="utf-8").strip()
 
 
 # ── Option chain API + cache ───────────────────────────────────────────────────
