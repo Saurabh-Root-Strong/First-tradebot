@@ -1065,6 +1065,44 @@ body { background:#030810 !important; overflow-x:hidden; }
 """
 app.index_string = app.index_string.replace("</head>", _CSS + "</head>")
 
+
+def _charts_help() -> "html.Details":
+    """Plain-English 'what is this / how to read' for the Charts section, embedded
+    in its heading. Inlined (not via _panel_help, which is defined after the layout)."""
+    what = ("Five lenses on one timeframe, full session. Candles = index price (green up / "
+            "red down, wicks = rejection). Dotted line = close. Red CE OI = total call "
+            "writing (resistance / ceiling). Green PE OI = total put writing (support / "
+            "floor). Cyan bars = traded option volume. Amber = ATM straddle premium "
+            "(IV / expected-move pulse).")
+    read = [
+        "CE OI rising = ceiling building (capped). CE OI FALLING = call unwind / short-cover "
+        "= ceiling lifting (bullish fuel).",
+        "PE OI rising = floor building (bullish). PE OI falling = puts unwind = floor cracking "
+        "(bearish).",
+        "Price UP + CE OI DOWN = short-covering breakout (strong up). Price DOWN + PE OI DOWN "
+        "= long-unwind breakdown (strong down).",
+        "Both OI rising while price ranges = two-sided writing → range tightens toward max-pain.",
+        "Premium spike + big volume bar = something real starting (don't fade). Falling premium "
+        "= calm / decay / range.",
+        "Shaded band = the clicked timeframe window — line the OI turn up with the candle above it.",
+    ]
+    caveat = ("OI turns only count on real volume — a turn on a thin bar is noise. Volume here is "
+              "OPTION volume (the index itself has none).")
+    body = [html.Div(what, style={"color": "#cbd5e1", "fontSize": "0.56rem",
+                                  "lineHeight": "1.5", "marginBottom": "5px", "whiteSpace": "pre-line"})]
+    body += [html.Div("• " + r, style={"color": "#94a3b8", "fontSize": "0.54rem",
+                                       "lineHeight": "1.5", "whiteSpace": "normal"}) for r in read]
+    body.append(html.Div("⚠ " + caveat, style={"color": "#fbbf24", "fontSize": "0.54rem",
+                "lineHeight": "1.45", "marginTop": "5px", "whiteSpace": "normal"}))
+    return html.Details([
+        html.Summary("ℹ what is this · how to read", style={
+            "color": "#67e8f9", "fontSize": "0.54rem", "cursor": "pointer", "marginLeft": "8px"}),
+        html.Div(body, style={"maxHeight": "260px", "overflowY": "auto", "marginTop": "5px",
+                 "padding": "7px 9px", "background": "#0a0f1a", "border": "1px solid #1e2d40",
+                 "borderRadius": "4px", "maxWidth": "640px"}),
+    ], style={"display": "inline-block", "verticalAlign": "middle"})
+
+
 app.layout = dbc.Container([
     # ── Header (brand + status, then a horizontal index/nav strip) ──────────────
     html.Div([
@@ -1280,9 +1318,12 @@ app.layout = dbc.Container([
             # price candle + OI + volume + premium for a chosen index & timeframe.
             html.Div(id="charts-panel", style={"display": "none"}, children=[
                 dbc.Row([
-                    dbc.Col(html.Div("📈 CHARTS — PRICE · OI · VOLUME · PREMIUM", style={
-                        "color": "#a78bfa", "fontWeight": "700", "fontSize": "0.95rem",
-                        "letterSpacing": "0.08em", "paddingTop": "6px"}), md=6),
+                    dbc.Col(html.Div([
+                        html.Span("📈 CHARTS — PRICE · OI · VOLUME · PREMIUM", style={
+                            "color": "#a78bfa", "fontWeight": "700", "fontSize": "0.95rem",
+                            "letterSpacing": "0.08em"}),
+                        _charts_help(),
+                    ], style={"paddingTop": "6px"}), md=6),
                     dbc.Col(dcc.Dropdown(
                         id="charts-idx", clearable=False,
                         options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
