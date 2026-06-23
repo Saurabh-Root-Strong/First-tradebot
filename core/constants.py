@@ -6,13 +6,17 @@ Everything anchors to PROJECT_ROOT so it is correct regardless of the working di
 from __future__ import annotations
 
 import datetime
+import os
 from pathlib import Path
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
-LIVE_DIR = DATA_DIR / "intraday" / "live"        # lock-free parquet mirrors (today)
+# Lock-free parquet mirrors (today). TRADEBOT_MIRROR_DIR overrides the location so a
+# read-only VM viewer can read a *separate* synced copy that a local capturer (which
+# always writes the default dir) can never clobber. Default unchanged.
+LIVE_DIR = Path(os.environ.get("TRADEBOT_MIRROR_DIR", str(DATA_DIR / "intraday" / "live")))
 HIST_DIR = DATA_DIR / "historical"               # downloaded OHLCV per timeframe
 
 # The four live-captured indices.

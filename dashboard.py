@@ -1089,6 +1089,7 @@ app.layout = dbc.Container([
         html.Div([
             *[_header_nav_card(sym) for sym in INDEX_SYMBOLS],
             html.Div(style={"flex": "1 1 auto"}),     # spacer pushes actions to the right
+            _header_action_chip("nav-charts", "📈", "CHARTS", "#a78bfa"),
             _header_action_chip("nav-liveoi", "📡", "LIVE OI", "#40c4ff"),
         ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px",
                   "alignItems": "center", "marginTop": "10px"}),
@@ -1273,6 +1274,29 @@ app.layout = dbc.Container([
                         value="NSE:NIFTY50-INDEX", style={"fontSize": "0.75rem"}), md=4),
                 ], className="mb-2 align-items-center"),
                 html.Div(id="liveoi-content"),
+            ]),
+
+            # CHARTS PANEL (hidden until 'Charts' is clicked) — full-session
+            # price candle + OI + volume + premium for a chosen index & timeframe.
+            html.Div(id="charts-panel", style={"display": "none"}, children=[
+                dbc.Row([
+                    dbc.Col(html.Div("📈 CHARTS — PRICE · OI · VOLUME · PREMIUM", style={
+                        "color": "#a78bfa", "fontWeight": "700", "fontSize": "0.95rem",
+                        "letterSpacing": "0.08em", "paddingTop": "6px"}), md=6),
+                    dbc.Col(dcc.Dropdown(
+                        id="charts-idx", clearable=False,
+                        options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
+                        value="NSE:NIFTY50-INDEX", style={"fontSize": "0.75rem"}), md=3),
+                    dbc.Col(dcc.Dropdown(
+                        id="charts-tf", clearable=False,
+                        options=[{"label": "5 min", "value": 5},
+                                 {"label": "15 min", "value": 15},
+                                 {"label": "60 min", "value": 60}],
+                        value=15, style={"fontSize": "0.75rem"}), md=3),
+                ], className="mb-2 align-items-center"),
+                dcc.Loading(dcc.Graph(id="charts-graph",
+                            config={"displayModeBar": False}),
+                            type="circle", color="#a78bfa"),
             ]),
         ], md=9, lg=9, style={"padding": "12px 16px"}),
     ], className="gx-0"),
@@ -2712,11 +2736,12 @@ def _render_trade_rec(rec: dict, sym: str) -> html.Div:
     [Input(f"nav-{_slug(s)}", "n_clicks") for s in INDEX_SYMBOLS],
     Input("nav-tradebook", "n_clicks"),
     Input("nav-liveoi",    "n_clicks"),
+    Input("nav-charts",    "n_clicks"),
     State("sel-sym", "data"),
     prevent_initial_call=True,
 )
 def on_nav_click(*args):
-    *_, _tradebook_clicks, _liveoi_clicks, current = args
+    *_, _tradebook_clicks, _liveoi_clicks, _charts_clicks, current = args
     from dash import callback_context as ctx
     if not ctx.triggered:
         return current, ""
@@ -2725,6 +2750,8 @@ def on_nav_click(*args):
         return (None, "") if current == "TRADES" else ("TRADES", "")
     if tid == "nav-liveoi":
         return (None, "") if current == "LIVEOI" else ("LIVEOI", "")
+    if tid == "nav-charts":
+        return (None, "") if current == "CHARTS" else ("CHARTS", "")
     for sym in INDEX_SYMBOLS:
         if tid == f"nav-{_slug(sym)}":
             return (None, "") if current == sym else (sym, "")
@@ -2742,9 +2769,26 @@ def _sync_url(sym):
         return "/trades"
     if sym == "LIVEOI":
         return "/live-oi"
+    if sym == "CHARTS":
+        return "/charts"
     if sym in INDEX_SYMBOLS:
         return f"/chain/{_URL_SHORT.get(sym, 'index')}"
     return "/"
+
+
+# ── Charts section: full-session price/OI/volume/premium for index + timeframe ──
+@app.callback(
+    Output("charts-graph", "figure"),
+    Input("charts-idx", "value"),
+    Input("charts-tf",  "value"),
+    Input("sel-sym",    "data"),
+)
+def _update_charts(sym, tf, sel):
+    """Redraw when the index/timeframe changes or the Charts section opens."""
+    from dash.exceptions import PreventUpdate
+    if sel != "CHARTS":
+        raise PreventUpdate
+    return _footprint_fig(sym or "NSE:NIFTY50-INDEX", int(tf or 15))
 
 
 # ── Callback 2: toggle panels + highlight selected nav card ───────────────────
@@ -2753,6 +2797,7 @@ def _sync_url(sym):
     Output("oc-panel",        "style"),
     Output("trade-book-panel", "style"),
     Output("live-oi-panel",   "style"),
+    Output("charts-panel",    "style"),
     Output("oc-title",        "children"),
     *[Output(f"nav-{_slug(s)}", "style") for s in INDEX_SYMBOLS],
     Input("sel-sym", "data"),
@@ -2760,12 +2805,14 @@ def _sync_url(sym):
 def toggle_view(sym):
     is_trades = (sym == "TRADES")
     is_liveoi = (sym == "LIVEOI")
-    is_index  = bool(sym) and not is_trades and not is_liveoi
+    is_charts = (sym == "CHARTS")
+    is_index  = bool(sym) and not is_trades and not is_liveoi and not is_charts
 
     ov_style = {"display": "block"} if not sym else {"display": "none"}
     oc_style = {"display": "block"} if is_index else {"display": "none"}
     tb_style = {"display": "block"} if is_trades else {"display": "none"}
     lo_style = {"display": "block"} if is_liveoi else {"display": "none"}
+    ch_style = {"display": "block"} if is_charts else {"display": "none"}
 
     if is_index:
         color = COLORS[sym]
@@ -2780,7 +2827,7 @@ def toggle_view(sym):
         title = ""
 
     nav_styles = [_nav_chip_style(s, selected=(s == sym)) for s in INDEX_SYMBOLS]
-    return (ov_style, oc_style, tb_style, lo_style, title, *nav_styles)
+    return (ov_style, oc_style, tb_style, lo_style, ch_style, title, *nav_styles)
 
 
 # ── Callback 3: sidebar live prices + status ───────────────────────────────────
