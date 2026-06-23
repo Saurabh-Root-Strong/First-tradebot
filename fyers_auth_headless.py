@@ -36,7 +36,7 @@ from pathlib import Path
 import requests
 
 HERE       = Path(__file__).parent
-TOKEN_FILE = HERE / "access_token.txt"
+from tradebot.adapters.broker.token import TOKEN_FILE   # single broker-token source
 
 APP_ID       = os.environ.get("FYERS_APP_ID", "WVDZUTO6HL-100")
 SECRET_KEY   = os.environ.get("FYERS_SECRET_KEY", "")

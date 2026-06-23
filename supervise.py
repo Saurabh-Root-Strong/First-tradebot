@@ -30,7 +30,7 @@ from core.constants import IST   # single source of truth
 HERE = Path(__file__).parent
 PY   = HERE / ".venv" / "Scripts" / "python.exe"
 PY   = PY if PY.exists() else Path(sys.executable)
-TOKEN_FILE = HERE / "access_token.txt"
+from tradebot.adapters.broker.token import TOKEN_FILE   # single broker-token source
 HEARTBEAT  = HERE / "data" / "ws_heartbeat.txt"
 LOG        = HERE / "logs" / "supervisor.log"
 

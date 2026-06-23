@@ -16,8 +16,7 @@ import requests
 import pandas as pd
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-APP_ID     = "WVDZUTO6HL-100"
-TOKEN_FILE = Path("access_token.txt")
+from tradebot.adapters.broker.token import APP_ID, TOKEN_FILE   # single broker-token source
 from core.constants import IST   # single source of truth  # noqa: E402
 
 HISTORY_URL = "https://api-t1.fyers.in/data/history"

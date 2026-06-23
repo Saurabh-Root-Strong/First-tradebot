@@ -42,7 +42,7 @@ REDIRECT_URI = f"http://127.0.0.1:{LOCAL_PORT}"
 _AUTH_CODE_URL = "https://api-t1.fyers.in/api/v3/generate-authcode"
 _VALIDATE_URL  = "https://api-t1.fyers.in/api/v3/validate-authcode"
 
-TOKEN_FILE = Path("access_token.txt")
+from tradebot.adapters.broker.token import TOKEN_FILE   # single broker-token source
 
 
 # ── Local OAuth callback server ────────────────────────────────────────────────

@@ -51,8 +51,7 @@ import requests
 from fno_universe import ALL_SYMBOLS, INDEX_SYMBOLS, LABELS
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-APP_ID       = "WVDZUTO6HL-100"
-TOKEN_FILE   = Path("access_token.txt")
+from tradebot.adapters.broker.token import APP_ID, TOKEN_FILE   # single broker-token source
 DATA_DIR     = Path("data") / "historical"
 HISTORY_URL  = "https://api-t1.fyers.in/data/history"
 from core.constants import IST   # single source of truth  # noqa: E402

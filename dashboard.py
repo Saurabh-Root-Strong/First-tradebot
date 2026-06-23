@@ -89,9 +89,10 @@ except Exception:
     _CTX_BRIDGE_OK = False
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-APP_ID     = "WVDZUTO6HL-100"
-TOKEN_FILE = Path("access_token.txt")
 from core.constants import IST, INDEX_SYMBOLS, LABELS   # single source of truth
+from tradebot.adapters.broker import token as _broker_token   # single broker-token source
+APP_ID     = _broker_token.APP_ID
+TOKEN_FILE = _broker_token.TOKEN_FILE   # PROJECT_ROOT-anchored (was CWD-relative)
 OC_URL     = "https://api-t1.fyers.in/data/options-chain-v3"
 SEP        = "─" * 58
 
@@ -133,13 +134,7 @@ _OC_ERR_TTL = 8.0            # back-off after a failed/limited fetch
 # ── Token validation ───────────────────────────────────────────────────────────
 def _token_remaining(raw: str) -> "float | None":
     """Seconds left on the JWT, or None if unparseable."""
-    try:
-        payload = raw.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload))
-        return claims.get("exp", 0) - time.time()
-    except Exception:
-        return None
+    return _broker_token.token_remaining(raw)
 
 
 def _run_auth() -> None:
@@ -198,8 +193,7 @@ def _expiry_to_epoch(expiry_val: str) -> str:
 
 def _get_auth() -> str:
     """Always read token from file — avoids module-global timing issues with Dash threads."""
-    raw = TOKEN_FILE.read_text(encoding="utf-8").strip() if TOKEN_FILE.exists() else ""
-    return f"{APP_ID}:{raw}"
+    return _broker_token.auth_header()
 
 
 def fetch_option_chain(sym: str, expiry: str = "", n_strikes: int = 15) -> dict:
