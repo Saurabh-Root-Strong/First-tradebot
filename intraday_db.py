@@ -52,156 +52,9 @@ _PARQUET_TABLES = (
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
-_DDL = """
--- ── Raw tick store ────────────────────────────────────────────────────────────
--- One row per WebSocket SymbolUpdate message (Fyers L1, ~1 tick/sec per index).
--- Primary key on (ts, symbol) deduplicates WebSocket reconnect replays.
---
--- tick_vol  = volume increment from previous tick (derived, always 0 for indices
---             since NSE computed indices carry no traded volume — meaningful for
---             futures symbols if they are added later).
--- cum_vol   = Fyers cumulative day volume at this tick (raw from feed).
--- day_open/high/low  = expanding session OHLC as broadcast by exchange feed.
--- ch / chp  = points / % change from previous session close.
-CREATE TABLE IF NOT EXISTS ticks (
-    ts          TIMESTAMPTZ NOT NULL,
-    symbol      VARCHAR     NOT NULL,
-    ltp         DOUBLE      NOT NULL,
-    tick_vol    BIGINT      DEFAULT 0,
-    cum_vol     BIGINT      DEFAULT 0,
-    day_open    DOUBLE,
-    day_high    DOUBLE,
-    day_low     DOUBLE,
-    ch          DOUBLE,
-    chp         DOUBLE,
-    PRIMARY KEY (ts, symbol)
-);
-
-CREATE TABLE IF NOT EXISTS candles (
-    ts         TIMESTAMPTZ NOT NULL,
-    date       DATE        NOT NULL,
-    symbol     VARCHAR     NOT NULL,
-    resolution VARCHAR     NOT NULL,
-    open       DOUBLE,
-    high       DOUBLE,
-    low        DOUBLE,
-    close      DOUBLE,
-    volume     BIGINT,
-    PRIMARY KEY (ts, symbol, resolution)
-);
-
-CREATE TABLE IF NOT EXISTS oi_snapshots (
-    ts             TIMESTAMPTZ NOT NULL,
-    date           DATE        NOT NULL,
-    symbol         VARCHAR     NOT NULL,
-    spot           DOUBLE,
-    atm            INTEGER,
-    pcr            DOUBLE,
-    total_call_oi  BIGINT,
-    total_put_oi   BIGINT,
-    atm_call_oi    BIGINT,
-    atm_put_oi     BIGINT,
-    atm_call_iv    DOUBLE,
-    atm_put_iv     DOUBLE,
-    atm_iv         DOUBLE,
-    atm_call_prem  DOUBLE,
-    atm_put_prem   DOUBLE,
-    call_wall      INTEGER,
-    put_wall       INTEGER,
-    max_pain       INTEGER,
-    near_call_oi   BIGINT,
-    near_put_oi    BIGINT,
-    put_skew       DOUBLE,
-    PRIMARY KEY (ts, symbol)
-);
-
-CREATE TABLE IF NOT EXISTS futures_quotes (
-    ts             TIMESTAMPTZ NOT NULL,
-    date           DATE        NOT NULL,
-    symbol         VARCHAR     NOT NULL,
-    near_ltp       DOUBLE,
-    next_ltp       DOUBLE,
-    far_ltp        DOUBLE,
-    near_basis     DOUBLE,
-    next_basis     DOUBLE,
-    roll_spread    DOUBLE,
-    term_structure VARCHAR,
-    near_vol       BIGINT,
-    next_vol       BIGINT,
-    PRIMARY KEY (ts, symbol)
-);
-
-CREATE TABLE IF NOT EXISTS signals (
-    ts             TIMESTAMPTZ NOT NULL,
-    date           DATE        NOT NULL,
-    symbol         VARCHAR     NOT NULL,
-    weighted_score DOUBLE,
-    overall        VARCHAR,
-    score_5min     DOUBLE,
-    score_15min    DOUBLE,
-    score_60min    DOUBLE,
-    score_daily    DOUBLE,
-    signal_5min    VARCHAR,
-    signal_15min   VARCHAR,
-    signal_60min   VARCHAR,
-    signal_daily   VARCHAR,
-    rsi_5min       DOUBLE,
-    rsi_15min      DOUBLE,
-    macd_hist_15m  DOUBLE,
-    close_price    DOUBLE,
-    vwap_15min     DOUBLE,
-    bull_tfs       INTEGER,
-    bear_tfs       INTEGER,
-    PRIMARY KEY (ts, symbol)
-);
-
-CREATE TABLE IF NOT EXISTS trade_setups (
-    ts              TIMESTAMPTZ NOT NULL,
-    date            DATE        NOT NULL,
-    symbol          VARCHAR     NOT NULL,
-    timeframe       VARCHAR     NOT NULL,
-    signal          VARCHAR,
-    composite_score DOUBLE,
-    confidence      INTEGER,
-    direction       VARCHAR,
-    l1_tech         DOUBLE,
-    l2_oi           DOUBLE,
-    l3_velocity     DOUBLE,
-    l4_inst         DOUBLE,
-    l5_futures      DOUBLE,
-    l6_iv           DOUBLE,
-    l7_pcr          DOUBLE,
-    l8_maxpain      DOUBLE,
-    l9_context      DOUBLE,
-    agreement       INTEGER,
-    phase           VARCHAR,
-    spot            DOUBLE,
-    atm_iv          DOUBLE,
-    PRIMARY KEY (ts, symbol, timeframe)
-);
-
--- ── Per-strike option-chain snapshots ─────────────────────────────────────────
--- Written every ~3 min by the OI background poller for strikes near ATM.
--- oich / ltpch are vs PREVIOUS SESSION CLOSE (raw Fyers chain fields), so the
--- 4-quadrant OI-premium read (writing / buildup / covering / unwinding) can be
--- reconstructed per strike for any moment of the session — the strike-level
--- detail that total-OI aggregates hide (e.g. gap-up call unwinding).
-CREATE TABLE IF NOT EXISTS chain_snapshots (
-    ts      TIMESTAMPTZ NOT NULL,
-    date    DATE        NOT NULL,
-    symbol  VARCHAR     NOT NULL,
-    strike  INTEGER     NOT NULL,
-    side    VARCHAR     NOT NULL,
-    ltp     DOUBLE,
-    ltpch   DOUBLE,
-    oi      BIGINT,
-    oich    BIGINT,
-    volume  BIGINT,
-    delta   DOUBLE,
-    iv      DOUBLE,
-    PRIMARY KEY (ts, symbol, strike, side)
-);
-"""
+# Per-day DuckDB schema is the single source of truth in the storage layer.
+from tradebot.storage.schema import INTRADAY_DDL as _DDL  # noqa: F401  (kept for compat)
+from tradebot.storage.schema import init_intraday as _init_intraday
 
 _SENTINEL = object()   # poison pill sent by shutdown()
 
@@ -456,14 +309,7 @@ class IntradayDB:
             _DB_DIR.mkdir(parents=True, exist_ok=True)
             path = _DB_DIR / f"{today}.duckdb"
             self._conn = self._duckdb.connect(str(path))
-            self._conn.execute(_DDL)
-            # Migrate today's existing db (CREATE IF NOT EXISTS won't add columns):
-            # greeks for faithful replay (Phase 4.1). Old rows stay NULL.
-            for _col in ("delta DOUBLE", "iv DOUBLE"):
-                try:
-                    self._conn.execute(f"ALTER TABLE chain_snapshots ADD COLUMN IF NOT EXISTS {_col}")
-                except Exception:
-                    pass
+            _init_intraday(self._conn)   # create tables + apply idempotent migrations
             self._date = today
             self._tick_prev_vol.clear()   # new session — reset volume baselines
         return self._conn
