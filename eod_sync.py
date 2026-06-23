@@ -178,8 +178,19 @@ def main() -> None:
     print(f"        fetched {df}, up-to-date {ds}")
     print("  [3/4] merge paper-trades")
     _merge_trades(args.host, args.key, q)
-    print("  [4/4] merge footprint ledger")
+    print("  [4/5] merge footprint ledger")
     _merge_ledger(args.host, args.key, q)
+    print("  [5/5] refresh hour-forecast ledger (today's labeled rows)")
+    try:
+        import backtest_hour_forecast as hfb
+        new = hfb.harvest(hfb._captured_days())
+        if not new.empty:
+            comb = hfb._upsert(new)
+            print(f"        ledger now {len(comb)} rows / {comb['date'].nunique()} days")
+        else:
+            print("        nothing to harvest yet")
+    except Exception as exc:
+        print(f"        skipped: {exc}")
     print("eod_sync done.")
 
 
