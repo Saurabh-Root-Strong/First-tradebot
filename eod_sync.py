@@ -16,22 +16,30 @@ What it does (idempotent, safe to re-run):
 The VM is the authoritative capturer (24/7), so it is a superset on capture days;
 the additive copy + union-merge means the local archive only ever grows.
 
+Then, LAST, it PURGES the VM of any day BEFORE today whose files are already verified
+present locally (size match) — so the tiny t3.micro only ever holds the live (today's)
+capture and never fills up. Today's still-capturing files are never touched. This makes
+the laptop the permanent archive and keeps the VM lean. Disable with --no-purge.
+NOTE: purging old DAYS frees DISK; it does not change the live process's RAM use.
+
 Run:
-  python eod_sync.py            # pull + merge everything
+  python eod_sync.py            # pull + merge everything, then purge archived days off the VM
   python eod_sync.py --quiet    # less chatter (for the scheduled task)
+  python eod_sync.py --no-purge # pull + merge but leave the VM's copies in place
 Auto-schedule (runs ~15:45 IST weekdays, and ASAP if the laptop was asleep then):
   setup_eod_sync.bat
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from core.constants import PROJECT_ROOT, DATA_DIR, LIVE_DIR
+from core.constants import PROJECT_ROOT, DATA_DIR, LIVE_DIR, IST
 from sync_from_vm import DEF_HOST, DEF_KEY            # reuse VM connection config
 
 REMOTE_ROOT = os.environ.get("TRADEBOT_VM_ROOT", "~/tradebot")
@@ -155,32 +163,78 @@ def _merge_ledger(host: str, key: str, quiet: bool) -> int:
         return 0
 
 
+def _day_stem(name: str) -> str | None:
+    """Extract the YYYY-MM-DD date from a per-day filename, else None.
+    Handles '<date>_<table>.parquet' and '<date>.duckdb'."""
+    stem = name.split("_")[0] if name.endswith(".parquet") else name.rsplit(".", 1)[0]
+    try:
+        datetime.date.fromisoformat(stem)
+        return stem
+    except ValueError:
+        return None
+
+
+def _purge_vm(host: str, key: str, quiet: bool, today: str) -> int:
+    """Delete from the VM every per-day file that is (a) for a day BEFORE today and
+    (b) already byte-for-byte present locally. This is what keeps the t3.micro lean:
+    the laptop is the permanent archive, the VM only ever holds the live (today's)
+    capture. SAFETY: today's still-capturing files are NEVER touched, and a file is
+    removed only when the local copy's size matches the VM's (verified archived)."""
+    remote = {}
+    remote.update(_remote_listing(host, key, f"{REMOTE_ROOT}/data/intraday/live/*.parquet"))
+    remote.update(_remote_listing(host, key, f"{REMOTE_ROOT}/data/intraday/*.duckdb"))
+    targets: list[tuple[str, int]] = []
+    for rpath, rsize in remote.items():
+        name = Path(rpath).name
+        stem = _day_stem(name)
+        if not stem or stem >= today:           # skip non-dated + today/future (live)
+            continue
+        lpath = (LIVE_DIR / name) if name.endswith(".parquet") else (_INTRADAY / name)
+        if lpath.exists() and lpath.stat().st_size == rsize:   # verified archived locally
+            targets.append((rpath, rsize))
+    if not targets:
+        if not quiet:
+            print("        nothing to purge (VM holds only today's live files / nothing verified yet)")
+        return 0
+    # one ssh call deletes them all
+    _ssh(host, key, "rm -f " + " ".join(f"'{p}'" for p, _ in targets))
+    freed = sum(s for _, s in targets)
+    if not quiet:
+        for p, s in sorted(targets):
+            print(f"    - VM rm {Path(p).name}  ({s/1e6:.1f} MB)")
+    print(f"        purged {len(targets)} VM file(s), freed {freed/1e6:.1f} MB")
+    return freed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="post-close archival sync from the VM")
     ap.add_argument("--host", default=DEF_HOST)
     ap.add_argument("--key",  default=DEF_KEY)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-purge", action="store_true",
+                    help="skip deleting already-archived days from the VM (keep VM copies)")
     args = ap.parse_args()
     q = args.quiet
+    today = datetime.datetime.now(tz=IST).date().isoformat()
 
     if not Path(args.key).exists():
         print(f"SSH key not found: {args.key}", file=sys.stderr)
         sys.exit(1)
 
     print(f"eod_sync  {args.host}:{REMOTE_ROOT}  ->  {PROJECT_ROOT}")
-    print("  [1/4] per-day mirrors (live/*.parquet)")
+    print("  [1/6] per-day mirrors (live/*.parquet)")
     mf, ms = _sync_perday(args.host, args.key,
                           f"{REMOTE_ROOT}/data/intraday/live/*.parquet", LIVE_DIR, q)
     print(f"        fetched {mf}, up-to-date {ms}")
-    print("  [2/4] per-day duckdb (intraday/*.duckdb)")
+    print("  [2/6] per-day duckdb (intraday/*.duckdb)")
     df, ds = _sync_perday(args.host, args.key,
                           f"{REMOTE_ROOT}/data/intraday/*.duckdb", _INTRADAY, q)
     print(f"        fetched {df}, up-to-date {ds}")
-    print("  [3/4] merge paper-trades")
+    print("  [3/6] merge paper-trades")
     _merge_trades(args.host, args.key, q)
-    print("  [4/5] merge footprint ledger")
+    print("  [4/6] merge footprint ledger")
     _merge_ledger(args.host, args.key, q)
-    print("  [5/5] refresh hour-forecast ledger (today's labeled rows)")
+    print("  [5/6] refresh hour-forecast ledger (today's labeled rows)")
     try:
         import backtest_hour_forecast as hfb
         new = hfb.harvest(hfb._captured_days())
@@ -191,6 +245,12 @@ def main() -> None:
             print("        nothing to harvest yet")
     except Exception as exc:
         print(f"        skipped: {exc}")
+    # Purge LAST — only after every fetch/merge above has safely landed locally.
+    if args.no_purge:
+        print("  [6/6] purge VM (skipped: --no-purge)")
+    else:
+        print(f"  [6/6] purge VM of already-archived days (< {today})")
+        _purge_vm(args.host, args.key, q, today)
     print("eod_sync done.")
 
 
