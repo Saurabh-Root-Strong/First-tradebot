@@ -1103,6 +1103,13 @@ def _charts_help() -> "html.Details":
          "strangle); a sudden SPIKE = volatility expanding → a real move is starting → favour "
          "BUYING options / trading the breakout, don't sell vol; a big 'expected move' (₹230) "
          "while price barely moved = premium is rich → writing edge."),
+        ("Positioning flow (bottom panel)", "#a78bfa",
+         "WHAT: each bar = that bar's CHANGE in OI — calls plotted UP, puts plotted DOWN — "
+         "coloured by what was happening: red = call writing, amber = call buying, green = put "
+         "writing, lime = put buying, grey = positions closing.  WHY: this is the 'what are they "
+         "secretly doing' read.  HOW (the splitter): OI building + IV RISING = aggressive BUYING "
+         "(demand); OI building + IV flat/FALLING = WRITING (eating premium). The dotted purple "
+         "IV line on the premium panel is that splitter — watch it with the flow bars."),
     ]
     combos = [
         "Price UP + CE OI DOWN + premium rising = short-covering breakout with vol expansion "
@@ -1111,8 +1118,10 @@ def _charts_help() -> "html.Details":
         "Both OI rising while price ranges = two-sided writing → range tightens toward max-pain.",
         "Shaded band = the clicked timeframe window — line the OI turn up with the candle above it.",
     ]
-    caveat = ("OI turns only count on real volume — a turn on a thin bar is noise. Volume here is "
-              "OPTION volume (the index itself has none).")
+    caveat = ("Honest limit: every contract has a buyer AND a writer — so 'buy vs write' is the "
+              "AGGRESSOR (who initiated), inferred from IV, not a certainty. And OI turns only "
+              "count on real volume; a turn on a thin bar is noise. Volume here is OPTION volume "
+              "(the index itself has none).")
     body = [html.Div(intro, style={"color": "#cbd5e1", "fontSize": "0.56rem",
                      "lineHeight": "1.5", "marginBottom": "7px", "whiteSpace": "normal"})]
     for name, clr, txt in terms:
@@ -3902,11 +3911,13 @@ def _render_index_trades(sym) -> "html.Div":
 
 
 def _footprint_fig(sym, tf_min: int, asof_value=None) -> "go.Figure":
-    """4-panel popup chart for one index/timeframe — full session, tf-minute bars:
-      1. Price  — candlestick + close line (so price moves line up with OI).
-      2. Option OI — CE (ceiling) vs PE (floor): see writing build-up / unwinding.
+    """5-panel popup chart for one index/timeframe — full session, tf-minute bars:
+      1. Price  — candlestick + close line.
+      2. Option OI — CE (ceiling) vs PE (floor): writing build-up vs unwinding.
       3. Traded option volume per bar.
-      4. ATM-straddle premium (IV/decay pulse).
+      4. ATM-straddle premium + ATM IV (decay vs vol-expansion).
+      5. Positioning flow — per-bar ΔOI coloured BUY vs WRITE (inferred from IV):
+         the "what are they secretly doing" read. Calls plotted up, puts down.
     The clicked lookback window is shaded across every panel."""
     d = footprint_chart.build_series(sym, int(tf_min), as_of=_parse_asof(asof_value))
     if not d.get("has_data"):
@@ -3920,11 +3931,15 @@ def _footprint_fig(sym, tf_min: int, asof_value=None) -> "go.Figure":
     ts = d["ts"]
     label = LABELS.get(sym, sym)
     fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.045,
-        row_heights=[0.34, 0.26, 0.20, 0.20],
-        subplot_titles=(f"{label} price — {tf_min}m candles", "Option OI — CE vs PE (lakh)",
-                        "Traded option volume per bar (lakh)", "ATM straddle premium (₹)"))
-    # 1 — price: candlestick (the "graph chart") + a thin close line (the "line chart").
+        rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        row_heights=[0.30, 0.20, 0.12, 0.18, 0.20],
+        specs=[[{}], [{}], [{}], [{"secondary_y": True}], [{}]],
+        subplot_titles=(
+            f"{label} price — {tf_min}m candles", "Option OI — CE vs PE (lakh)",
+            "Traded option volume per bar (lakh)", "ATM straddle premium (₹) + ATM IV (%)",
+            "Positioning flow — ΔOI/bar · calls↑ puts↓ · red=call-write amber=call-buy "
+            "green=put-write lime=put-buy grey=closing"))
+    # 1 — price: candlestick + thin close line.
     fig.add_trace(go.Candlestick(
         x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"],
         name="price", increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
@@ -3933,32 +3948,52 @@ def _footprint_fig(sym, tf_min: int, asof_value=None) -> "go.Figure":
     fig.add_trace(go.Scatter(x=ts, y=d["close"], mode="lines", name="close",
                              line=dict(color="#67e8f9", width=1, dash="dot"),
                              connectgaps=True, opacity=0.7), row=1, col=1)
-    # 2 — OI CE vs PE: where writing builds (rising) or unwinds (falling).
+    # 2 — OI CE vs PE.
     fig.add_trace(go.Scatter(x=ts, y=d["oi_ce"], mode="lines", name="CE OI (ceiling)",
                              line=dict(color="#ef4444", width=1.6)), row=2, col=1)
     fig.add_trace(go.Scatter(x=ts, y=d["oi_pe"], mode="lines", name="PE OI (floor)",
                              line=dict(color="#22c55e", width=1.6)), row=2, col=1)
-    # 3 — volume, 4 — premium.
+    # 3 — volume.
     fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
                          marker_color="#22d3ee", opacity=0.75), row=3, col=1)
+    # 4 — premium (left axis) + ATM IV (right axis): decay vs vol-expansion.
     fig.add_trace(go.Scatter(x=ts, y=d["premium"], mode="lines", name="ATM straddle",
                              line=dict(color="#fbbf24", width=2),
-                             connectgaps=True), row=4, col=1)
-    # Shade the clicked lookback window (the delta the footprint row reports).
+                             connectgaps=True), row=4, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=ts, y=d.get("iv_ce"), mode="lines", name="ATM IV %",
+                             line=dict(color="#a78bfa", width=1.3, dash="dot"),
+                             connectgaps=True), row=4, col=1, secondary_y=True)
+    # 5 — positioning flow: per-bar ΔOI, colour = buy vs write (inferred from IV).
+    _CE = {"write": "#ef4444", "buy": "#f59e0b", "cover": "#64748b", "unwind": "#334155", "flat": "rgba(0,0,0,0)"}
+    _PE = {"write": "#22c55e", "buy": "#84cc16", "cover": "#64748b", "unwind": "#334155", "flat": "rgba(0,0,0,0)"}
+    ce_y = [abs(v) if v is not None else 0 for v in d["d_oi_ce"]]      # calls plotted up
+    pe_y = [-abs(v) if v is not None else 0 for v in d["d_oi_pe"]]     # puts plotted down
+    ce_c = [_CE.get(a, "#334155") for a in d["ce_act"]]
+    pe_c = [_PE.get(a, "#334155") for a in d["pe_act"]]
+    ce_t = [f"CALL {a} · ΔOI {v}L" for a, v in zip(d["ce_act"], d["d_oi_ce"])]
+    pe_t = [f"PUT {a} · ΔOI {v}L" for a, v in zip(d["pe_act"], d["d_oi_pe"])]
+    fig.add_trace(go.Bar(x=ts, y=ce_y, marker_color=ce_c, name="calls", showlegend=False,
+                         hovertext=ce_t, hoverinfo="x+text"), row=5, col=1)
+    fig.add_trace(go.Bar(x=ts, y=pe_y, marker_color=pe_c, name="puts", showlegend=False,
+                         hovertext=pe_t, hoverinfo="x+text"), row=5, col=1)
+    fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=5, col=1)
+    # Shade the clicked lookback window across every panel.
     if d.get("last_ts"):
         x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
-        for rr in (1, 2, 3, 4):
+        for rr in (1, 2, 3, 4, 5):
             fig.add_vrect(x0=x0, x1=d["last_ts"], fillcolor="#67e8f9",
                           opacity=0.08, line_width=0, row=rr, col=1)
-    fig.update_layout(template="plotly_dark", height=760,
-                      margin=dict(l=54, r=18, t=46, b=28),
+    fig.update_yaxes(title_text="IV %", row=4, col=1, secondary_y=True,
+                     showgrid=False, color="#a78bfa")
+    fig.update_layout(template="plotly_dark", height=940,
+                      margin=dict(l=54, r=46, t=46, b=28),
                       paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD,
-                      bargap=0.15, showlegend=True,
-                      legend=dict(orientation="h", y=1.07, x=0, font=dict(size=9)),
+                      barmode="overlay", bargap=0.15, showlegend=True,
+                      legend=dict(orientation="h", y=1.05, x=0, font=dict(size=9)),
                       font=dict(size=10))
     fig.update_xaxes(rangeslider_visible=False)   # candlestick adds one by default
     for a in fig["layout"]["annotations"]:        # subplot titles
-        a["font"] = dict(size=11, color="#94a3b8")
+        a["font"] = dict(size=10.5, color="#94a3b8")
     return fig
 
 
