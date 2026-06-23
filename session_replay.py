@@ -80,10 +80,8 @@ def _label(sym_full: str | None) -> str:
 
 _LIVE_DIR = DB_DIR / "live"   # Parquet snapshots written by dashboard after each flush
 
-_PARQUET_TABLES = (
-    "ticks", "candles", "oi_snapshots",
-    "futures_quotes", "signals", "trade_setups",
-)
+from tradebot.storage.schema import CAPTURE_TABLES   # single source for the 6 core tables
+_PARQUET_TABLES = CAPTURE_TABLES
 
 _live_notice_shown = False   # print the "[live] snapshot" banner at most once per run
 
@@ -210,7 +208,7 @@ def cmd_list() -> None:
             con = duckdb.connect(str(f), read_only=True)
             counts = {
                 t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-                for t in ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals", "trade_setups")
+                for t in CAPTURE_TABLES
             }
             con.close()
             row_total = sum(counts.values())
@@ -224,7 +222,7 @@ def cmd_list() -> None:
 
 def cmd_stats(date: datetime.date) -> None:
     _hdr(f"SESSION STATS  {date}")
-    tables = ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals", "trade_setups")
+    tables = CAPTURE_TABLES
     for t in tables:
         df = _run(date, f"SELECT COUNT(*) AS rows FROM {t}")
         n  = int(df.iloc[0]["rows"]) if not df.empty else 0
@@ -786,7 +784,7 @@ def cmd_export(date: datetime.date, fmt: str, out_dir: Path) -> None:
         print(f"  No session data for {date}")
         return
 
-    for tbl in ("ticks","candles","oi_snapshots","futures_quotes","signals","trade_setups"):
+    for tbl in CAPTURE_TABLES:
         try:
             df   = con.execute(f"SELECT * FROM {tbl} ORDER BY ts").df()
             stem = f"{date}_{tbl}"

@@ -163,6 +163,10 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
 );
 """
 
+# The six core capture tables, in canonical order (chain_snapshots is per-strike
+# and handled on its own path — parquet-exported / queried separately).
+CAPTURE_TABLES = ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals", "trade_setups")
+
 # Columns added to chain_snapshots after the table first shipped — applied as
 # idempotent ALTERs so an existing duckdb (CREATE IF NOT EXISTS won't add columns)
 # gains them. greeks for faithful replay (Phase 4.1). Old rows stay NULL.
