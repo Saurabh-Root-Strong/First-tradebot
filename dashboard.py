@@ -3505,7 +3505,7 @@ def _panel_help(what: str, read: list[str], caveat: str = "") -> "html.Details":
     guide is one click away (and survives on mobile — it's a real expander, not a
     hover tooltip)."""
     body = [html.Div(what, style={"color": "#cbd5e1", "fontSize": "0.56rem",
-                                  "lineHeight": "1.5", "marginBottom": "5px", "whiteSpace": "normal"})]
+                                  "lineHeight": "1.5", "marginBottom": "5px", "whiteSpace": "pre-line"})]
     body += [html.Div("• " + r, style={"color": "#94a3b8", "fontSize": "0.54rem",
                                        "lineHeight": "1.5", "whiteSpace": "normal"}) for r in read]
     if caveat:
@@ -3725,9 +3725,16 @@ def _render_conductor(asof_value=None, snap=None) -> "html.Div":
                   "  ·  decision-support · % = conviction (signal agreement), NOT win-rate",
                   style={"color": "#64748b", "fontSize": "0.55rem"}),
         _panel_help(
-            "ONE evolving stance per index, all session. Fuses the opening call (fading by "
-            "~11am) + live regime + momentum + OI into a single 'where are we now' directive — "
-            "the Opening Playbook kept current instead of going stale.",
+            "In plain words: ONE line that tells you what the market is doing RIGHT NOW for this "
+            "index — every refresh, all session. It fuses the morning call (fading by ~11am) + live "
+            "regime + momentum + OI so you don't have to read 4 panels and guess if the old call "
+            "still holds.\n"
+            "EXAMPLE — reading NIFTY at 12:30 you might see: 'LONG · ✓2.1σ · 68% conv · WRITE PE "
+            "24500 · act now · opened LONG→LONG · wrong below 24450 · regime→trend ~40m'. That reads "
+            "as: right now Nifty leans UP, the move is real (not noise), the signals mostly agree, "
+            "the way to play it is sell the 24500 puts, the entry window is open now, this view has "
+            "held since the open, and if Nifty breaks BELOW 24450 the bullish idea is dead — step "
+            "aside. A NEUTRAL/FLAT card with a low σ = chop, no trade.",
             ["LONG / SHORT / FLAT = net directional stance.",
              "~0.9σ drift vs ✓2.0σ = move quality. Under 2σ = whipsaw zone, NO edge — don't chase. ≥2σ = confirmed.",
              "% conv = how much the sub-signals agree. NOT a win-rate.",
