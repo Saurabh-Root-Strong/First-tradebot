@@ -1067,39 +1067,72 @@ app.index_string = app.index_string.replace("</head>", _CSS + "</head>")
 
 
 def _charts_help() -> "html.Details":
-    """Plain-English 'what is this / how to read' for the Charts section, embedded
-    in its heading. Inlined (not via _panel_help, which is defined after the layout)."""
-    what = ("Five lenses on one timeframe, full session. Candles = index price (green up / "
-            "red down, wicks = rejection). Dotted line = close. Red CE OI = total call "
-            "writing (resistance / ceiling). Green PE OI = total put writing (support / "
-            "floor). Cyan bars = traded option volume. Amber = ATM straddle premium "
-            "(IV / expected-move pulse).")
-    read = [
-        "CE OI rising = ceiling building (capped). CE OI FALLING = call unwind / short-cover "
-        "= ceiling lifting (bullish fuel).",
-        "PE OI rising = floor building (bullish). PE OI falling = puts unwind = floor cracking "
-        "(bearish).",
-        "Price UP + CE OI DOWN = short-covering breakout (strong up). Price DOWN + PE OI DOWN "
-        "= long-unwind breakdown (strong down).",
+    """Plain-English explainer for the Charts section — each series as What / Why /
+    How. Embedded in the heading. Inlined (not via _panel_help, which is defined
+    after the layout)."""
+    intro = ("Five lenses on one timeframe, full session. PRICE tells you WHAT happened · "
+             "OI tells you WHO is defending where (the walls) · VOLUME tells you IF it is "
+             "real · the STRADDLE tells you HOW scared or calm the market is. Read together "
+             "you see WHY a move happened, not just that it did.")
+    # (label, colour, what / why / how)
+    terms = [
+        ("Price — candles", "#e2e8f0",
+         "WHAT: index open/high/low/close per bar (green up, red down; a long wick = that "
+         "level was rejected).  WHY: the actual move + the levels buyers/sellers fight over.  "
+         "HOW: read trend, entries and rejections off highs/lows."),
+        ("close (dotted cyan)", "#67e8f9",
+         "WHAT: the closing price as a smooth line.  WHY: trend without the wick noise.  "
+         "HOW: confirm direction; watch where the line turns vs where OI turns."),
+        ("CE OI (red)", "#ef4444",
+         "WHAT: total CALL open interest.  WHY: call writing = sellers capping a level = "
+         "RESISTANCE / ceiling.  HOW: RISING = ceiling building (price capped); FALLING = "
+         "calls unwinding / short-covering = ceiling lifting (bullish fuel)."),
+        ("PE OI (green)", "#22c55e",
+         "WHAT: total PUT open interest.  WHY: put writing = sellers defending below = "
+         "SUPPORT / floor.  HOW: RISING = floor building (bullish); FALLING = puts unwinding "
+         "= floor cracking (bearish)."),
+        ("Volume (cyan bars)", "#22d3ee",
+         "WHAT: traded option volume in the bar.  WHY: the conviction behind a move.  "
+         "HOW: an OI change on HIGH volume is trustworthy; on a thin bar it is just noise."),
+        ("ATM straddle (amber)", "#fbbf24",
+         "WHAT: the ATM call + the ATM put added together (strike nearest spot — e.g. NIFTY "
+         "24,100 → 24,100 CE ₹120 + PE ₹110 = straddle ₹230).  WHY: it is the market's PRICE "
+         "of expected movement — how far the index is expected to travel up OR down by expiry, "
+         "direction stripped out: pure volatility + fear + time-value.  HOW: falling all day in "
+         "a range = time-decay (theta) bleed → option BUYERS lose, WRITERS win (sell straddle/"
+         "strangle); a sudden SPIKE = volatility expanding → a real move is starting → favour "
+         "BUYING options / trading the breakout, don't sell vol; a big 'expected move' (₹230) "
+         "while price barely moved = premium is rich → writing edge."),
+    ]
+    combos = [
+        "Price UP + CE OI DOWN + premium rising = short-covering breakout with vol expansion "
+        "(strong, real up-move).",
+        "Price DOWN + PE OI DOWN = long-unwinding breakdown (strong down).",
         "Both OI rising while price ranges = two-sided writing → range tightens toward max-pain.",
-        "Premium spike + big volume bar = something real starting (don't fade). Falling premium "
-        "= calm / decay / range.",
         "Shaded band = the clicked timeframe window — line the OI turn up with the candle above it.",
     ]
     caveat = ("OI turns only count on real volume — a turn on a thin bar is noise. Volume here is "
               "OPTION volume (the index itself has none).")
-    body = [html.Div(what, style={"color": "#cbd5e1", "fontSize": "0.56rem",
-                                  "lineHeight": "1.5", "marginBottom": "5px", "whiteSpace": "pre-line"})]
-    body += [html.Div("• " + r, style={"color": "#94a3b8", "fontSize": "0.54rem",
-                                       "lineHeight": "1.5", "whiteSpace": "normal"}) for r in read]
+    body = [html.Div(intro, style={"color": "#cbd5e1", "fontSize": "0.56rem",
+                     "lineHeight": "1.5", "marginBottom": "7px", "whiteSpace": "normal"})]
+    for name, clr, txt in terms:
+        body.append(html.Div([
+            html.Span(name + " — ", style={"color": clr, "fontWeight": "700"}),
+            html.Span(txt, style={"color": "#94a3b8"}),
+        ], style={"fontSize": "0.54rem", "lineHeight": "1.5", "marginBottom": "5px",
+                  "whiteSpace": "normal"}))
+    body.append(html.Div("Read them together", style={"color": "#67e8f9", "fontWeight": "700",
+                "fontSize": "0.54rem", "marginTop": "6px", "marginBottom": "3px"}))
+    body += [html.Div("• " + c, style={"color": "#94a3b8", "fontSize": "0.54rem",
+             "lineHeight": "1.5", "whiteSpace": "normal"}) for c in combos]
     body.append(html.Div("⚠ " + caveat, style={"color": "#fbbf24", "fontSize": "0.54rem",
-                "lineHeight": "1.45", "marginTop": "5px", "whiteSpace": "normal"}))
+                "lineHeight": "1.45", "marginTop": "6px", "whiteSpace": "normal"}))
     return html.Details([
         html.Summary("ℹ what is this · how to read", style={
             "color": "#67e8f9", "fontSize": "0.54rem", "cursor": "pointer", "marginLeft": "8px"}),
-        html.Div(body, style={"maxHeight": "260px", "overflowY": "auto", "marginTop": "5px",
-                 "padding": "7px 9px", "background": "#0a0f1a", "border": "1px solid #1e2d40",
-                 "borderRadius": "4px", "maxWidth": "640px"}),
+        html.Div(body, style={"maxHeight": "360px", "overflowY": "auto", "marginTop": "5px",
+                 "padding": "8px 10px", "background": "#0a0f1a", "border": "1px solid #1e2d40",
+                 "borderRadius": "4px", "maxWidth": "660px"}),
     ], style={"display": "inline-block", "verticalAlign": "middle"})
 
 
