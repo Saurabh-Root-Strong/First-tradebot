@@ -17,6 +17,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import footprint_chart   # full-session OI/Volume/ATM-premium series for the popup chart
+import hour_forecast     # next-60-min zone + directional lean (accumulating, unproven)
 from fyers_apiv3.FyersWebsocket import data_ws
 from signals import run_full_analysis, fetch_ohlcv, _vwap
 from trade_setup import build_recommendation, TF_PROFILES
@@ -4211,6 +4212,65 @@ def _trade_card(t, fc=None) -> "html.Div":
     ], style={"padding": "9px 0", "borderBottom": "1px solid #111d2e", **MONO})
 
 
+def _render_hour_forecast(asof_value=None) -> "html.Div":
+    """Next-~60-min ZONE (calibrated ~68% range) + a directional lean (UNPROVEN).
+    The range is the honest output; the lean is shown faint until the accumulating
+    ledger (backtest_hour_forecast.py) proves it beats a coin-flip out-of-sample."""
+    as_of = _parse_asof(asof_value)
+    head = html.Div([
+        html.Span("🎯 NEXT-HOUR ZONE", style={"color": "#a78bfa", "fontWeight": "700",
+                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
+        html.Span("  ~60-min range (calibrated ≈68%) + directional lean",
+                  style={"color": "#64748b", "fontSize": "0.55rem"}),
+        _panel_help(
+            "A forward read for the next ~60 minutes: a price ZONE (where spot likely sits in an "
+            "hour) plus a faint directional lean. The zone is realised-vol based and calibrated to "
+            "~68% hit; the lean reuses the opening-playbook composite.",
+            ["lo – hi = the ~68% zone for spot in ~60 min (±band% shown).",
+             "lean ▲/▼ p_up = directional tilt + prob — UNPROVEN, shown faint on purpose.",
+             "the zone is the trustworthy part (vol forecasts range); direction is not yet validated.",
+             "every session adds a labeled day to the ledger — the lean goes solid only if it clears 50% OOS."],
+            "Scaffold accumulating a track record (backtest_hour_forecast.py). Direction has NO measured "
+            "edge yet — trade the ZONE as context, not the arrow. NOT wired to auto-execution."),
+    ], style={"marginBottom": "6px"})
+
+    cols = []
+    for sym in INDEX_SYMBOLS:
+        cd = COLORS.get(sym, "#a78bfa")
+        f = {}
+        try:
+            f = hour_forecast.forecast(sym, as_of=as_of)
+        except Exception:
+            f = {}
+        if not f.get("has_data"):
+            body = html.Div("warming up — need ticks + OI", style={"color": "#475569", "fontSize": "0.55rem"})
+        else:
+            lo, hi = f.get("lo"), f.get("hi")
+            up = (f.get("p_up") or 0.5) >= 0.5
+            lean_clr = "#22c55e" if up else "#ef4444"
+            zone = (f"{lo:,.0f} – {hi:,.0f}" if (lo is not None and hi is not None) else "—")
+            body = html.Div([
+                html.Div(zone, style={"color": "#e2e8f0", "fontWeight": "700", "fontSize": "0.74rem", **MONO}),
+                html.Div(f"±{f.get('exp_move_pct')}% · ~68% zone" if f.get("exp_move_pct") else "",
+                         style={"color": "#64748b", "fontSize": "0.5rem"}),
+                html.Div([
+                    html.Span("lean ", style={"color": "#475569", "fontSize": "0.52rem"}),
+                    html.Span(f"{'▲' if up else '▼'} {f.get('direction','—')} ",
+                              style={"color": lean_clr, "fontSize": "0.56rem", "opacity": 0.55}),
+                    html.Span(f"p_up {100*(f.get('p_up') or 0):.0f}%  ·  unproven",
+                              style={"color": "#475569", "fontSize": "0.48rem", "opacity": 0.7}),
+                ], style={"marginTop": "2px"}),
+            ])
+        cols.append(dbc.Col([
+            html.Div(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
+                     "fontSize": "0.58rem", "letterSpacing": "0.06em", "marginBottom": "3px"}),
+            body,
+        ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {cd}33"}))
+    return html.Div([head, dbc.Row(cols, className="gx-0")], style={
+        "marginBottom": "10px", "padding": "9px 11px", "borderRadius": "4px",
+        "background": "#0a0f1a", "border": "1px solid #211a3a", **MONO})
+
+
 def _render_trade_book(asof_value=None) -> "html.Div":
     """Full Trade Book cockpit — trades by index with levels, progress, and reason."""
     led   = intraday_trades.get_ledger()
@@ -4281,9 +4341,10 @@ def _render_trade_book(asof_value=None) -> "html.Div":
     conductor = _render_conductor(asof_value, snap)
     footprint = _render_trade_book_footprint(asof_value, snap)
     playbook = _render_opening_playbook(asof_value, snap)
+    hour_zone = _render_hour_forecast(asof_value)
 
     if not rows:
-        return html.Div([header, strat_banner, conductor, footprint, playbook, regime_radar, pred_dropdown, html.Div(
+        return html.Div([header, strat_banner, conductor, hour_zone, footprint, playbook, regime_radar, pred_dropdown, html.Div(
             "No trades yet today — signals log here as the engine fires across all 4 indices.",
             style={"color": "#475569", "fontSize": "0.75rem", **MONO})])
 
@@ -4306,7 +4367,7 @@ def _render_trade_book(asof_value=None) -> "html.Div":
             html.Div(cards),
         ], md=3, style={"padding": "0 9px"}))
 
-    return html.Div([header, strat_banner, conductor, footprint, playbook, regime_radar, pred_dropdown,
+    return html.Div([header, strat_banner, conductor, hour_zone, footprint, playbook, regime_radar, pred_dropdown,
                      dbc.Row(cols, className="gx-0")],
                     style={"background": BG_CARD, "border": "1px solid #111d2e",
                            "borderRadius": "10px", "padding": "16px 18px"})

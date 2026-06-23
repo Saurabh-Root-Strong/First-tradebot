@@ -36,6 +36,11 @@ _W = {"or": 0.20, "gap": 0.10, "oi": 0.25, "prem": 0.15, "fut": 0.10}
 _WTOT = sum(_W.values())
 _SIG_FLOOR = 0.02          # min 1-min sigma %
 _P_K = 2.5                 # logistic steepness mapping composite -> p(up)
+# Range multiplier: 1-min realised vol scaled by sqrt(60) OVER-states the 60-min
+# move (microstructure bounce), so a raw 1-sigma band over-covers (~93%). 0.47 was
+# the empirical 68%-coverage multiplier on the first 116-row ledger; recalibrate as
+# the ledger grows (backtest_hour_forecast.py prints close-in-band).
+_RANGE_M = 0.47
 
 
 def _sigma1_pct(ticks: pd.DataFrame, upto) -> float | None:
@@ -82,20 +87,21 @@ def features(sym: str, as_of: Optional[datetime.datetime] = None,
     }
 
 
-def predict(feat: dict, m: float = 1.0) -> dict:
-    """v0 forecast from a feature vector. m = range half-width in sigma (1.0 ~= 68%)."""
+def predict(feat: dict, m: float = _RANGE_M) -> dict:
+    """v0 forecast from a feature vector. m = calibrated band half-width multiplier."""
     if not feat:
         return {"has_data": False}
     comp = sum(_W[k] * feat.get(f"f_{k}", 0.0) for k in _W) / _WTOT     # [-1,1]-ish
     p_up = 1.0 / (1.0 + math.exp(-_P_K * comp))
     spot = feat.get("spot", 0.0)
     sig1 = feat.get("sigma1", np.nan)
-    sig60 = (max(sig1, _SIG_FLOOR) * math.sqrt(60)) if (sig1 == sig1) else np.nan  # %
-    band = (spot * m * sig60 / 100.0) if (sig60 == sig60 and spot) else np.nan
+    sig60 = (max(sig1, _SIG_FLOOR) * math.sqrt(60)) if (sig1 == sig1) else np.nan  # raw %
+    band_pct = (m * sig60) if (sig60 == sig60) else np.nan                          # calibrated band %
+    band = (spot * band_pct / 100.0) if (band_pct == band_pct and spot) else np.nan
     direction = "BULLISH" if comp > 0.10 else "BEARISH" if comp < -0.10 else "NEUTRAL"
     return {
         "has_data": True, "direction": direction, "composite": round(comp, 3),
-        "p_up": round(p_up, 3), "exp_move_pct": (round(sig60, 3) if sig60 == sig60 else None),
+        "p_up": round(p_up, 3), "exp_move_pct": (round(band_pct, 3) if band_pct == band_pct else None),
         "lo": (round(spot - band, 1) if band == band else None),
         "hi": (round(spot + band, 1) if band == band else None),
         "spot": spot,
