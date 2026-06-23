@@ -91,9 +91,9 @@ except Exception:
 # ── Constants ──────────────────────────────────────────────────────────────────
 from core.constants import IST, INDEX_SYMBOLS, LABELS   # single source of truth
 from tradebot.adapters.broker import token as _broker_token   # single broker-token source
+from tradebot.adapters.broker import rest as _broker_rest     # single Fyers REST-fetch source
 APP_ID     = _broker_token.APP_ID
 TOKEN_FILE = _broker_token.TOKEN_FILE   # PROJECT_ROOT-anchored (was CWD-relative)
-OC_URL     = "https://api-t1.fyers.in/data/options-chain-v3"
 SEP        = "─" * 58
 
 COLORS = {
@@ -117,18 +117,8 @@ _history: dict[str, deque] = {s: deque(maxlen=1800) for s in INDEX_SYMBOLS}
 _ws     = None
 _seen:  set[str] = set()
 
-_oc_lock  = threading.Lock()
-# Per-(sym, expiry) option-chain cache. The Fyers option-chain endpoint is
-# rate/quota limited ("request limit reached"); the poller AND every UI callback
-# call fetch_option_chain independently, so a single-slot 2s cache (one sym at a
-# time) collapsed to ~zero hits across 4 rotating indices → each callback hit
-# Fyers fresh → burst → limit tripped mid-morning. A keyed cache with a TTL that
-# matches the genuine OI refresh cadence (~25s) lets all callers share one fetch
-# per index per window. Errors are cached briefly so a hit limit backs off instead
-# of being re-hammered every refresh.
-_oc_cache: dict = {}          # (sym, expiry) -> {"data":.., "ts":.., "ttl":..}
-_OC_TTL     = 25.0            # seconds to reuse a good chain (matches 30s poll)
-_OC_ERR_TTL = 8.0            # back-off after a failed/limited fetch
+# Option-chain fetch + its quota-aware keyed cache now live in the broker adapter
+# (tradebot.adapters.broker.rest) — fetch_option_chain below delegates there.
 
 
 # ── Token validation ───────────────────────────────────────────────────────────
@@ -186,9 +176,8 @@ def _validate_token() -> str:
 
 
 # ── Option chain API + cache ───────────────────────────────────────────────────
-def _expiry_to_epoch(expiry_val: str) -> str:
-    """expiry_val is already the epoch string returned by Fyers expiryData."""
-    return expiry_val or ""
+_expiry_to_epoch  = _broker_rest.expiry_to_epoch
+fetch_option_chain = _broker_rest.fetch_option_chain
 
 
 def _get_auth() -> str:
@@ -196,71 +185,10 @@ def _get_auth() -> str:
     return _broker_token.auth_header()
 
 
-def fetch_option_chain(sym: str, expiry: str = "", n_strikes: int = 15) -> dict:
-    key = (sym, expiry)
-    now = time.time()
-    with _oc_lock:
-        e = _oc_cache.get(key)
-        if e and now - e["ts"] < e["ttl"]:
-            return e["data"]
-    try:
-        resp = requests.get(
-            OC_URL,
-            headers={
-                "Authorization": _get_auth(),
-                "Content-Type":  "application/json",
-                "version":       "3",
-            },
-            params={
-                "symbol":      sym,
-                "strikecount": n_strikes,
-                "timestamp":   _expiry_to_epoch(expiry) if expiry else "",
-                "greeks":      "1",
-            },
-            timeout=10,
-        )
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"s": "error", "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
-    except Exception as e:
-        data = {"s": "error", "message": str(e)}
-    ttl = _OC_TTL if data.get("s") == "ok" else _OC_ERR_TTL
-    with _oc_lock:
-        _oc_cache[key] = {"data": data, "ts": time.time(), "ttl": ttl}
-    return data
-
-
 # ── Futures helpers ────────────────────────────────────────────────────────────
-_MONTH_ABB = {1:"JAN",2:"FEB",3:"MAR",4:"APR",5:"MAY",6:"JUN",
-              7:"JUL",8:"AUG",9:"SEP",10:"OCT",11:"NOV",12:"DEC"}
-_FUT_UNDERLYING = {
-    "NSE:NIFTY50-INDEX":    "NIFTY",
-    "NSE:NIFTYBANK-INDEX":  "BANKNIFTY",
-    "NSE:FINNIFTY-INDEX":   "FINNIFTY",
-    "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY",
-}
-_FUT_LABELS = ["NEAR", "NEXT", "FAR "]
-
-
-def _futures_symbols(index_sym: str) -> list[dict]:
-    """Build near/next/far futures symbols for the given index."""
-    ul = _FUT_UNDERLYING.get(index_sym, "")
-    if not ul:
-        return []
-    now = datetime.datetime.now(tz=IST)
-    out = []
-    for i in range(3):
-        mo = (now.month - 1 + i) % 12 + 1
-        yr = now.year + (now.month - 1 + i) // 12
-        sym = f"NSE:{ul}{str(yr)[2:]}{_MONTH_ABB[mo]}FUT"
-        out.append({"symbol": sym, "label": _FUT_LABELS[i],
-                    "month": f"{_MONTH_ABB[mo]} {yr}"})
-    return out
-
-
-_fut_cache: dict = {}
-_fut_lock  = threading.Lock()
+# Symbol-building + the cached REST fetch live in the broker adapter
+# (tradebot.adapters.broker.rest). dashboard keeps only the storage side-effect.
+_futures_symbols = _broker_rest.futures_symbols
 
 
 def _idb_write_futures(index_sym: str, futures: list) -> None:
@@ -274,53 +202,10 @@ def _idb_write_futures(index_sym: str, futures: list) -> None:
 
 
 def fetch_futures(index_sym: str) -> list[dict]:
-    """Fetch near/next/far futures quotes. Cached 2s."""
-    with _fut_lock:
-        c = _fut_cache.get(index_sym)
-        if c and time.time() - c["ts"] < 2:
-            return c["data"]
-
-    sym_info = _futures_symbols(index_sym)
-    if not sym_info:
-        return []
-    try:
-        resp = requests.get(
-            "https://api-t1.fyers.in/data/quotes",
-            headers={"Authorization": _get_auth(),
-                     "Content-Type": "application/json", "version": "3"},
-            params={"symbols": ",".join(s["symbol"] for s in sym_info)},
-            timeout=10,
-        )
-        raw = resp.json()
-    except Exception:
-        return []
-
-    if raw.get("s") != "ok":
-        return []
-
-    q_map = {item["n"]: item.get("v", {}) for item in raw.get("d", [])}
-    result = []
-    for info in sym_info:
-        v = q_map.get(info["symbol"], {})
-        result.append({
-            **info,
-            "ltp":   v.get("lp",               0) or 0,
-            "ch":    v.get("ch",                0) or 0,
-            "chp":   v.get("chp",               0) or 0,
-            "high":  v.get("high_price",        0) or 0,
-            "low":   v.get("low_price",         0) or 0,
-            "open":  v.get("open_price",        0) or 0,
-            "prev":  v.get("prev_close_price",  0) or 0,
-            "vol":   v.get("volume",            0) or 0,
-            "bid":   v.get("bid",               0) or 0,
-            "ask":   v.get("ask",               0) or 0,
-            "atp":   v.get("atp",               0) or 0,
-        })
-
-    with _fut_lock:
-        _fut_cache[index_sym] = {"data": result, "ts": time.time()}
-    _idb_write_futures(index_sym, result)
-    return result
+    """Fetch near/next/far futures quotes (broker adapter) + persist the strip.
+    DB write fires only on a fresh network fetch (not cache hits) via on_fresh."""
+    return _broker_rest.fetch_futures(
+        index_sym, on_fresh=lambda r: _idb_write_futures(index_sym, r))
 
 
 def render_futures(futures: list[dict], spot: float) -> html.Div:
@@ -667,26 +552,7 @@ def _oi_background_poller():
         time.sleep(POLL_FAST if datetime.datetime.now(tz=IST).time() < SLOW_AFTER else POLL_SLOW)
 
 
-def _fetch_quotes(symbols: list[str]) -> dict:
-    """Fetch last price (lp) for a list of Fyers symbols via /data/quotes."""
-    if not symbols:
-        return {}
-    out: dict = {}
-    try:
-        resp = requests.get(
-            "https://api-t1.fyers.in/data/quotes",
-            headers={"Authorization": _get_auth(), "version": "3"},
-            params={"symbols": ",".join(symbols)},
-            timeout=8,
-        )
-        for item in (resp.json().get("d") or []):
-            n = item.get("n")
-            lp = (item.get("v") or {}).get("lp")
-            if n and lp is not None:
-                out[n] = float(lp)
-    except Exception:
-        pass
-    return out
+_fetch_quotes = _broker_rest.fetch_quotes   # /data/quotes lp map — broker adapter
 
 
 class LiveFeed:
