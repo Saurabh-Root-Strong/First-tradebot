@@ -3781,8 +3781,12 @@ def _render_index_trades(sym) -> "html.Div":
 
 
 def _footprint_fig(sym, tf_min: int, asof_value=None) -> "go.Figure":
-    """3-panel popup chart for one index/timeframe: ATM-straddle premium, CE/PE OI,
-    traded volume — full session, tf-minute bars, with the clicked window shaded."""
+    """4-panel popup chart for one index/timeframe — full session, tf-minute bars:
+      1. Price  — candlestick + close line (so price moves line up with OI).
+      2. Option OI — CE (ceiling) vs PE (floor): see writing build-up / unwinding.
+      3. Traded option volume per bar.
+      4. ATM-straddle premium (IV/decay pulse).
+    The clicked lookback window is shaded across every panel."""
     d = footprint_chart.build_series(sym, int(tf_min), as_of=_parse_asof(asof_value))
     if not d.get("has_data"):
         fig = go.Figure()
@@ -3793,32 +3797,45 @@ def _footprint_fig(sym, tf_min: int, asof_value=None) -> "go.Figure":
                           xaxis=dict(visible=False), yaxis=dict(visible=False))
         return fig
     ts = d["ts"]
+    label = LABELS.get(sym, sym)
     fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-        row_heights=[0.40, 0.34, 0.26],
-        subplot_titles=("ATM straddle premium (₹)", "Option OI — CE vs PE (lakh)",
-                        "Traded option volume per bar (lakh)"))
-    fig.add_trace(go.Scatter(x=ts, y=d["premium"], mode="lines", name="ATM straddle",
-                             line=dict(color="#fbbf24", width=2),
-                             connectgaps=True), row=1, col=1)
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.045,
+        row_heights=[0.34, 0.26, 0.20, 0.20],
+        subplot_titles=(f"{label} price — {tf_min}m candles", "Option OI — CE vs PE (lakh)",
+                        "Traded option volume per bar (lakh)", "ATM straddle premium (₹)"))
+    # 1 — price: candlestick (the "graph chart") + a thin close line (the "line chart").
+    fig.add_trace(go.Candlestick(
+        x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"],
+        name="price", increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
+        increasing_fillcolor="#22c55e", decreasing_fillcolor="#ef4444",
+        line=dict(width=1), showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=ts, y=d["close"], mode="lines", name="close",
+                             line=dict(color="#67e8f9", width=1, dash="dot"),
+                             connectgaps=True, opacity=0.7), row=1, col=1)
+    # 2 — OI CE vs PE: where writing builds (rising) or unwinds (falling).
     fig.add_trace(go.Scatter(x=ts, y=d["oi_ce"], mode="lines", name="CE OI (ceiling)",
                              line=dict(color="#ef4444", width=1.6)), row=2, col=1)
     fig.add_trace(go.Scatter(x=ts, y=d["oi_pe"], mode="lines", name="PE OI (floor)",
                              line=dict(color="#22c55e", width=1.6)), row=2, col=1)
+    # 3 — volume, 4 — premium.
     fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
                          marker_color="#22d3ee", opacity=0.75), row=3, col=1)
+    fig.add_trace(go.Scatter(x=ts, y=d["premium"], mode="lines", name="ATM straddle",
+                             line=dict(color="#fbbf24", width=2),
+                             connectgaps=True), row=4, col=1)
     # Shade the clicked lookback window (the delta the footprint row reports).
     if d.get("last_ts"):
         x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
-        for rr in (1, 2, 3):
+        for rr in (1, 2, 3, 4):
             fig.add_vrect(x0=x0, x1=d["last_ts"], fillcolor="#67e8f9",
                           opacity=0.08, line_width=0, row=rr, col=1)
-    fig.update_layout(template="plotly_dark", height=640,
+    fig.update_layout(template="plotly_dark", height=760,
                       margin=dict(l=54, r=18, t=46, b=28),
                       paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD,
                       bargap=0.15, showlegend=True,
-                      legend=dict(orientation="h", y=1.10, x=0, font=dict(size=9)),
+                      legend=dict(orientation="h", y=1.07, x=0, font=dict(size=9)),
                       font=dict(size=10))
+    fig.update_xaxes(rangeslider_visible=False)   # candlestick adds one by default
     for a in fig["layout"]["annotations"]:        # subplot titles
         a["font"] = dict(size=11, color="#94a3b8")
     return fig

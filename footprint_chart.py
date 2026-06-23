@@ -8,11 +8,12 @@ Reads the SAME lock-free parquet mirrors the footprint panel uses
 and replays any captured day via `as_of`. Pure data layer — no plotly, no Dash.
 
 Series produced (whole session 9:15 -> now, resampled to tf-minute bars):
+  open/high/low/close  underlying price OHLC per bar  — candlestick price
+  spot     underlying close per bar     — price context (line)
   premium  ATM straddle (CE+PE of the strike nearest spot, per bar)  — IV/decay pulse
   oi_ce    total call OI  (lakh)        — ceiling / call-writing
   oi_pe    total put OI   (lakh)        — floor / put-writing
   volume   traded option volume in the bar (lakh)  — activity
-  spot     underlying close per bar     — price context
 """
 from __future__ import annotations
 
@@ -93,6 +94,15 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         vol.iloc[0] = bar["cum_vol"].iloc[0]          # first bar = volume since open
     vol = vol.clip(lower=0)                            # guard the stale-open crossover
 
+    # Per-bar price OHLC from the underlying tick stream (same bars as the level
+    # series above) — lets the popup draw a candlestick, not just a close line.
+    px = spot_at.resample(f"{tf_min}min", label="right", closed="right")
+    ohlc = pd.DataFrame({"o": px.first(), "h": px.max(),
+                         "l": px.min(), "c": px.last()}).reindex(bar.index)
+
+    def _col(s):
+        return [None if pd.isna(v) else round(float(v), 2) for v in s]
+
     return {
         "has_data": True, "sym": sym, "tf": tf_min,
         "ts":      [t.to_pydatetime() for t in bar.index],
@@ -100,6 +110,8 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         "oi_ce":   [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in bar["oi_ce"]],
         "oi_pe":   [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in bar["oi_pe"]],
         "spot":    [None if pd.isna(v) else round(float(v), 2) for v in bar["spot"]],
+        "open":    _col(ohlc["o"]), "high": _col(ohlc["h"]),
+        "low":     _col(ohlc["l"]), "close": _col(ohlc["c"]),
         "volume":  [0.0 if pd.isna(v) else round(float(v) / 1e5, 3) for v in vol],
         "last_ts": bar.index[-1].to_pydatetime(),
     }
