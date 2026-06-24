@@ -159,7 +159,8 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
     volume  BIGINT,
     delta   DOUBLE,
     iv      DOUBLE,
-    PRIMARY KEY (ts, symbol, strike, side)
+    expiry  BIGINT NOT NULL DEFAULT 0,   -- option expiry epoch (0 = legacy single-expiry)
+    PRIMARY KEY (ts, symbol, strike, side, expiry)
 );
 """
 
@@ -170,7 +171,7 @@ CAPTURE_TABLES = ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals
 # Columns added to chain_snapshots after the table first shipped — applied as
 # idempotent ALTERs so an existing duckdb (CREATE IF NOT EXISTS won't add columns)
 # gains them. greeks for faithful replay (Phase 4.1). Old rows stay NULL.
-CHAIN_SNAPSHOT_MIGRATIONS = ("delta DOUBLE", "iv DOUBLE")
+CHAIN_SNAPSHOT_MIGRATIONS = ("delta DOUBLE", "iv DOUBLE", "expiry BIGINT")
 
 
 def init_intraday(conn) -> None:

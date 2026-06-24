@@ -24,14 +24,39 @@ from core.constants import NSE_NAME, STRIKE_DISPLAY_STEP, STRIKE_STEP
 from core.mirror_io import read_mirror as _read
 
 
-def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
+def _filter_expiry(c, kind: str):
+    """(filtered_chain, available) for expiry `kind` in {weekly, monthly}. Legacy
+    capture (no expiry column / all 0 / all null) is the single nearest weekly, so
+    weekly returns it and monthly is 'not captured yet'. Once the capture tags rows
+    with the expiry epoch, weekly = soonest, monthly = furthest captured."""
+    if c is None:
+        return c, False
+    if "expiry" not in c.columns:
+        return c, (kind != "monthly")
+    exps = sorted({int(e) for e in c["expiry"].dropna().tolist() if int(e) > 0})
+    if not exps:                                   # legacy rows (expiry 0/null) = weekly
+        return c, (kind != "monthly")
+    if kind == "monthly" and len(exps) < 2:
+        return c.iloc[0:0], False
+    target = exps[0] if kind == "weekly" else exps[-1]
+    sub = c[c["expiry"] == target]
+    return sub, len(sub) > 0
+
+
+def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") -> dict:
     """Return the bar series for `sym` at `tf_min` minutes. {'has_data': False, ...}
-    until enough is captured. tf_min is the bar size AND the highlighted window."""
+    until enough is captured. tf_min is the bar size AND the highlighted window.
+    `expiry` in {weekly, monthly} picks the option expiry (weekly until capture is
+    extended to tag/store the monthly chain)."""
     ticks = _read("ticks", date, as_of, sym)
     chain = _read("chain_snapshots", date, as_of, sym)
     if ticks is None or chain is None or "ltp" not in chain.columns:
         return {"has_data": False, "sym": sym, "tf": tf_min,
                 "note": "warming up — need ticks + option-chain capture"}
+    chain, ok = _filter_expiry(chain, expiry)
+    if not ok:
+        return {"has_data": False, "sym": sym, "tf": tf_min,
+                "note": f"{expiry} expiry not captured yet"}
     oi = _read("oi_snapshots", date, as_of, sym)
 
     spot_at = ticks.set_index("ts")["ltp"].sort_index()
@@ -262,14 +287,17 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
     }
 
 
-def atm_strikes(sym: str, date=None, as_of=None, n: int = 5) -> tuple:
+def atm_strikes(sym: str, date=None, as_of=None, n: int = 5, expiry="weekly") -> tuple:
     """(atm_strike, [strikes ATM±n]) for the picker — laddered by the ROUND step
     (STRIKE_DISPLAY_STEP, e.g. NIFTY 100), snapped to round numbers, where the real
     OI / premium / smart-money activity sits. Only strikes actually captured in
-    chain_snapshots are returned. ATM from oi_snapshots if available, else nearest
-    captured strike to last spot."""
+    chain_snapshots (for the chosen `expiry`) are returned. ATM from oi_snapshots if
+    available, else nearest captured strike to last spot."""
     c = _read("chain_snapshots", date, as_of, sym)
     if c is None or "strike" not in c.columns:
+        return None, []
+    c, ok = _filter_expiry(c, expiry)
+    if not ok or c is None or c.empty:
         return None, []
     ks = sorted(int(k) for k in c["strike"].unique())
     if not ks:
@@ -296,7 +324,8 @@ def atm_strikes(sym: str, date=None, as_of=None, n: int = 5) -> tuple:
     return atm_r, ladder
 
 
-def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=None) -> dict:
+def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=None,
+                        expiry="weekly") -> dict:
     """Per-bar series for ONE option strike, full session: that strike's CE & PE
     OI, premium (ltp), volume, and a per-side write/buy classification (ΔOI × Δltp).
     Index OHLC is returned for price context (with the strike level to overlay)."""
@@ -304,6 +333,10 @@ def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=Non
     if c is None or "strike" not in c.columns:
         return {"has_data": False, "sym": sym, "tf": tf_min, "strike": strike,
                 "note": "warming up — need option-chain capture"}
+    c, ok = _filter_expiry(c, expiry)
+    if not ok:
+        return {"has_data": False, "sym": sym, "tf": tf_min, "strike": strike,
+                "note": f"{expiry} expiry not captured yet"}
     c = c[c["strike"] == int(strike)]
     if c.empty:
         return {"has_data": False, "sym": sym, "tf": tf_min, "strike": strike,

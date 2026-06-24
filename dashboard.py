@@ -1426,6 +1426,13 @@ app.layout = dbc.Container([
                         # only shown in Futures mode (toggled by _toggle_mode_cols)
                         id="charts-leg-col", md=2, style={"display": "none"}),
                     dbc.Col(dcc.Dropdown(
+                        id="charts-expiry", clearable=False,
+                        options=[{"label": "Weekly expiry", "value": "weekly"},
+                                 {"label": "Monthly expiry", "value": "monthly"}],
+                        value="weekly", style={"fontSize": "0.72rem"}),
+                        # only shown in Options mode (toggled by _toggle_mode_cols)
+                        id="charts-expiry-col", md=2),
+                    dbc.Col(dcc.Dropdown(
                         id="charts-strike", clearable=False,
                         options=[{"label": "Totals (CE/PE)", "value": "totals"}],
                         value="totals", style={"fontSize": "0.72rem"}),
@@ -2933,22 +2940,23 @@ def _sync_url(sym):
 
 # ── Charts section: full-session price/OI/volume/premium for index + timeframe ──
 @app.callback(Output("charts-leg-col", "style"), Output("charts-strike-col", "style"),
-              Input("charts-mode", "value"))
+              Output("charts-expiry-col", "style"), Input("charts-mode", "value"))
 def _toggle_mode_cols(mode):
-    """Futures → show the near/next/far leg picker; Options → show the strike picker."""
+    """Futures → show the near/next/far leg picker; Options → show expiry + strike pickers."""
     show, hide = {"display": "block"}, {"display": "none"}
-    return (show, hide) if mode == "futures" else (hide, show)
+    return (show, hide, hide) if mode == "futures" else (hide, show, show)
 
 
 @app.callback(Output("charts-strike", "options"), Output("charts-strike", "value"),
               Input("charts-mode", "value"), Input("charts-idx", "value"),
-              Input("charts-date", "value"),
+              Input("charts-date", "value"), Input("charts-expiry", "value"),
               State("charts-strike", "value"))
-def _fill_strikes(mode, sym, date, cur):
-    """Populate the option strike picker (Totals + ATM±5) for the chosen index/date."""
+def _fill_strikes(mode, sym, date, expiry, cur):
+    """Populate the option strike picker (Totals + ATM±5) for the chosen index/date/expiry."""
     opts = [{"label": "Totals (CE/PE)", "value": "totals"}]
     if mode == "options":
-        atm, ks = footprint_chart.atm_strikes(sym or "NSE:NIFTY50-INDEX", date=date or None, n=5)
+        atm, ks = footprint_chart.atm_strikes(sym or "NSE:NIFTY50-INDEX", date=date or None,
+                                              n=5, expiry=expiry or "weekly")
         for k in ks:
             tag = "  • ATM" if k == atm else ("  (ITM/OTM↓)" if k < atm else "  (OTM/ITM↑)")
             opts.append({"label": f"{k}{tag}", "value": str(k)})
@@ -2967,25 +2975,27 @@ def _swap_charts_help(mode):
     Input("charts-mode",   "value"),
     Input("charts-leg",    "value"),
     Input("charts-strike", "value"),
+    Input("charts-expiry", "value"),
     Input("charts-idx",    "value"),
     Input("charts-tf",     "value"),
     Input("charts-date",   "value"),
     Input("sel-sym",       "data"),
 )
-def _update_charts(mode, leg, strike, sym, tf, date, sel):
-    """Redraw when mode/leg/strike/index/timeframe/date changes or the section opens."""
+def _update_charts(mode, leg, strike, expiry, sym, tf, date, sel):
+    """Redraw when mode/leg/strike/expiry/index/timeframe/date changes or section opens."""
     from dash.exceptions import PreventUpdate
     if sel != "CHARTS":
         raise PreventUpdate
     sym, tf, date = sym or "NSE:NIFTY50-INDEX", int(tf or 15), date or None
+    expiry = expiry or "weekly"
     if mode == "futures":
         return _futures_fig(sym, tf, date=date, leg=leg or "near")
     if strike and strike != "totals":
         try:
-            return _strike_fig(sym, tf, int(strike), date=date)
+            return _strike_fig(sym, tf, int(strike), date=date, expiry=expiry)
         except (ValueError, TypeError):
             pass
-    return _footprint_fig(sym, tf, date=date)
+    return _footprint_fig(sym, tf, date=date, expiry=expiry)
 
 
 # ── Callback 2: toggle panels + highlight selected nav card ───────────────────
@@ -4024,7 +4034,7 @@ def _render_index_trades(sym) -> "html.Div":
     return html.Div(items)
 
 
-def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
+def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly") -> "go.Figure":
     """4-panel popup chart for one index/timeframe — full session, tf-minute bars:
       1. Price  — candlestick + close line, with volume merged at the base.
       2. Option OI — CE (ceiling) vs PE (floor): writing build-up vs unwinding.
@@ -4032,7 +4042,8 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
       4. Positioning flow — per-bar ΔOI coloured BUY vs WRITE (per-leg premium):
          the "what are they doing" read. Calls plotted up, puts down.
     The clicked lookback window is shaded across every panel."""
-    d = footprint_chart.build_series(sym, int(tf_min), date=date, as_of=_parse_asof(asof_value))
+    d = footprint_chart.build_series(sym, int(tf_min), date=date,
+                                     as_of=_parse_asof(asof_value), expiry=expiry)
     if not d.get("has_data"):
         fig = go.Figure()
         fig.add_annotation(text=d.get("note", "no data"), showarrow=False,
@@ -4124,14 +4135,14 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
     return fig
 
 
-def _strike_fig(sym, tf_min: int, strike: int, asof_value=None, date=None) -> "go.Figure":
+def _strike_fig(sym, tf_min: int, strike: int, asof_value=None, date=None, expiry="weekly") -> "go.Figure":
     """4-panel single-strike option chart — full session, tf-minute bars:
       1. Index price candles + volume, with a dashed line at the strike.
       2. This strike's CE OI vs PE OI (writing/unwinding AT this strike).
       3. This strike's CE vs PE premium (LTP).
       4. This strike's positioning — per-bar ΔOI, CE up / PE down, buy vs write."""
     d = footprint_chart.build_strike_series(sym, int(tf_min), int(strike),
-                                            date=date, as_of=_parse_asof(asof_value))
+                                            date=date, as_of=_parse_asof(asof_value), expiry=expiry)
     if not d.get("has_data"):
         fig = go.Figure()
         fig.add_annotation(text=d.get("note", "no data"), showarrow=False,
