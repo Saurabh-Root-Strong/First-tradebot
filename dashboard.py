@@ -4046,12 +4046,12 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
 
 
 def _futures_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
-    """4-panel near-month futures chart — full session, tf-minute bars:
-      1. Near-future price candlestick + close line + next-month line.
-      2. Futures volume per bar.
-      3. Basis (near − spot): premium = longs paying up; discount/collapse = bearish carry.
-      4. Roll spread (next − near): calendar / contango vs backwardation.
-    (No OI panel — Fyers doesn't feed intraday futures OI; basis/roll are the proxies.)"""
+    """5-panel near-month futures chart — full session, tf-minute bars:
+      1. Near-future candlestick + close + next-month line.
+      2. Futures OI (lakh contracts) — NSE oi-spurts (the piece Fyers lacks).
+      3. Futures positioning — per-bar ΔOI × price: long/short buildup vs covering/unwinding.
+      4. Basis (near − spot): premium = longs paying up; discount = bearish carry.
+      5. Futures volume per bar."""
     d = footprint_chart.build_futures_series(sym, int(tf_min), date=date, as_of=_parse_asof(asof_value))
     if not d.get("has_data"):
         fig = go.Figure()
@@ -4062,14 +4062,17 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
         return fig
     ts = d["ts"]
     label = LABELS.get(sym, sym)
+    oi_note = "" if d.get("has_oi") else "  (no OI captured this day)"
     fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-        row_heights=[0.42, 0.18, 0.22, 0.18],
+        rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        row_heights=[0.30, 0.16, 0.20, 0.18, 0.16],
         subplot_titles=(f"{label} FUT (near) — {tf_min}m candles  ·  + next-month",
-                        "Futures volume per bar (lakh)",
+                        f"Futures OI (lakh contracts){oi_note}",
+                        "Futures positioning — ΔOI/bar · green=long-buildup red=short-buildup "
+                        "· teal=covering amber=unwinding (down=closing)",
                         "Basis = near − spot (₹)  ·  premium=longs paying up, discount=bearish",
-                        "Roll spread = next − near (₹)  ·  calendar / contango"))
-    # 1 — near futures candles + close + next-month line.
+                        "Futures volume per bar (lakh)"))
+    # 1 — candles + close + next-month.
     fig.add_trace(go.Candlestick(
         x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="near FUT",
         increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
@@ -4080,26 +4083,37 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
     if any(v is not None for v in d.get("next", [])):
         fig.add_trace(go.Scatter(x=ts, y=d["next"], mode="lines", name="next month",
                                  line=dict(color="#a78bfa", width=1.2)), row=1, col=1)
-    # 2 — volume.
-    fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
-                         marker_color="#22d3ee", opacity=0.75), row=2, col=1)
-    # 3 — basis (coloured by sign: premium green / discount red).
+    # 2 — futures OI level.
+    fig.add_trace(go.Scatter(x=ts, y=d.get("oi"), mode="lines", name="futures OI",
+                             line=dict(color="#38bdf8", width=1.8), connectgaps=True,
+                             showlegend=False), row=2, col=1)
+    # 3 — futures positioning flow: ΔOI signed (build up / close down), coloured by action.
+    _FC = {"long": "#22c55e", "short": "#ef4444", "cover": "#5eead4", "unwind": "#f59e0b",
+           "flat": "rgba(0,0,0,0)"}
+    fa = d.get("fut_act", [])
+    fy = [v if v is not None else 0 for v in d.get("d_oi", [])]
+    fc_clr = [_FC.get(a, "rgba(0,0,0,0)") for a in fa]
+    ft = [f"{a} · ΔOI {v}L" for a, v in zip(fa, d.get("d_oi", []))]
+    fig.add_trace(go.Bar(x=ts, y=fy, marker_color=fc_clr, name="ΔOI", showlegend=False,
+                         hovertext=ft, hoverinfo="x+text"), row=3, col=1)
+    fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=3, col=1)
+    # 4 — basis (premium green / discount red).
     b_clr = ["#22c55e" if (v is not None and v >= 0) else "#ef4444" for v in d["basis"]]
     fig.add_trace(go.Bar(x=ts, y=d["basis"], name="basis", marker_color=b_clr,
-                         showlegend=False), row=3, col=1)
-    fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=3, col=1)
-    # 4 — roll spread.
-    fig.add_trace(go.Scatter(x=ts, y=d["roll"], mode="lines", name="roll spread",
-                             line=dict(color="#fbbf24", width=1.6), showlegend=False), row=4, col=1)
+                         showlegend=False), row=4, col=1)
+    fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=4, col=1)
+    # 5 — volume.
+    fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
+                         marker_color="#22d3ee", opacity=0.75, showlegend=False), row=5, col=1)
     if d.get("last_ts"):
         x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
-        for rr in (1, 2, 3, 4):
+        for rr in (1, 2, 3, 4, 5):
             fig.add_vrect(x0=x0, x1=d["last_ts"], fillcolor="#67e8f9",
                           opacity=0.08, line_width=0, row=rr, col=1)
-    fig.update_layout(template="plotly_dark", height=820,
+    fig.update_layout(template="plotly_dark", height=960,
                       margin=dict(l=54, r=18, t=46, b=28),
                       paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD, bargap=0.15,
-                      showlegend=True, legend=dict(orientation="h", y=1.06, x=0, font=dict(size=9)),
+                      showlegend=True, legend=dict(orientation="h", y=1.05, x=0, font=dict(size=9)),
                       font=dict(size=10))
     fig.update_xaxes(rangeslider_visible=False)
     for a in fig["layout"]["annotations"]:

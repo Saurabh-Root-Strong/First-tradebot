@@ -20,6 +20,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from core.constants import NSE_NAME
 from core.mirror_io import read_mirror as _read
 
 
@@ -194,6 +195,31 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
     term = (ts_term.resample(f"{tf_min}min", label="right", closed="right").last()
             .reindex(bar.index)) if ts_term is not None else None
 
+    # Futures OI (NSE oi-spurts mirror, keyed by NSE name e.g. "NIFTY") — the piece
+    # Fyers lacks. ΔOI × futures-price gives the futures 4-quadrant positioning:
+    #   OI up + price up = long buildup ; OI up + price down = short buildup ;
+    #   OI down + price up = short covering ; OI down + price down = long unwinding.
+    oi_lakh = d_oi = None
+    fut_act = ["flat"] * len(bar)
+    ofut = _read("futures_oi", date, as_of, NSE_NAME.get(sym, sym))
+    if ofut is not None and "oi" in ofut.columns:
+        oi_s = (ofut.set_index("ts")["oi"].sort_index()
+                .resample(f"{tf_min}min", label="right", closed="right").last()
+                .reindex(bar.index, method="ffill"))
+        oi_lakh = oi_s / 1e5
+        d_oi = oi_lakh.diff()
+        d_px = bar["c"].diff()
+        eps = max(0.1, 0.10 * float(d_oi.abs().median() or 0))
+
+        def _fact(do, dp):
+            if pd.isna(do) or abs(do) < eps:
+                return "flat"
+            if do > 0:
+                return "long" if (pd.notna(dp) and dp >= 0) else "short"
+            return "cover" if (pd.notna(dp) and dp >= 0) else "unwind"
+
+        fut_act = [_fact(o, p) for o, p in zip(d_oi, d_px)]
+
     def _c(s):
         return [None if (s is None or pd.isna(v)) else round(float(v), 2) for v in (s if s is not None else [])]
 
@@ -207,5 +233,7 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         "volume": [0.0 if (vol is None or pd.isna(v)) else round(float(v) / 1e5, 3)
                    for v in (vol if vol is not None else [0] * len(bar))],
         "term":   [None if (term is None or pd.isna(v)) else str(v) for v in (term if term is not None else [None] * len(bar))],
+        "oi":     _c(oi_lakh), "d_oi": _c(d_oi), "fut_act": fut_act,
+        "has_oi": oi_lakh is not None,
         "last_ts": bar.index[-1].to_pydatetime(),
     }
