@@ -337,7 +337,9 @@ def atm_strikes(sym: str, date=None, as_of=None, n: int = 10, expiry="weekly") -
 def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=None,
                         expiry="weekly") -> dict:
     """Per-bar series for ONE option strike, full session: that strike's CE & PE
-    OI, premium (ltp), volume, and a per-side write/buy classification (ΔOI × Δltp).
+    OI, premium (ltp), volume, and a per-side write/buy classification via the
+    DELTA-ADJUSTED premium residual (Δprem − delta·Δindex) — the index-move stripped
+    out, so it reads true buy (residual>0) vs write (residual<=0), not just price.
     Index OHLC is returned for price context (with the strike level to overlay)."""
     c = _read("chain_snapshots", date, as_of, sym)
     if c is None or "strike" not in c.columns:
@@ -360,7 +362,8 @@ def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=Non
             return None
         r = s.resample(f"{tf_min}min", label="right", closed="right")
         return pd.DataFrame({"oi": r["oi"].last(), "ltp": r["ltp"].last(),
-                             "cum_vol": r["volume"].last()})
+                             "cum_vol": r["volume"].last(),
+                             "delta": r["delta"].last() if "delta" in s.columns else np.nan})
 
     ce, pe = _side("CE"), _side("PE")
     base = ce if ce is not None else pe
@@ -372,32 +375,41 @@ def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=Non
           if spot_at is not None else None)
     ohlc = (pd.DataFrame({"o": px.first(), "h": px.max(), "l": px.min(), "c": px.last()}).reindex(idx)
             if px is not None else pd.DataFrame(index=idx))
+    d_spot = ohlc["c"].diff() if "c" in ohlc.columns else pd.Series(np.nan, index=idx)
 
     def _col(s):
         return [None if (s is None or pd.isna(v)) else round(float(v), 2) for v in (s if s is not None else [None] * len(idx))]
 
     def _legbars(df):
-        """(oi_lakh, prem, vol_lakh, d_oi_lakh, actions) for one option leg."""
+        """(oi_lakh, prem, vol_lakh, d_oi_lakh, actions) for one option leg.
+
+        buy-vs-write uses the DELTA-ADJUSTED premium residual:
+          residual = Δpremium − delta·Δindex   (the option move stripped of the part
+          the underlying move alone explains). residual>0 = buyers paying up (BUY);
+          residual<=0 = writers pressing (WRITE). Far truer than raw premium, which on
+          a trending bar just echoes price. Falls back to raw Δpremium if delta absent."""
         if df is None:
             n = len(idx)
             return [None] * n, [None] * n, [0.0] * n, [None] * n, ["flat"] * n
         df = df.reindex(idx)
         d_oi = df["oi"].diff()
         d_pr = df["ltp"].diff()
+        dlt = df["delta"] if "delta" in df.columns else pd.Series(np.nan, index=idx)
+        resid = d_pr - dlt.fillna(0.0) * d_spot.reindex(df.index).fillna(0.0)
         vol = df["cum_vol"].diff()
         if len(vol):
             vol.iloc[0] = df["cum_vol"].iloc[0]
         vol = vol.clip(lower=0)
         eps = max(1.0, 0.10 * float(d_oi.abs().median() or 0))
 
-        def _act(do, dp):
+        def _act(do, rz):
             if pd.isna(do) or abs(do) < eps:
                 return "flat"
-            if do > 0:
-                return "buy" if (pd.notna(dp) and dp > 0) else "write"
-            return "cover" if (pd.notna(dp) and dp > 0) else "unwind"
+            if do > 0:                                   # OI building
+                return "buy" if (pd.notna(rz) and rz > 0) else "write"
+            return "cover" if (pd.notna(rz) and rz > 0) else "unwind"   # OI falling
 
-        acts = [_act(o_, p_) for o_, p_ in zip(d_oi, d_pr)]
+        acts = [_act(o_, r_) for o_, r_ in zip(d_oi, resid)]
         return (_oilakh(df["oi"]), _col(df["ltp"]), _vollakh(vol), _oilakh(d_oi), acts)
 
     def _oilakh(s):

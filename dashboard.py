@@ -1072,8 +1072,12 @@ _HELP_OPTIONS = {
               "the market is. Read together = WHY a move happened, not just that it did.  "
               "STRIKE PICKER: 'Totals' = aggregate CE/PE; or pick a strike — the ladder is FIXED at "
               "the 9:15 OPEN ±1000 (round-100 strikes, labelled by offset from open e.g. +300 / -700) "
-              "— to drill into THAT strike's CE/PE OI, premium and write-vs-buy (where the wall is "
-              "built or torn down)."),
+              "— to drill into THAT strike's CE/PE OI, premium and write-vs-buy. The per-strike "
+              "positioning panel is DELTA-ADJUSTED (Δprem − delta·Δindex = the index move removed), so "
+              "buy vs write is the genuine aggressor read, not just price echoing. How to justify "
+              "BUYING vs WRITING: OI building + delta-adjusted residual UP = aggressive BUYING; "
+              "residual flat/DOWN = WRITING (the 90-95% case). Confirm with the futures panel — e.g. "
+              "'call writing' but futures show long-buildup means the calls are being BOUGHT, not written."),
     "terms": [
         ("Price — candles + volume", "#e2e8f0",
          "WHAT: index OHLC per bar (green up/red down; long wick = rejected level), volume bars "
@@ -4204,8 +4208,8 @@ def _strike_fig(sym, tf_min: int, strike: int, asof_value=None, date=None, expir
         subplot_titles=(f"{label} price — {tf_min}m + volume  ·  dashed line = {k} strike",
                         f"OI at {k} — CE (ceiling) vs PE (floor) (lakh)",
                         f"Premium at {k} — CE vs PE (₹)",
-                        f"Positioning at {k} — ΔOI/bar · CE↑ PE↓ · red=call-write amber=call-buy "
-                        "green=put-write lime=put-buy · hatched=closing"))
+                        f"Positioning at {k} — ΔOI/bar (delta-adjusted: true buy vs write) · CE↑ PE↓ "
+                        "· red=call-write amber=call-buy green=put-write lime=put-buy · hatched=closing"))
     # 1 — index price + volume + strike line.
     fig.add_trace(go.Candlestick(
         x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="price",
