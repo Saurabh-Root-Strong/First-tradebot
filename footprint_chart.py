@@ -20,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from core.constants import NSE_NAME
+from core.constants import NSE_NAME, STRIKE_STEP
 from core.mirror_io import read_mirror as _read
 
 
@@ -259,4 +259,111 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
         "oi":     _c(oi_lakh), "d_oi": _c(d_oi), "fut_act": fut_act,
         "has_oi": oi_lakh is not None,
         "last_ts": bar.index[-1].to_pydatetime(),
+    }
+
+
+def atm_strikes(sym: str, date=None, as_of=None, n: int = 5) -> tuple:
+    """(atm_strike, [strikes ATM±n]) actually present in chain_snapshots for the day.
+    ATM from oi_snapshots if available, else the captured strike nearest last spot."""
+    c = _read("chain_snapshots", date, as_of, sym)
+    if c is None or "strike" not in c.columns:
+        return None, []
+    ks = sorted(int(k) for k in c["strike"].unique())
+    if not ks:
+        return None, []
+    atm = None
+    o = _read("oi_snapshots", date, as_of, sym)
+    if o is not None and "atm" in o.columns and len(o):
+        try:
+            atm = int(o["atm"].iloc[-1])
+        except Exception:
+            atm = None
+    if atm is None:
+        t = _read("ticks", date, as_of, sym)
+        spot = float(t["ltp"].iloc[-1]) if t is not None and len(t) else ks[len(ks) // 2]
+        atm = min(ks, key=lambda k: abs(k - spot))
+    i = ks.index(min(ks, key=lambda k: abs(k - atm)))
+    lo, hi = max(0, i - n), min(len(ks), i + n + 1)
+    return ks[i], ks[lo:hi]
+
+
+def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=None) -> dict:
+    """Per-bar series for ONE option strike, full session: that strike's CE & PE
+    OI, premium (ltp), volume, and a per-side write/buy classification (ΔOI × Δltp).
+    Index OHLC is returned for price context (with the strike level to overlay)."""
+    c = _read("chain_snapshots", date, as_of, sym)
+    if c is None or "strike" not in c.columns:
+        return {"has_data": False, "sym": sym, "tf": tf_min, "strike": strike,
+                "note": "warming up — need option-chain capture"}
+    c = c[c["strike"] == int(strike)]
+    if c.empty:
+        return {"has_data": False, "sym": sym, "tf": tf_min, "strike": strike,
+                "note": f"no capture at strike {strike}"}
+    ticks = _read("ticks", date, as_of, sym)
+    spot_at = ticks.set_index("ts")["ltp"].sort_index() if ticks is not None else None
+
+    def _side(side):
+        s = c[c["side"] == side].set_index("ts").sort_index()
+        if s.empty:
+            return None
+        r = s.resample(f"{tf_min}min", label="right", closed="right")
+        return pd.DataFrame({"oi": r["oi"].last(), "ltp": r["ltp"].last(),
+                             "cum_vol": r["volume"].last()})
+
+    ce, pe = _side("CE"), _side("PE")
+    base = ce if ce is not None else pe
+    if base is None or not len(base):
+        return {"has_data": False, "sym": sym, "tf": tf_min, "strike": strike, "note": "warming up"}
+    idx = base.index
+
+    px = (spot_at.resample(f"{tf_min}min", label="right", closed="right")
+          if spot_at is not None else None)
+    ohlc = (pd.DataFrame({"o": px.first(), "h": px.max(), "l": px.min(), "c": px.last()}).reindex(idx)
+            if px is not None else pd.DataFrame(index=idx))
+
+    def _col(s):
+        return [None if (s is None or pd.isna(v)) else round(float(v), 2) for v in (s if s is not None else [None] * len(idx))]
+
+    def _legbars(df):
+        """(oi_lakh, prem, vol_lakh, d_oi_lakh, actions) for one option leg."""
+        if df is None:
+            n = len(idx)
+            return [None] * n, [None] * n, [0.0] * n, [None] * n, ["flat"] * n
+        df = df.reindex(idx)
+        d_oi = df["oi"].diff()
+        d_pr = df["ltp"].diff()
+        vol = df["cum_vol"].diff()
+        if len(vol):
+            vol.iloc[0] = df["cum_vol"].iloc[0]
+        vol = vol.clip(lower=0)
+        eps = max(1.0, 0.10 * float(d_oi.abs().median() or 0))
+
+        def _act(do, dp):
+            if pd.isna(do) or abs(do) < eps:
+                return "flat"
+            if do > 0:
+                return "buy" if (pd.notna(dp) and dp > 0) else "write"
+            return "cover" if (pd.notna(dp) and dp > 0) else "unwind"
+
+        acts = [_act(o_, p_) for o_, p_ in zip(d_oi, d_pr)]
+        return (_oilakh(df["oi"]), _col(df["ltp"]), _vollakh(vol), _oilakh(d_oi), acts)
+
+    def _oilakh(s):
+        return [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in s]
+
+    def _vollakh(s):
+        return [0.0 if pd.isna(v) else round(float(v) / 1e5, 3) for v in s]
+
+    ce_oi, ce_prem, ce_vol, ce_doi, ce_act = _legbars(ce)
+    pe_oi, pe_prem, pe_vol, pe_doi, pe_act = _legbars(pe)
+
+    return {
+        "has_data": True, "sym": sym, "tf": tf_min, "strike": int(strike),
+        "ts":    [t.to_pydatetime() for t in idx],
+        "open":  _col(ohlc.get("o")), "high": _col(ohlc.get("h")),
+        "low":   _col(ohlc.get("l")), "close": _col(ohlc.get("c")),
+        "ce_oi": ce_oi, "pe_oi": pe_oi, "ce_prem": ce_prem, "pe_prem": pe_prem,
+        "ce_vol": ce_vol, "pe_vol": pe_vol, "ce_doi": ce_doi, "pe_doi": pe_doi,
+        "ce_act": ce_act, "pe_act": pe_act,
+        "last_ts": idx[-1].to_pydatetime(),
     }

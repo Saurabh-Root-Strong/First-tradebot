@@ -1069,7 +1069,10 @@ app.index_string = app.index_string.replace("</head>", _CSS + "</head>")
 _HELP_OPTIONS = {
     "intro": ("OPTIONS FLOW — five lenses on one timeframe. PRICE = WHAT happened · OI = WHO is "
               "defending where (the walls) · VOLUME = IF it is real · STRADDLE = HOW scared/calm "
-              "the market is. Read together = WHY a move happened, not just that it did."),
+              "the market is. Read together = WHY a move happened, not just that it did.  "
+              "STRIKE PICKER: 'Totals' = aggregate CE/PE across strikes; pick a strike (ATM±5) to "
+              "drill into THAT strike's CE/PE OI, premium and write-vs-buy — see exactly where the "
+              "wall is being built or torn down."),
     "terms": [
         ("Price — candles + volume", "#e2e8f0",
          "WHAT: index OHLC per bar (green up/red down; long wick = rejected level), volume bars "
@@ -1420,8 +1423,14 @@ app.layout = dbc.Container([
                                  {"label": "Next expiry", "value": "next"},
                                  {"label": "Far expiry", "value": "far"}],
                         value="near", style={"fontSize": "0.72rem"}),
-                        # only shown in Futures mode (toggled by _toggle_leg_col)
+                        # only shown in Futures mode (toggled by _toggle_mode_cols)
                         id="charts-leg-col", md=2, style={"display": "none"}),
+                    dbc.Col(dcc.Dropdown(
+                        id="charts-strike", clearable=False,
+                        options=[{"label": "Totals (CE/PE)", "value": "totals"}],
+                        value="totals", style={"fontSize": "0.72rem"}),
+                        # only shown in Options mode (populated by _fill_strikes)
+                        id="charts-strike-col", md=2),
                     dbc.Col(dcc.Dropdown(
                         id="charts-date", clearable=False,
                         options=_CHART_DATE_OPTS, value=_CHART_DATE_DEF,
@@ -2923,10 +2932,28 @@ def _sync_url(sym):
 
 
 # ── Charts section: full-session price/OI/volume/premium for index + timeframe ──
-@app.callback(Output("charts-leg-col", "style"), Input("charts-mode", "value"))
-def _toggle_leg_col(mode):
-    """Show the near/next/far expiry picker only in Futures mode."""
-    return {"display": "block"} if mode == "futures" else {"display": "none"}
+@app.callback(Output("charts-leg-col", "style"), Output("charts-strike-col", "style"),
+              Input("charts-mode", "value"))
+def _toggle_mode_cols(mode):
+    """Futures → show the near/next/far leg picker; Options → show the strike picker."""
+    show, hide = {"display": "block"}, {"display": "none"}
+    return (show, hide) if mode == "futures" else (hide, show)
+
+
+@app.callback(Output("charts-strike", "options"), Output("charts-strike", "value"),
+              Input("charts-mode", "value"), Input("charts-idx", "value"),
+              Input("charts-date", "value"),
+              State("charts-strike", "value"))
+def _fill_strikes(mode, sym, date, cur):
+    """Populate the option strike picker (Totals + ATM±5) for the chosen index/date."""
+    opts = [{"label": "Totals (CE/PE)", "value": "totals"}]
+    if mode == "options":
+        atm, ks = footprint_chart.atm_strikes(sym or "NSE:NIFTY50-INDEX", date=date or None, n=5)
+        for k in ks:
+            tag = "  • ATM" if k == atm else ("  (ITM/OTM↓)" if k < atm else "  (OTM/ITM↑)")
+            opts.append({"label": f"{k}{tag}", "value": str(k)})
+    vals = {o["value"] for o in opts}
+    return opts, (cur if cur in vals else "totals")
 
 
 @app.callback(Output("charts-help-box", "children"), Input("charts-mode", "value"))
@@ -2937,21 +2964,27 @@ def _swap_charts_help(mode):
 
 @app.callback(
     Output("charts-graph", "figure"),
-    Input("charts-mode", "value"),
-    Input("charts-leg",  "value"),
-    Input("charts-idx",  "value"),
-    Input("charts-tf",   "value"),
-    Input("charts-date", "value"),
-    Input("sel-sym",     "data"),
+    Input("charts-mode",   "value"),
+    Input("charts-leg",    "value"),
+    Input("charts-strike", "value"),
+    Input("charts-idx",    "value"),
+    Input("charts-tf",     "value"),
+    Input("charts-date",   "value"),
+    Input("sel-sym",       "data"),
 )
-def _update_charts(mode, leg, sym, tf, date, sel):
-    """Redraw when mode/leg/index/timeframe/date changes or the Charts section opens."""
+def _update_charts(mode, leg, strike, sym, tf, date, sel):
+    """Redraw when mode/leg/strike/index/timeframe/date changes or the section opens."""
     from dash.exceptions import PreventUpdate
     if sel != "CHARTS":
         raise PreventUpdate
     sym, tf, date = sym or "NSE:NIFTY50-INDEX", int(tf or 15), date or None
     if mode == "futures":
         return _futures_fig(sym, tf, date=date, leg=leg or "near")
+    if strike and strike != "totals":
+        try:
+            return _strike_fig(sym, tf, int(strike), date=date)
+        except (ValueError, TypeError):
+            pass
     return _footprint_fig(sym, tf, date=date)
 
 
@@ -4087,6 +4120,90 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
                       font=dict(size=10))
     fig.update_xaxes(rangeslider_visible=False)   # candlestick adds one by default
     for a in fig["layout"]["annotations"]:        # subplot titles
+        a["font"] = dict(size=10.5, color="#94a3b8")
+    return fig
+
+
+def _strike_fig(sym, tf_min: int, strike: int, asof_value=None, date=None) -> "go.Figure":
+    """4-panel single-strike option chart — full session, tf-minute bars:
+      1. Index price candles + volume, with a dashed line at the strike.
+      2. This strike's CE OI vs PE OI (writing/unwinding AT this strike).
+      3. This strike's CE vs PE premium (LTP).
+      4. This strike's positioning — per-bar ΔOI, CE up / PE down, buy vs write."""
+    d = footprint_chart.build_strike_series(sym, int(tf_min), int(strike),
+                                            date=date, as_of=_parse_asof(asof_value))
+    if not d.get("has_data"):
+        fig = go.Figure()
+        fig.add_annotation(text=d.get("note", "no data"), showarrow=False,
+                           font=dict(color="#64748b", size=13))
+        fig.update_layout(template="plotly_dark", height=300, paper_bgcolor=BG_CARD,
+                          plot_bgcolor=BG_CARD, xaxis=dict(visible=False), yaxis=dict(visible=False))
+        return fig
+    ts = d["ts"]
+    label = LABELS.get(sym, sym)
+    k = d["strike"]
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.045,
+        row_heights=[0.32, 0.22, 0.22, 0.24],
+        specs=[[{"secondary_y": True}], [{}], [{}], [{}]],
+        subplot_titles=(f"{label} price — {tf_min}m + volume  ·  dashed line = {k} strike",
+                        f"OI at {k} — CE (ceiling) vs PE (floor) (lakh)",
+                        f"Premium at {k} — CE vs PE (₹)",
+                        f"Positioning at {k} — ΔOI/bar · CE↑ PE↓ · red=call-write amber=call-buy "
+                        "green=put-write lime=put-buy · hatched=closing"))
+    # 1 — index price + volume + strike line.
+    fig.add_trace(go.Candlestick(
+        x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="price",
+        increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
+        increasing_fillcolor="#22c55e", decreasing_fillcolor="#ef4444",
+        line=dict(width=1), showlegend=False), row=1, col=1, secondary_y=False)
+    _vol = [(a or 0) + (b or 0) for a, b in zip(d["ce_vol"], d["pe_vol"])]
+    fig.add_trace(go.Bar(x=ts, y=_vol, name="volume", marker_color="rgba(34,211,238,0.4)",
+                         showlegend=False), row=1, col=1, secondary_y=True)
+    _mv = max([v for v in _vol if v] or [1])
+    fig.update_yaxes(range=[0, _mv * 4.5], row=1, col=1, secondary_y=True,
+                     showticklabels=False, showgrid=False)
+    fig.update_yaxes(tickformat=",.0f", row=1, col=1, secondary_y=False)
+    fig.add_hline(y=k, line_width=1, line_dash="dash", line_color="#a78bfa", row=1, col=1)
+    # 2 — OI at strike.
+    fig.add_trace(go.Scatter(x=ts, y=d["ce_oi"], mode="lines", name="CE OI",
+                             line=dict(color="#ef4444", width=1.6)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=ts, y=d["pe_oi"], mode="lines", name="PE OI",
+                             line=dict(color="#22c55e", width=1.6)), row=2, col=1)
+    # 3 — premium at strike.
+    fig.add_trace(go.Scatter(x=ts, y=d["ce_prem"], mode="lines", name="CE ₹",
+                             line=dict(color="#ef4444", width=1.4)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=ts, y=d["pe_prem"], mode="lines", name="PE ₹",
+                             line=dict(color="#22c55e", width=1.4)), row=3, col=1)
+    # 4 — positioning at strike.
+    _CLOSE = "#64748b"
+    _CE = {"write": "#ef4444", "buy": "#f59e0b", "cover": _CLOSE, "unwind": _CLOSE, "flat": "rgba(0,0,0,0)"}
+    _PE = {"write": "#22c55e", "buy": "#84cc16", "cover": _CLOSE, "unwind": _CLOSE, "flat": "rgba(0,0,0,0)"}
+    _isc = {"cover", "unwind"}
+    ce_y = [abs(v) if v is not None else 0 for v in d["ce_doi"]]
+    pe_y = [-abs(v) if v is not None else 0 for v in d["pe_doi"]]
+    fig.add_trace(go.Bar(x=ts, y=ce_y, name="CE", showlegend=False,
+                         marker=dict(color=[_CE.get(a, _CLOSE) for a in d["ce_act"]],
+                                     pattern=dict(shape=["/" if a in _isc else "" for a in d["ce_act"]],
+                                                  solidity=0.45, fgcolor="#0a0f1a")),
+                         hovertext=[f"CE {a}" for a in d["ce_act"]], hoverinfo="x+text"), row=4, col=1)
+    fig.add_trace(go.Bar(x=ts, y=pe_y, name="PE", showlegend=False,
+                         marker=dict(color=[_PE.get(a, _CLOSE) for a in d["pe_act"]],
+                                     pattern=dict(shape=["/" if a in _isc else "" for a in d["pe_act"]],
+                                                  solidity=0.45, fgcolor="#0a0f1a")),
+                         hovertext=[f"PE {a}" for a in d["pe_act"]], hoverinfo="x+text"), row=4, col=1)
+    fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=4, col=1)
+    if d.get("last_ts"):
+        x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
+        for rr in (1, 2, 3, 4):
+            fig.add_vrect(x0=x0, x1=d["last_ts"], fillcolor="#67e8f9",
+                          opacity=0.08, line_width=0, row=rr, col=1)
+    fig.update_layout(template="plotly_dark", height=900, margin=dict(l=58, r=18, t=46, b=28),
+                      paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD, barmode="overlay", bargap=0.15,
+                      showlegend=True, legend=dict(orientation="h", y=1.05, x=0, font=dict(size=9)),
+                      font=dict(size=10))
+    fig.update_xaxes(rangeslider_visible=False)
+    for a in fig["layout"]["annotations"]:
         a["font"] = dict(size=10.5, color="#94a3b8")
     return fig
 
