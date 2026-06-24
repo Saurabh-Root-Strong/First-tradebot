@@ -1066,86 +1066,102 @@ body { background:#030810 !important; overflow-x:hidden; }
 app.index_string = app.index_string.replace("</head>", _CSS + "</head>")
 
 
-def _charts_help() -> "html.Details":
-    """Plain-English explainer for the Charts section — each series as What / Why /
-    How. Embedded in the heading. Inlined (not via _panel_help, which is defined
-    after the layout)."""
-    intro = ("Five lenses on one timeframe, full session. PRICE tells you WHAT happened · "
-             "OI tells you WHO is defending where (the walls) · VOLUME tells you IF it is "
-             "real · the STRADDLE tells you HOW scared or calm the market is. Read together "
-             "you see WHY a move happened, not just that it did.")
-    # (label, colour, what / why / how)
-    terms = [
-        ("Price — candles", "#e2e8f0",
-         "WHAT: index open/high/low/close per bar (green up, red down; a long wick = that "
-         "level was rejected).  WHY: the actual move + the levels buyers/sellers fight over.  "
-         "HOW: read trend, entries and rejections off highs/lows."),
-        ("close (dotted cyan)", "#67e8f9",
-         "WHAT: the closing price as a smooth line.  WHY: trend without the wick noise.  "
-         "HOW: confirm direction; watch where the line turns vs where OI turns."),
+_HELP_OPTIONS = {
+    "intro": ("OPTIONS FLOW — five lenses on one timeframe. PRICE = WHAT happened · OI = WHO is "
+              "defending where (the walls) · VOLUME = IF it is real · STRADDLE = HOW scared/calm "
+              "the market is. Read together = WHY a move happened, not just that it did."),
+    "terms": [
+        ("Price — candles + volume", "#e2e8f0",
+         "WHAT: index OHLC per bar (green up/red down; long wick = rejected level), volume bars "
+         "at the base.  WHY: the actual move + where buyers/sellers fight.  HOW: trend + rejections."),
         ("CE OI (red)", "#ef4444",
-         "WHAT: total CALL open interest.  WHY: call writing = sellers capping a level = "
-         "RESISTANCE / ceiling.  HOW: RISING = ceiling building (price capped); FALLING = "
-         "calls unwinding / short-covering = ceiling lifting (bullish fuel)."),
+         "WHAT: total CALL open interest.  WHY: call writing = sellers capping = RESISTANCE/ceiling.  "
+         "HOW: RISING = ceiling building (capped); FALLING = calls unwinding/short-cover = ceiling "
+         "lifting (bullish fuel)."),
         ("PE OI (green)", "#22c55e",
-         "WHAT: total PUT open interest.  WHY: put writing = sellers defending below = "
-         "SUPPORT / floor.  HOW: RISING = floor building (bullish); FALLING = puts unwinding "
-         "= floor cracking (bearish)."),
-        ("Volume (cyan bars)", "#22d3ee",
-         "WHAT: traded option volume in the bar.  WHY: the conviction behind a move.  "
-         "HOW: an OI change on HIGH volume is trustworthy; on a thin bar it is just noise."),
-        ("ATM straddle (amber)", "#fbbf24",
-         "WHAT: the ATM call + the ATM put added together (strike nearest spot — e.g. NIFTY "
-         "24,100 → 24,100 CE ₹120 + PE ₹110 = straddle ₹230).  WHY: it is the market's PRICE "
-         "of expected movement — how far the index is expected to travel up OR down by expiry, "
-         "direction stripped out: pure volatility + fear + time-value.  HOW: falling all day in "
-         "a range = time-decay (theta) bleed → option BUYERS lose, WRITERS win (sell straddle/"
-         "strangle); a sudden SPIKE = volatility expanding → a real move is starting → favour "
-         "BUYING options / trading the breakout, don't sell vol; a big 'expected move' (₹230) "
-         "while price barely moved = premium is rich → writing edge."),
-        ("Positioning flow (bottom panel)", "#a78bfa",
-         "WHAT: each bar = that bar's CHANGE in OI — calls plotted UP, puts plotted DOWN — "
-         "coloured by action: red = call writing, amber = call buying, green = put writing, "
-         "lime = put buying, hatched grey = positions CLOSING (cover/unwind).  WHY: this is the "
-         "'what are they doing' read.  HOW (the splitter): OI building + that leg's premium UP = "
-         "aggressive BUYING (long buildup); OI building + premium flat/DOWN = WRITING (eating "
-         "premium); OI falling = closing (premium up = covering, down = unwinding). Standard "
-         "OI-premium matrix, per leg.  NOTE: ATM premium also carries ~half the spot move (delta), "
-         "so on a strong trend bar the label leans with price — the dotted purple ATM-IV line is "
-         "the vol-regime context (one market-wide value, not per-leg)."),
-    ]
-    combos = [
-        "Price UP + CE OI DOWN + premium rising = short-covering breakout with vol expansion "
-        "(strong, real up-move).",
+         "WHAT: total PUT open interest.  WHY: put writing = sellers defending below = SUPPORT/floor.  "
+         "HOW: RISING = floor building (bullish); FALLING = puts unwinding = floor cracking (bearish)."),
+        ("ATM straddle + IV (amber / purple)", "#fbbf24",
+         "WHAT: ATM call + ATM put added (e.g. 24,100 CE 120 + PE 110 = 230) + the dotted ATM-IV line.  "
+         "WHY: the market's PRICE of expected move (direction stripped) — pure vol+fear+time.  HOW: "
+         "falling in a range = theta bleed → writers win; sudden spike = vol expanding → buy/breakout."),
+        ("Positioning flow (bottom)", "#a78bfa",
+         "WHAT: per-bar ΔOI — calls UP, puts DOWN — red=call-write amber=call-buy green=put-write "
+         "lime=put-buy hatched-grey=closing.  WHY: the 'what are they doing' read.  HOW: OI building + "
+         "that leg's premium UP = BUYING; premium flat/DOWN = WRITING; OI falling = closing."),
+    ],
+    "combos": [
+        "Price UP + CE OI DOWN = short-covering breakout (strong up).",
         "Price DOWN + PE OI DOWN = long-unwinding breakdown (strong down).",
-        "Both OI rising while price ranges = two-sided writing → range tightens toward max-pain.",
-        "Shaded band = the clicked timeframe window — line the OI turn up with the candle above it.",
-    ]
-    caveat = ("Honest limit: every contract has a buyer AND a writer — so 'buy vs write' is the "
-              "AGGRESSOR (who initiated), inferred from OI × premium, not a certainty. And OI "
-              "turns only count on real volume; a turn on a thin bar is noise. Volume here is "
-              "OPTION volume (the index itself has none).")
-    body = [html.Div(intro, style={"color": "#cbd5e1", "fontSize": "0.56rem",
+        "Both OI rising in a range = two-sided writing → range tightens toward max-pain.",
+    ],
+    "caveat": ("Every contract has a buyer AND a writer — 'buy vs write' is the AGGRESSOR inferred from "
+               "OI × premium, not certainty. OI turns only count on real volume. ATM premium also "
+               "carries ~half the spot move (delta), so labels lean with price on strong trend bars."),
+}
+
+_HELP_FUTURES = {
+    "intro": ("FUTURES — the directional/positioning read. Price+volume per EXPIRY (near/next/far via "
+              "the dropdown) · OI = the directional cash · basis = carry · rollover = positions moving "
+              "to next month vs exiting."),
+    "terms": [
+        ("Price — candles + volume (selected expiry)", "#e2e8f0",
+         "WHAT: OHLC + volume for the expiry you pick; the OTHER expiries show as dotted context lines.  "
+         "WHY: see the near/next/far price ladder.  HOW: pick Near/Next/Far in the dropdown. Far is "
+         "price-only (no volume in the feed)."),
+        ("Futures OI (consolidated)", "#38bdf8",
+         "WHAT: total futures OI across ALL expiries (near dominates ~80-90%).  WHY: directional smart "
+         "money — options are often hedges, futures are the real bet.  HOW: RISING into a move = "
+         "conviction. NOTE: same number whatever expiry you pick (not split by month)."),
+        ("Positioning — ΔOI × price", "#22c55e",
+         "WHAT: per-bar ΔOI coloured: green=long-buildup red=short-buildup teal=covering amber=unwinding "
+         "(down bars = closing).  WHY: are big players pressing long or short?  HOW: OI↑+price↑=long "
+         "buildup (bullish); OI↑+price↓=short buildup (bearish); OI↓+price↑=covering; OI↓+price↓=unwind."),
+        ("Basis = near − spot (₹)", "#22c55e",
+         "WHAT: futures premium/discount to spot.  WHY: premium = longs paying up to carry (bullish); "
+         "discount/collapse = bearish carry / unwinding.  HOW: widening premium = aggressive longs."),
+        ("Rollover (bottom)", "#fbbf24",
+         "WHAT: roll spread (next−near ₹, amber) + next-month volume share (%, teal).  WHY: near expiry, "
+         "positions ROLL near→next (a move, not an exit).  HOW: rising next-vol share + widening roll + "
+         "total OI holding while near fades = ROLLING; total OI dropping = genuine EXIT."),
+    ],
+    "combos": [
+        "Price UP + OI UP (green) + basis premium widening = longs pressing, strong real up.",
+        "Price DOWN + OI UP (red) = fresh shorts building, strong down.",
+        "Price DOWN + OI DOWN (long-unwind) = longs exiting — can bounce if just unwinding.",
+        "Near fading + next-vol share rising + total OI flat = rollover, not a bearish exit.",
+    ],
+    "caveat": ("OI is consolidated (all expiries) — can't split near/next/far intraday; per-expiry OI "
+               "needs the EOD bhavcopy. Far has no volume. Every contract has a long AND a short, so "
+               "'long/short buildup' is the aggressor read, not certainty."),
+}
+
+
+def _charts_help(mode="options") -> "html.Details":
+    """Mode-aware plain-English explainer for the Charts section. Rendered into its own
+    row by a callback so opening it never disrupts the dropdown controls."""
+    h = _HELP_FUTURES if mode == "futures" else _HELP_OPTIONS
+    body = [html.Div(h["intro"], style={"color": "#cbd5e1", "fontSize": "0.58rem",
                      "lineHeight": "1.5", "marginBottom": "7px", "whiteSpace": "normal"})]
-    for name, clr, txt in terms:
+    for name, clr, txt in h["terms"]:
         body.append(html.Div([
             html.Span(name + " — ", style={"color": clr, "fontWeight": "700"}),
             html.Span(txt, style={"color": "#94a3b8"}),
-        ], style={"fontSize": "0.54rem", "lineHeight": "1.5", "marginBottom": "5px",
+        ], style={"fontSize": "0.56rem", "lineHeight": "1.5", "marginBottom": "5px",
                   "whiteSpace": "normal"}))
     body.append(html.Div("Read them together", style={"color": "#67e8f9", "fontWeight": "700",
-                "fontSize": "0.54rem", "marginTop": "6px", "marginBottom": "3px"}))
-    body += [html.Div("• " + c, style={"color": "#94a3b8", "fontSize": "0.54rem",
-             "lineHeight": "1.5", "whiteSpace": "normal"}) for c in combos]
-    body.append(html.Div("⚠ " + caveat, style={"color": "#fbbf24", "fontSize": "0.54rem",
+                "fontSize": "0.56rem", "marginTop": "6px", "marginBottom": "3px"}))
+    body += [html.Div("• " + c, style={"color": "#94a3b8", "fontSize": "0.56rem",
+             "lineHeight": "1.5", "whiteSpace": "normal"}) for c in h["combos"]]
+    body.append(html.Div("⚠ " + h["caveat"], style={"color": "#fbbf24", "fontSize": "0.56rem",
                 "lineHeight": "1.45", "marginTop": "6px", "whiteSpace": "normal"}))
     return html.Details([
         html.Summary("ℹ what is this · how to read", style={
-            "color": "#67e8f9", "fontSize": "0.54rem", "cursor": "pointer", "marginLeft": "8px"}),
-        html.Div(body, style={"maxHeight": "360px", "overflowY": "auto", "marginTop": "5px",
-                 "padding": "8px 10px", "background": "#0a0f1a", "border": "1px solid #1e2d40",
-                 "borderRadius": "4px", "maxWidth": "660px"}),
-    ], style={"display": "inline-block", "verticalAlign": "middle"})
+            "color": "#67e8f9", "fontSize": "0.6rem", "cursor": "pointer"}),
+        html.Div(body, style={"maxHeight": "320px", "overflowY": "auto", "marginTop": "5px",
+                 "padding": "9px 12px", "background": "#0a0f1a", "border": "1px solid #1e2d40",
+                 "borderRadius": "4px"}),
+    ], style={"display": "block"})
 
 
 def _chart_dates():
@@ -1384,12 +1400,10 @@ app.layout = dbc.Container([
             # price candle + OI + volume + premium for a chosen index & timeframe.
             html.Div(id="charts-panel", style={"display": "none"}, children=[
                 dbc.Row([
-                    dbc.Col(html.Div([
-                        html.Span("📈 CHARTS", style={
-                            "color": "#a78bfa", "fontWeight": "700", "fontSize": "0.9rem",
-                            "letterSpacing": "0.06em"}),
-                        _charts_help(),
-                    ], style={"paddingTop": "6px"}), md=2),
+                    dbc.Col(html.Span("📈 CHARTS", style={
+                        "color": "#a78bfa", "fontWeight": "700", "fontSize": "0.9rem",
+                        "letterSpacing": "0.06em", "paddingTop": "6px",
+                        "display": "inline-block"}), md=2),
                     dbc.Col(dcc.Dropdown(
                         id="charts-mode", clearable=False,
                         options=[{"label": "⚙ Options flow", "value": "options"},
@@ -1418,6 +1432,9 @@ app.layout = dbc.Container([
                                  {"label": "60 min", "value": 60}],
                         value=15, style={"fontSize": "0.72rem"}), md=2),
                 ], className="mb-2 align-items-center"),
+                # Mode-aware help on its own row (so opening it never shifts the controls).
+                html.Div(_charts_help("options"), id="charts-help-box",
+                         className="mb-2", style={"maxWidth": "780px"}),
                 dcc.Loading(dcc.Graph(id="charts-graph",
                             config={"displayModeBar": False}),
                             type="circle", color="#a78bfa"),
@@ -2905,6 +2922,12 @@ def _sync_url(sym):
 def _toggle_leg_col(mode):
     """Show the near/next/far expiry picker only in Futures mode."""
     return {"display": "block"} if mode == "futures" else {"display": "none"}
+
+
+@app.callback(Output("charts-help-box", "children"), Input("charts-mode", "value"))
+def _swap_charts_help(mode):
+    """Show the help that matches the selected mode (options vs futures)."""
+    return _charts_help("futures" if mode == "futures" else "options")
 
 
 @app.callback(
