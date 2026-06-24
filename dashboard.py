@@ -1145,6 +1145,27 @@ def _charts_help() -> "html.Details":
     ], style={"display": "inline-block", "verticalAlign": "middle"})
 
 
+def _chart_dates():
+    """(options, default) for the Charts date picker — the captured session days in
+    the active mirror dir (newest first), defaulting to the latest day that actually
+    has data (so a pre-market empty 'today' doesn't show a blank chart)."""
+    from core.constants import LIVE_DIR, today_iso
+    have = {}
+    try:
+        for p in LIVE_DIR.glob("*_oi_snapshots.parquet"):
+            have[p.name[:10]] = p.stat().st_size
+    except Exception:
+        pass
+    have.setdefault(today_iso(), 0)
+    days = sorted(have, reverse=True)
+    opts = [{"label": ("● " + d if d == today_iso() else d), "value": d} for d in days]
+    default = next((d for d in days if have.get(d, 0) > 800), days[0] if days else today_iso())
+    return opts, default
+
+
+_CHART_DATE_OPTS, _CHART_DATE_DEF = _chart_dates()
+
+
 app.layout = dbc.Container([
     # ── Header (brand + status, then a horizontal index/nav strip) ──────────────
     html.Div([
@@ -1361,11 +1382,15 @@ app.layout = dbc.Container([
             html.Div(id="charts-panel", style={"display": "none"}, children=[
                 dbc.Row([
                     dbc.Col(html.Div([
-                        html.Span("📈 CHARTS — PRICE · OI · VOLUME · PREMIUM", style={
+                        html.Span("📈 CHARTS", style={
                             "color": "#a78bfa", "fontWeight": "700", "fontSize": "0.95rem",
                             "letterSpacing": "0.08em"}),
                         _charts_help(),
-                    ], style={"paddingTop": "6px"}), md=6),
+                    ], style={"paddingTop": "6px"}), md=3),
+                    dbc.Col(dcc.Dropdown(
+                        id="charts-date", clearable=False,
+                        options=_CHART_DATE_OPTS, value=_CHART_DATE_DEF,
+                        style={"fontSize": "0.75rem"}), md=3),
                     dbc.Col(dcc.Dropdown(
                         id="charts-idx", clearable=False,
                         options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
@@ -2862,16 +2887,17 @@ def _sync_url(sym):
 # ── Charts section: full-session price/OI/volume/premium for index + timeframe ──
 @app.callback(
     Output("charts-graph", "figure"),
-    Input("charts-idx", "value"),
-    Input("charts-tf",  "value"),
-    Input("sel-sym",    "data"),
+    Input("charts-idx",  "value"),
+    Input("charts-tf",   "value"),
+    Input("charts-date", "value"),
+    Input("sel-sym",     "data"),
 )
-def _update_charts(sym, tf, sel):
-    """Redraw when the index/timeframe changes or the Charts section opens."""
+def _update_charts(sym, tf, date, sel):
+    """Redraw when the index/timeframe/date changes or the Charts section opens."""
     from dash.exceptions import PreventUpdate
     if sel != "CHARTS":
         raise PreventUpdate
-    return _footprint_fig(sym or "NSE:NIFTY50-INDEX", int(tf or 15))
+    return _footprint_fig(sym or "NSE:NIFTY50-INDEX", int(tf or 15), date=date or None)
 
 
 # ── Callback 2: toggle panels + highlight selected nav card ───────────────────
@@ -3910,7 +3936,7 @@ def _render_index_trades(sym) -> "html.Div":
     return html.Div(items)
 
 
-def _footprint_fig(sym, tf_min: int, asof_value=None) -> "go.Figure":
+def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
     """5-panel popup chart for one index/timeframe — full session, tf-minute bars:
       1. Price  — candlestick + close line.
       2. Option OI — CE (ceiling) vs PE (floor): writing build-up vs unwinding.
@@ -3919,7 +3945,7 @@ def _footprint_fig(sym, tf_min: int, asof_value=None) -> "go.Figure":
       5. Positioning flow — per-bar ΔOI coloured BUY vs WRITE (inferred from IV):
          the "what are they secretly doing" read. Calls plotted up, puts down.
     The clicked lookback window is shaded across every panel."""
-    d = footprint_chart.build_series(sym, int(tf_min), as_of=_parse_asof(asof_value))
+    d = footprint_chart.build_series(sym, int(tf_min), date=date, as_of=_parse_asof(asof_value))
     if not d.get("has_data"):
         fig = go.Figure()
         fig.add_annotation(text=d.get("note", "no data"), showarrow=False,
