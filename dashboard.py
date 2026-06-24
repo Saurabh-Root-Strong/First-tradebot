@@ -1070,9 +1070,10 @@ _HELP_OPTIONS = {
     "intro": ("OPTIONS FLOW — five lenses on one timeframe. PRICE = WHAT happened · OI = WHO is "
               "defending where (the walls) · VOLUME = IF it is real · STRADDLE = HOW scared/calm "
               "the market is. Read together = WHY a move happened, not just that it did.  "
-              "STRIKE PICKER: 'Totals' = aggregate CE/PE across strikes; pick a strike (ATM±5) to "
-              "drill into THAT strike's CE/PE OI, premium and write-vs-buy — see exactly where the "
-              "wall is being built or torn down."),
+              "STRIKE PICKER: 'Totals' = aggregate CE/PE; or pick a strike — the ladder is FIXED at "
+              "the 9:15 OPEN ±700 (round-100 strikes, labelled by offset from open e.g. +300 / -700) "
+              "— to drill into THAT strike's CE/PE OI, premium and write-vs-buy (where the wall is "
+              "built or torn down)."),
     "terms": [
         ("Price — candles + volume", "#e2e8f0",
          "WHAT: index OHLC per bar (green up/red down; long wick = rejected level), volume bars "
@@ -2949,10 +2950,11 @@ def _fill_strikes(mode, sym, date, expiry, cur):
     """Populate the option strike picker (Totals + ATM±5) for the chosen index/date/expiry."""
     opts = [{"label": "Totals (CE/PE)", "value": "totals"}]
     if mode == "options":
-        atm, ks = footprint_chart.atm_strikes(sym or "NSE:NIFTY50-INDEX", date=date or None,
-                                              n=5, expiry=expiry or "weekly")
+        anchor, ks = footprint_chart.atm_strikes(sym or "NSE:NIFTY50-INDEX", date=date or None,
+                                                 n=7, expiry=expiry or "weekly")
         for k in ks:
-            tag = "  • ATM" if k == atm else ("  (ITM/OTM↓)" if k < atm else "  (OTM/ITM↑)")
+            off = k - (anchor or k)
+            tag = "  • OPEN" if off == 0 else f"  ({off:+d})"
             opts.append({"label": f"{k}{tag}", "value": str(k)})
     vals = {o["value"] for o in opts}
     return opts, (cur if cur in vals else "totals")

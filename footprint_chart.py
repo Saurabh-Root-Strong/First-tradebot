@@ -287,12 +287,15 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
     }
 
 
-def atm_strikes(sym: str, date=None, as_of=None, n: int = 5, expiry="weekly") -> tuple:
-    """(atm_strike, [strikes ATM±n]) for the picker — laddered by the ROUND step
-    (STRIKE_DISPLAY_STEP, e.g. NIFTY 100), snapped to round numbers, where the real
-    OI / premium / smart-money activity sits. Only strikes actually captured in
-    chain_snapshots (for the chosen `expiry`) are returned. ATM from oi_snapshots if
-    available, else nearest captured strike to last spot."""
+def atm_strikes(sym: str, date=None, as_of=None, n: int = 7, expiry="weekly") -> tuple:
+    """(open_anchor, [anchor ± n round strikes]) for the picker.
+
+    Anchor = the session OPENING price (the 09:15 open), snapped to the round step
+    (STRIKE_DISPLAY_STEP, e.g. NIFTY 100). The ladder is FIXED at market open and
+    spans the day's realistic range — n*step each side (default ±700 for NIFTY) —
+    rather than the moving intraday ATM, so the captured strikes don't shift as spot
+    drifts. Round-number strikes only (where the real OI sits), filtered to those
+    actually captured in chain_snapshots for the chosen `expiry`."""
     c = _read("chain_snapshots", date, as_of, sym)
     if c is None or "strike" not in c.columns:
         return None, []
@@ -302,26 +305,33 @@ def atm_strikes(sym: str, date=None, as_of=None, n: int = 5, expiry="weekly") ->
     ks = sorted(int(k) for k in c["strike"].unique())
     if not ks:
         return None, []
-    atm = None
-    o = _read("oi_snapshots", date, as_of, sym)
-    if o is not None and "atm" in o.columns and len(o):
-        try:
-            atm = int(o["atm"].iloc[-1])
-        except Exception:
-            atm = None
-    if atm is None:
-        t = _read("ticks", date, as_of, sym)
-        spot = float(t["ltp"].iloc[-1]) if t is not None and len(t) else ks[len(ks) // 2]
-        atm = min(ks, key=lambda k: abs(k - spot))
 
     step = STRIKE_DISPLAY_STEP.get(sym, STRIKE_STEP.get(sym, 50))
-    atm_r = int(round(atm / step) * step)              # snap ATM to the round step
+    # session OPENING price (first 09:15–15:30 tick's day_open, else its ltp)
+    open_px = None
+    t = _read("ticks", date, as_of, sym)
+    if t is not None and len(t):
+        sess = t[(t["ts"].dt.time >= pd.Timestamp("09:15").time()) &
+                 (t["ts"].dt.time <= pd.Timestamp("15:30").time())]
+        first = (sess if len(sess) else t).iloc[0]
+        open_px = float(first.get("day_open") or 0) or float(first.get("ltp") or 0)
+    if not open_px:                                    # fallback: oi-snapshots open ATM / mid
+        o = _read("oi_snapshots", date, as_of, sym)
+        if o is not None and "atm" in o.columns and len(o):
+            try:
+                open_px = float(o["atm"].iloc[0])
+            except Exception:
+                open_px = None
+        if not open_px:
+            open_px = ks[len(ks) // 2]
+
+    anchor = int(round(open_px / step) * step)         # snap open to the round step
     avail = set(ks)
-    ladder = [atm_r + i * step for i in range(-n, n + 1) if (atm_r + i * step) in avail]
+    ladder = [anchor + i * step for i in range(-n, n + 1) if (anchor + i * step) in avail]
     if not ladder:                                     # round strikes not captured → fall back
-        i = ks.index(min(ks, key=lambda k: abs(k - atm)))
+        i = ks.index(min(ks, key=lambda k: abs(k - anchor)))
         return ks[i], ks[max(0, i - n):i + n + 1]
-    return atm_r, ladder
+    return anchor, ladder
 
 
 def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=None,
