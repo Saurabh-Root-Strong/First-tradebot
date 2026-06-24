@@ -20,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from core.constants import NSE_NAME, STRIKE_STEP
+from core.constants import NSE_NAME, STRIKE_DISPLAY_STEP, STRIKE_STEP
 from core.mirror_io import read_mirror as _read
 
 
@@ -263,8 +263,11 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
 
 
 def atm_strikes(sym: str, date=None, as_of=None, n: int = 5) -> tuple:
-    """(atm_strike, [strikes ATM±n]) actually present in chain_snapshots for the day.
-    ATM from oi_snapshots if available, else the captured strike nearest last spot."""
+    """(atm_strike, [strikes ATM±n]) for the picker — laddered by the ROUND step
+    (STRIKE_DISPLAY_STEP, e.g. NIFTY 100), snapped to round numbers, where the real
+    OI / premium / smart-money activity sits. Only strikes actually captured in
+    chain_snapshots are returned. ATM from oi_snapshots if available, else nearest
+    captured strike to last spot."""
     c = _read("chain_snapshots", date, as_of, sym)
     if c is None or "strike" not in c.columns:
         return None, []
@@ -282,9 +285,15 @@ def atm_strikes(sym: str, date=None, as_of=None, n: int = 5) -> tuple:
         t = _read("ticks", date, as_of, sym)
         spot = float(t["ltp"].iloc[-1]) if t is not None and len(t) else ks[len(ks) // 2]
         atm = min(ks, key=lambda k: abs(k - spot))
-    i = ks.index(min(ks, key=lambda k: abs(k - atm)))
-    lo, hi = max(0, i - n), min(len(ks), i + n + 1)
-    return ks[i], ks[lo:hi]
+
+    step = STRIKE_DISPLAY_STEP.get(sym, STRIKE_STEP.get(sym, 50))
+    atm_r = int(round(atm / step) * step)              # snap ATM to the round step
+    avail = set(ks)
+    ladder = [atm_r + i * step for i in range(-n, n + 1) if (atm_r + i * step) in avail]
+    if not ladder:                                     # round strikes not captured → fall back
+        i = ks.index(min(ks, key=lambda k: abs(k - atm)))
+        return ks[i], ks[max(0, i - n):i + n + 1]
+    return atm_r, ladder
 
 
 def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=None) -> dict:

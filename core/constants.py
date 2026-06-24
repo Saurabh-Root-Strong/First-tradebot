@@ -32,8 +32,13 @@ LABEL_TO_SYM = {v.replace(" ", ""): k for k, v in LABELS.items()}   # NIFTY50, B
 LABEL_TO_SYM.update({"NIFTY": NIFTY, "BANKNIFTY": BANKNIFTY, "FINNIFTY": FINNIFTY,
                      "MIDCPNIFTY": MIDCPNIFTY, "MIDCAPNIFTY": MIDCPNIFTY})
 
-# option strike step per index
+# option strike step per index (the exchange's actual strike interval)
 STRIKE_STEP = {NIFTY: 50, BANKNIFTY: 100, FINNIFTY: 50, MIDCPNIFTY: 25}
+
+# "Major" round-number step where real OI / premium / smart-money activity concentrates
+# — used for the chart strike picker so it ladders by round hundreds (NIFTY 23500/600/700…)
+# instead of the minor 50-pt hedging strikes in between.
+STRIKE_DISPLAY_STEP = {NIFTY: 100, BANKNIFTY: 100, FINNIFTY: 100, MIDCPNIFTY: 100}
 
 # index symbol <-> NSE F&O underlying name (oi-spurts / bhavcopy)
 NSE_NAME = {NIFTY: "NIFTY", BANKNIFTY: "BANKNIFTY", FINNIFTY: "FINNIFTY", MIDCPNIFTY: "MIDCPNIFTY"}
