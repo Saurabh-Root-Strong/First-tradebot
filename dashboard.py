@@ -1091,11 +1091,14 @@ _HELP_OPTIONS = {
          "the CURRENT ATM-straddle cost (a small step when the index crosses a strike is normal). "
          "Dotted purple = ATM IV.  WHY: the straddle PRICE ≈ the market's EXPECTED MOVE — roughly how "
          "many points the index is expected to travel up OR down by expiry; buy it and you need a "
-         "bigger move than that to profit. Direction-free: pure volatility + fear + time-value.  HOW: "
-         "HIGH / RISING = a big move being priced (event / vol expanding) → option BUYERS favoured, "
-         "breakout brewing; LOW / FALLING in a range = theta (time) decay bleeding premium → WRITERS "
-         "win (sell straddle/strangle); a sudden mid-day SPIKE = vol expansion = a real move starting. "
-         "Into expiry it bleeds toward zero (theta crush) — exactly what 06-23 did (82 → 24)."),
+         "bigger move than that to profit.  IMPORTANT: it tells you HOW BIG a move may come — NOT up "
+         "or down. Pure volatility, direction stripped out. For DIRECTION read the OI walls + "
+         "positioning flow (options) and the futures basis / OI.  HOW: HIGH / RISING = a big move "
+         "being priced (event / vol expanding) → option BUYERS favoured, breakout brewing; LOW / "
+         "FALLING in a range = theta (time) decay bleeding premium → WRITERS win (sell straddle/"
+         "strangle); a sudden mid-day SPIKE = vol expansion = a real move starting. Into expiry it "
+         "bleeds toward zero (theta crush) — exactly what 06-23 did (82 → 24).  In short: straddle = "
+         "'how big?', OI + positioning = 'which way?'."),
         ("Positioning flow (bottom)", "#a78bfa",
          "WHAT: per-bar ΔOI — calls UP, puts DOWN — red=call-write amber=call-buy green=put-write "
          "lime=put-buy hatched-grey=closing.  WHY: the 'what are they doing' read.  HOW: OI building + "
