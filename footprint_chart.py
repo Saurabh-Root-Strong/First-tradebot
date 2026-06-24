@@ -57,12 +57,16 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
     cum_vol = chain.groupby("ts")["volume"].sum().sort_index()
 
     # CE/PE totals from oi_snapshots (canonical); fall back to chain if absent.
-    iv_ce = iv_pe = None
+    iv_atm = prem_ce = prem_pe = None
     if oi is not None and "total_call_oi" in oi.columns:
         oi_i = oi.set_index("ts").sort_index()
         oi_ce, oi_pe = oi_i["total_call_oi"], oi_i["total_put_oi"]
-        if "atm_call_iv" in oi_i.columns:           # ATM IV → buy-vs-write splitter
-            iv_ce, iv_pe = oi_i["atm_call_iv"], oi_i["atm_put_iv"]
+        if "atm_iv" in oi_i.columns:                # single ATM IV (vol-regime context line)
+            iv_atm = oi_i["atm_iv"]
+        elif "atm_call_iv" in oi_i.columns:
+            iv_atm = oi_i["atm_call_iv"]
+        if "atm_call_prem" in oi_i.columns:         # per-leg ATM premium → buy/write splitter
+            prem_ce, prem_pe = oi_i["atm_call_prem"], oi_i["atm_put_prem"]
     else:
         oi_ce = chain[chain["side"] == "CE"].groupby("ts")["oi"].sum().sort_index()
         oi_pe = chain[chain["side"] == "PE"].groupby("ts")["oi"].sum().sort_index()
@@ -77,8 +81,9 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
     df["oi_pe"]   = oi_pe.reindex(idx, method="ffill")
     df["cum_vol"] = cum_vol.reindex(idx, method="ffill")
     df["spot"]    = spot_at.reindex(idx, method="ffill")
-    df["iv_ce"]   = iv_ce.reindex(idx, method="ffill") if iv_ce is not None else np.nan
-    df["iv_pe"]   = iv_pe.reindex(idx, method="ffill") if iv_pe is not None else np.nan
+    df["iv_atm"]  = iv_atm.reindex(idx, method="ffill") if iv_atm is not None else np.nan
+    df["prem_ce"] = prem_ce.reindex(idx, method="ffill") if prem_ce is not None else np.nan
+    df["prem_pe"] = prem_pe.reindex(idx, method="ffill") if prem_pe is not None else np.nan
 
     # Resample to tf-minute bars: point-in-time (last) for level series; volume is the
     # in-bar increment of the cumulative total.
@@ -89,8 +94,9 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         "oi_pe":   rs["oi_pe"].last(),
         "spot":    rs["spot"].last(),
         "cum_vol": rs["cum_vol"].last(),
-        "iv_ce":   rs["iv_ce"].last(),
-        "iv_pe":   rs["iv_pe"].last(),
+        "iv_atm":  rs["iv_atm"].last(),
+        "prem_ce": rs["prem_ce"].last(),
+        "prem_pe": rs["prem_pe"].last(),
     }).dropna(how="all")
     bar = bar[bar[["premium", "cum_vol"]].notna().any(axis=1)]
     if not len(bar):
@@ -111,27 +117,28 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         return [None if pd.isna(v) else round(float(v), 2) for v in s]
 
     # ── Positioning flow: who was AGGRESSIVE each bar, per side ──────────────────
-    # Inference (not certainty — every contract has a buyer AND a writer):
-    #   OI rising + IV rising  -> aggressive BUYING (demand lifting vol)
-    #   OI rising + IV flat/down -> WRITING (supply, premium capped / "eating premium")
-    #   OI falling + premium up  -> short COVERING ;  OI falling + premium down -> UNWINDING
-    # IV is the splitter; per-leg premium-change is the fallback when IV is absent.
+    # Standard OI-premium 4-quadrant, per leg (the leg's OWN ATM premium):
+    #   OI up   + premium up   -> long BUILDUP (aggressive BUYING)
+    #   OI up   + premium flat/down -> short BUILDUP (WRITING, "eating premium")
+    #   OI down + premium up   -> short COVERING ;  OI down + premium down -> long UNWINDING
+    # NOTE: ATM premium also carries ~half the underlying move (delta ~0.5), so on a
+    # strong directional bar the label leans with price — the convention every desk uses.
+    # (ATM IV is a single market-wide value here — kept only as the context line, never
+    # as the per-leg splitter, since atm_call_iv == atm_put_iv in the feed.)
     d_oi_ce, d_oi_pe = bar["oi_ce"].diff(), bar["oi_pe"].diff()
-    d_iv_ce, d_iv_pe = bar["iv_ce"].diff(), bar["iv_pe"].diff()
-    d_prem = bar["premium"].diff()
+    d_pr_ce, d_pr_pe = bar["prem_ce"].diff(), bar["prem_pe"].diff()
     eps_ce = max(1.0, 0.10 * float(d_oi_ce.abs().median() or 0))
     eps_pe = max(1.0, 0.10 * float(d_oi_pe.abs().median() or 0))
 
-    def _act(d_oi, d_iv, d_pr, eps):
+    def _act(d_oi, d_pr, eps):
         if pd.isna(d_oi) or abs(d_oi) < eps:
             return "flat"
-        if d_oi > 0:                                   # OI building
-            rising = (d_iv > 0) if pd.notna(d_iv) else (pd.notna(d_pr) and d_pr > 0)
-            return "buy" if rising else "write"
+        if d_oi > 0:                                              # OI building
+            return "buy" if (pd.notna(d_pr) and d_pr > 0) else "write"
         return "cover" if (pd.notna(d_pr) and d_pr > 0) else "unwind"   # OI falling
 
-    ce_act = [_act(o, v, p, eps_ce) for o, v, p in zip(d_oi_ce, d_iv_ce, d_prem)]
-    pe_act = [_act(o, v, p, eps_pe) for o, v, p in zip(d_oi_pe, d_iv_pe, d_prem)]
+    ce_act = [_act(o, p, eps_ce) for o, p in zip(d_oi_ce, d_pr_ce)]
+    pe_act = [_act(o, p, eps_pe) for o, p in zip(d_oi_pe, d_pr_pe)]
 
     return {
         "has_data": True, "sym": sym, "tf": tf_min,
@@ -143,8 +150,7 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         "open":    _col(ohlc["o"]), "high": _col(ohlc["h"]),
         "low":     _col(ohlc["l"]), "close": _col(ohlc["c"]),
         "volume":  [0.0 if pd.isna(v) else round(float(v) / 1e5, 3) for v in vol],
-        "iv_ce":   [None if pd.isna(v) else round(float(v), 2) for v in bar["iv_ce"]],
-        "iv_pe":   [None if pd.isna(v) else round(float(v), 2) for v in bar["iv_pe"]],
+        "iv_atm":  [None if pd.isna(v) else round(float(v), 2) for v in bar["iv_atm"]],
         "d_oi_ce": [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in d_oi_ce],
         "d_oi_pe": [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in d_oi_pe],
         "ce_act":  ce_act, "pe_act": pe_act,

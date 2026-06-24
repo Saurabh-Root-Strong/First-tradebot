@@ -1105,11 +1105,14 @@ def _charts_help() -> "html.Details":
          "while price barely moved = premium is rich → writing edge."),
         ("Positioning flow (bottom panel)", "#a78bfa",
          "WHAT: each bar = that bar's CHANGE in OI — calls plotted UP, puts plotted DOWN — "
-         "coloured by what was happening: red = call writing, amber = call buying, green = put "
-         "writing, lime = put buying, grey = positions closing.  WHY: this is the 'what are they "
-         "secretly doing' read.  HOW (the splitter): OI building + IV RISING = aggressive BUYING "
-         "(demand); OI building + IV flat/FALLING = WRITING (eating premium). The dotted purple "
-         "IV line on the premium panel is that splitter — watch it with the flow bars."),
+         "coloured by action: red = call writing, amber = call buying, green = put writing, "
+         "lime = put buying, hatched grey = positions CLOSING (cover/unwind).  WHY: this is the "
+         "'what are they doing' read.  HOW (the splitter): OI building + that leg's premium UP = "
+         "aggressive BUYING (long buildup); OI building + premium flat/DOWN = WRITING (eating "
+         "premium); OI falling = closing (premium up = covering, down = unwinding). Standard "
+         "OI-premium matrix, per leg.  NOTE: ATM premium also carries ~half the spot move (delta), "
+         "so on a strong trend bar the label leans with price — the dotted purple ATM-IV line is "
+         "the vol-regime context (one market-wide value, not per-leg)."),
     ]
     combos = [
         "Price UP + CE OI DOWN + premium rising = short-covering breakout with vol expansion "
@@ -1119,9 +1122,9 @@ def _charts_help() -> "html.Details":
         "Shaded band = the clicked timeframe window — line the OI turn up with the candle above it.",
     ]
     caveat = ("Honest limit: every contract has a buyer AND a writer — so 'buy vs write' is the "
-              "AGGRESSOR (who initiated), inferred from IV, not a certainty. And OI turns only "
-              "count on real volume; a turn on a thin bar is noise. Volume here is OPTION volume "
-              "(the index itself has none).")
+              "AGGRESSOR (who initiated), inferred from OI × premium, not a certainty. And OI "
+              "turns only count on real volume; a turn on a thin bar is noise. Volume here is "
+              "OPTION volume (the index itself has none).")
     body = [html.Div(intro, style={"color": "#cbd5e1", "fontSize": "0.56rem",
                      "lineHeight": "1.5", "marginBottom": "7px", "whiteSpace": "normal"})]
     for name, clr, txt in terms:
@@ -3964,7 +3967,7 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
             f"{label} price — {tf_min}m candles", "Option OI — CE vs PE (lakh)",
             "Traded option volume per bar (lakh)", "ATM straddle premium (₹) + ATM IV (%)",
             "Positioning flow — ΔOI/bar · calls↑ puts↓ · red=call-write amber=call-buy "
-            "green=put-write lime=put-buy grey=closing"))
+            "green=put-write lime=put-buy · hatched grey=closing"))
     # 1 — price: candlestick + thin close line.
     fig.add_trace(go.Candlestick(
         x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"],
@@ -3986,21 +3989,31 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
     fig.add_trace(go.Scatter(x=ts, y=d["premium"], mode="lines", name="ATM straddle",
                              line=dict(color="#fbbf24", width=2),
                              connectgaps=True), row=4, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=ts, y=d.get("iv_ce"), mode="lines", name="ATM IV %",
+    fig.add_trace(go.Scatter(x=ts, y=d.get("iv_atm"), mode="lines", name="ATM IV %",
                              line=dict(color="#a78bfa", width=1.3, dash="dot"),
                              connectgaps=True), row=4, col=1, secondary_y=True)
-    # 5 — positioning flow: per-bar ΔOI, colour = buy vs write (inferred from IV).
-    _CE = {"write": "#ef4444", "buy": "#f59e0b", "cover": "#64748b", "unwind": "#334155", "flat": "rgba(0,0,0,0)"}
-    _PE = {"write": "#22c55e", "buy": "#84cc16", "cover": "#64748b", "unwind": "#334155", "flat": "rgba(0,0,0,0)"}
+    # 5 — positioning flow: per-bar ΔOI, colour = buy vs write (from per-leg premium).
+    # Closing (cover/unwind) = one muted grey + a hatch pattern, so it is unmistakable
+    # from the solid build bars (no amber-vs-grey confusion).
+    _CLOSE = "#64748b"
+    _CE = {"write": "#ef4444", "buy": "#f59e0b", "cover": _CLOSE, "unwind": _CLOSE, "flat": "rgba(0,0,0,0)"}
+    _PE = {"write": "#22c55e", "buy": "#84cc16", "cover": _CLOSE, "unwind": _CLOSE, "flat": "rgba(0,0,0,0)"}
+    _is_close = {"cover", "unwind"}
     ce_y = [abs(v) if v is not None else 0 for v in d["d_oi_ce"]]      # calls plotted up
     pe_y = [-abs(v) if v is not None else 0 for v in d["d_oi_pe"]]     # puts plotted down
-    ce_c = [_CE.get(a, "#334155") for a in d["ce_act"]]
-    pe_c = [_PE.get(a, "#334155") for a in d["pe_act"]]
+    ce_c = [_CE.get(a, _CLOSE) for a in d["ce_act"]]
+    pe_c = [_PE.get(a, _CLOSE) for a in d["pe_act"]]
+    ce_pat = ["/" if a in _is_close else "" for a in d["ce_act"]]       # hatch = closing
+    pe_pat = ["/" if a in _is_close else "" for a in d["pe_act"]]
     ce_t = [f"CALL {a} · ΔOI {v}L" for a, v in zip(d["ce_act"], d["d_oi_ce"])]
     pe_t = [f"PUT {a} · ΔOI {v}L" for a, v in zip(d["pe_act"], d["d_oi_pe"])]
-    fig.add_trace(go.Bar(x=ts, y=ce_y, marker_color=ce_c, name="calls", showlegend=False,
+    fig.add_trace(go.Bar(x=ts, y=ce_y, name="calls", showlegend=False,
+                         marker=dict(color=ce_c, pattern=dict(shape=ce_pat, solidity=0.45,
+                                     fgcolor="#0a0f1a")),
                          hovertext=ce_t, hoverinfo="x+text"), row=5, col=1)
-    fig.add_trace(go.Bar(x=ts, y=pe_y, marker_color=pe_c, name="puts", showlegend=False,
+    fig.add_trace(go.Bar(x=ts, y=pe_y, name="puts", showlegend=False,
+                         marker=dict(color=pe_c, pattern=dict(shape=pe_pat, solidity=0.45,
+                                     fgcolor="#0a0f1a")),
                          hovertext=pe_t, hoverinfo="x+text"), row=5, col=1)
     fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=5, col=1)
     # Shade the clicked lookback window across every panel.
