@@ -1101,7 +1101,7 @@ _HELP_OPTIONS = {
     ],
     "caveat": ("Every contract has a buyer AND a writer — 'buy vs write' is the AGGRESSOR inferred from "
                "OI × premium, not certainty. OI turns only count on real volume. ATM premium also "
-               "carries ~half the spot move (delta), so labels lean with price on strong trend bars."),
+               "carries ~half the index move (delta), so labels lean with price on strong trend bars."),
 }
 
 _HELP_FUTURES = {
@@ -1121,9 +1121,14 @@ _HELP_FUTURES = {
          "WHAT: per-bar ΔOI coloured: green=long-buildup red=short-buildup teal=covering amber=unwinding "
          "(down bars = closing).  WHY: are big players pressing long or short?  HOW: OI↑+price↑=long "
          "buildup (bullish); OI↑+price↓=short buildup (bearish); OI↓+price↑=covering; OI↓+price↓=unwind."),
-        ("Basis = near − spot (₹)", "#22c55e",
-         "WHAT: futures premium/discount to spot.  WHY: premium = longs paying up to carry (bullish); "
-         "discount/collapse = bearish carry / unwinding.  HOW: widening premium = aggressive longs."),
+        ("Basis = futures − index (₹)", "#22c55e",
+         "WHAT: the GAP between the FUTURES price and the LIVE INDEX price (cash). Green = futures "
+         "above index (premium/contango); red = below (discount).  WHY: it isolates futures DEMAND, "
+         "not just price direction.  HOW: bars RISING (premium widening) = futures bid up faster than "
+         "the index = long demand GROWING (bullish); bars FALLING (premium shrinking) = longs "
+         "unwinding / demand fading (bearish); flip to RED/discount = aggressive futures selling "
+         "(strong bearish). Read WITH price: price-up + basis-up = real long buildup; price-up + "
+         "basis-flat/down = hollow rally."),
         ("Rollover (bottom)", "#fbbf24",
          "WHAT: two lines — amber = roll spread = next-month PRICE minus near-month PRICE in ₹ (a price "
          "gap, NOT open interest; e.g. near 24,100, next 24,200 → 100); teal = % of futures VOLUME in "
@@ -4229,7 +4234,7 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None, leg="near") -> "g
       1. Selected-leg candles + volume, with near/next/far context lines.
       2. Futures OI (lakh contracts, consolidated — NSE oi-spurts).
       3. Futures positioning — per-bar ΔOI × price (long/short buildup vs cover/unwind).
-      4. Basis (near − spot): premium = longs paying up; discount = bearish carry.
+      4. Basis (futures − index): rising = long demand (bullish); falling/discount = bearish.
       5. Rollover — roll spread (next − near ₹) + next-month volume share (%)."""
     d = footprint_chart.build_futures_series(sym, int(tf_min), date=date,
                                              as_of=_parse_asof(asof_value), leg=leg)
@@ -4253,7 +4258,8 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None, leg="near") -> "g
                         f"Futures OI (lakh contracts, all expiries){oi_note}",
                         "Futures positioning — ΔOI/bar · green=long-buildup red=short-buildup "
                         "· teal=covering amber=unwinding (down=closing)",
-                        "Basis = near − spot (₹)  ·  premium=longs paying up, discount=bearish",
+                        "Basis = futures − index (₹)  ·  rising=long demand (bullish) · "
+                        "falling / red discount=demand fading (bearish)",
                         "Rollover — roll spread next−near (₹, amber) + next-month volume share (%, teal)"))
     # 1 — selected-leg candles + volume, with the OTHER legs as faint context lines.
     fig.add_trace(go.Candlestick(
