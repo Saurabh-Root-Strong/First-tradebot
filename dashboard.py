@@ -1172,25 +1172,21 @@ def _charts_help(mode="options") -> "html.Details":
     ], style={"display": "block"})
 
 
-def _chart_dates():
-    """(options, default) for the Charts date picker — the captured session days in
-    the active mirror dir (newest first), defaulting to the latest day that actually
-    has data (so a pre-market empty 'today' doesn't show a blank chart)."""
+def _captured_days() -> list:
+    """All captured session days in the active mirror dir, NEWEST FIRST. This is the
+    master date list — the header ◀▶ nav drives the cards AND the Charts off it."""
     from core.constants import LIVE_DIR, today_iso
-    have = {}
+    have = set()
     try:
         for p in LIVE_DIR.glob("*_oi_snapshots.parquet"):
-            have[p.name[:10]] = p.stat().st_size
+            if p.stat().st_size > 800:
+                have.add(p.name[:10])
     except Exception:
         pass
-    have.setdefault(today_iso(), 0)
-    days = sorted(have, reverse=True)
-    opts = [{"label": ("● " + d if d == today_iso() else d), "value": d} for d in days]
-    default = next((d for d in days if have.get(d, 0) > 800), days[0] if days else today_iso())
-    return opts, default
+    return sorted(have, reverse=True) or [today_iso()]
 
 
-_CHART_DATE_OPTS, _CHART_DATE_DEF = _chart_dates()
+_DEFAULT_DAY = _captured_days()[0]
 
 
 app.layout = dbc.Container([
@@ -1222,8 +1218,10 @@ app.layout = dbc.Container([
         ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px",
                   "alignItems": "center", "marginTop": "10px"}),
         # Live news / event-impact ticker — always visible across all panels.
-        # Static date nav (◀ ▶) drives the news-date Store; the panel below renders rows.
+        # The date nav (◀ ▶) drives the news-date Store, which is the MASTER date for
+        # the whole viewer: news panel, index cards (seed) AND the Charts section.
         dcc.Store(id="news-date"),
+        dcc.Store(id="viewer-seed"),   # dummy output for the card-seed-on-date callback
         html.Div([
             html.Span("◀", id="news-prev", n_clicks=0, style={
                 "color": "#67e8f9", "fontSize": "0.7rem", "fontWeight": "700",
@@ -1438,10 +1436,6 @@ app.layout = dbc.Container([
                         value="totals", style={"fontSize": "0.72rem"}),
                         # only shown in Options mode (populated by _fill_strikes)
                         id="charts-strike-col", md=2),
-                    dbc.Col(dcc.Dropdown(
-                        id="charts-date", clearable=False,
-                        options=_CHART_DATE_OPTS, value=_CHART_DATE_DEF,
-                        style={"fontSize": "0.72rem"}), md=2),
                     dbc.Col(dcc.Dropdown(
                         id="charts-idx", clearable=False,
                         options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
@@ -2949,7 +2943,7 @@ def _toggle_mode_cols(mode):
 
 @app.callback(Output("charts-strike", "options"), Output("charts-strike", "value"),
               Input("charts-mode", "value"), Input("charts-idx", "value"),
-              Input("charts-date", "value"), Input("charts-expiry", "value"),
+              Input("news-date", "data"), Input("charts-expiry", "value"),
               State("charts-strike", "value"))
 def _fill_strikes(mode, sym, date, expiry, cur):
     """Populate the option strike picker (Totals + ATM±5) for the chosen index/date/expiry."""
@@ -2978,7 +2972,7 @@ def _swap_charts_help(mode):
     Input("charts-expiry", "value"),
     Input("charts-idx",    "value"),
     Input("charts-tf",     "value"),
-    Input("charts-date",   "value"),
+    Input("news-date",     "data"),
     Input("sel-sym",       "data"),
 )
 def _update_charts(mode, leg, strike, expiry, sym, tf, date, sel):
@@ -5205,9 +5199,9 @@ def _news_nav(_p, _n, _tick, cur):
     """◀ older / ▶ newer across captured days. Tick only refreshes the date list
     (so a brand-new day appears) without moving the user off their chosen date.
     Buttons grey out at the ends (oldest / newest=today)."""
-    if not _NEWS_AVAILABLE:
-        return no_update, no_update, no_update, no_update
-    dates = news_events.available_dates()            # newest first
+    dates = _captured_days()                         # newest first — all captured days
+    if not dates and _NEWS_AVAILABLE:
+        dates = news_events.available_dates()
     if not dates:
         return None, "—", _NEWS_NAV_OFF, _NEWS_NAV_OFF
     cur = cur if cur in dates else dates[0]
@@ -5223,6 +5217,16 @@ def _news_nav(_p, _n, _tick, cur):
     prev_style = _NEWS_NAV_OFF if idx >= len(dates) - 1 else _NEWS_NAV_ON   # at oldest
     next_style = _NEWS_NAV_OFF if idx <= 0 else _NEWS_NAV_ON                # at newest
     return new, f"{new}{tag}", prev_style, next_style
+
+
+@app.callback(Output("viewer-seed", "data"), Input("news-date", "data"))
+def _seed_cards_on_date(date):
+    """VIEWER: re-seed the index cards from the MASTER date (header nav) so the cards
+    show that day's close — keeping cards, Charts and news on one date."""
+    import os as _os
+    if _os.environ.get("DASH_VIEWER") == "1" and date:
+        _viewer_seed_latest(date)
+    return date
 
 
 @app.callback(Output("news-panel", "children"),
@@ -5296,7 +5300,7 @@ if __name__ == "__main__":
         print("  VIEWER MODE — capture disabled. Reading data/intraday/live/ mirrors.")
         print("  Refresh them from the VM with:  python sync_from_vm.py  (or --watch).")
         _viewer_seed_latest()   # immediate seed so cards aren't blank on first paint
-        threading.Thread(target=_viewer_seed_loop, daemon=True, name="viewer-seed").start()
+        # (the per-date re-seed is driven by the master news-date via _seed_cards_on_date)
     else:
         raw_token     = _validate_token()
         _access_token = raw_token
