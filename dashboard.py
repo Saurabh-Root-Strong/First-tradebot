@@ -1164,13 +1164,7 @@ def _charts_help(mode="options") -> "html.Details":
              "lineHeight": "1.5", "whiteSpace": "normal"}) for c in h["combos"]]
     body.append(html.Div("⚠ " + h["caveat"], style={"color": "#fbbf24", "fontSize": "0.56rem",
                 "lineHeight": "1.45", "marginTop": "6px", "whiteSpace": "normal"}))
-    return html.Details([
-        html.Summary("ℹ what is this · how to read", style={
-            "color": "#67e8f9", "fontSize": "0.6rem", "cursor": "pointer"}),
-        html.Div(body, style={"maxHeight": "320px", "overflowY": "auto", "marginTop": "5px",
-                 "padding": "9px 12px", "background": "#0a0f1a", "border": "1px solid #1e2d40",
-                 "borderRadius": "4px"}),
-    ], style={"display": "block"})
+    return html.Div(body)   # rendered inside the help popup (dbc.Modal body)
 
 
 def _captured_days() -> list:
@@ -1448,9 +1442,17 @@ app.layout = dbc.Container([
                                  {"label": "60 min", "value": 60}],
                         value=15, style={"fontSize": "0.72rem"}), md=2),
                 ], className="mb-2 align-items-center"),
-                # Mode-aware help on its own row (so opening it never shifts the controls).
-                html.Div(_charts_help("options"), id="charts-help-box",
-                         className="mb-2", style={"maxWidth": "780px"}),
+                # Mode-aware help in a POPUP — opens over the chart, closes via the X /
+                # click-outside, so it never covers or pushes the chart down.
+                dbc.Button("ℹ what is this · how to read", id="charts-help-btn",
+                           color="link", size="sm",
+                           style={"color": "#67e8f9", "fontSize": "0.62rem", "padding": "0 0 6px 0",
+                                  "textDecoration": "none"}),
+                dbc.Modal([
+                    dbc.ModalHeader(dbc.ModalTitle("Charts — what is this · how to read"),
+                                    close_button=True),
+                    dbc.ModalBody(html.Div(_charts_help("options"), id="charts-help-box")),
+                ], id="charts-help-modal", is_open=False, size="lg", scrollable=True),
                 dcc.Loading(dcc.Graph(id="charts-graph",
                             config={"displayModeBar": False}),
                             type="circle", color="#a78bfa"),
@@ -2958,6 +2960,13 @@ def _fill_strikes(mode, sym, date, expiry, cur):
             opts.append({"label": f"{k}{tag}", "value": str(k)})
     vals = {o["value"] for o in opts}
     return opts, (cur if cur in vals else "totals")
+
+
+@app.callback(Output("charts-help-modal", "is_open"),
+              Input("charts-help-btn", "n_clicks"), prevent_initial_call=True)
+def _open_help_modal(_n):
+    """Open the help popup; the X / click-outside close it natively (dbc)."""
+    return True
 
 
 @app.callback(Output("charts-help-box", "children"), Input("charts-mode", "value"))
