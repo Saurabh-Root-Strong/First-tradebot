@@ -159,46 +159,67 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
     }
 
 
-def build_futures_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
-    """Per-bar near-month futures series for `sym` at `tf_min` minutes, full session.
+def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near") -> dict:
+    """Per-bar futures series for `sym` at `tf_min` minutes, full session.
 
-    Reads the futures_quotes mirror (near/next/far LTP, basis, roll spread, volume).
-    NOTE: Fyers serves futures price + volume but NOT intraday futures OI, so there is
-    no OI/positioning leg here — basis and roll spread are the positioning proxies:
-      basis  = near-future − spot (premium = aggressive longs paying up; discount/
-               collapse = unwinding / bearish carry).
-      roll   = next − near (calendar spread; contango vs backwardation).
+    `leg` ∈ {near, next, far} picks which expiry's candles + volume to draw. The
+    near/next/far close lines are always returned for context overlay.
+
+    ROLLOVER: as expiry nears, positions move near→next (a roll, not an exit). The
+    captured data lets us read it two honest ways:
+      roll_share = next-month share of per-bar volume (rising = rollover in progress)
+      roll       = next − near price (calendar spread; widens with roll demand).
+    Per-expiry OI is NOT in the intraday feed (oi-spurts OI is consolidated across
+    expiries; the OI/positioning panel is underlying-level). True per-expiry rollover
+    OI% needs the EOD F&O bhavcopy.
     """
     f = _read("futures_quotes", date, as_of, sym)
     if f is None or "near_ltp" not in f.columns:
         return {"has_data": False, "sym": sym, "tf": tf_min,
                 "note": "warming up — need futures capture"}
     f = f.set_index("ts").sort_index()
-    near = f["near_ltp"]
-    rs = near.resample(f"{tf_min}min", label="right", closed="right")
+    leg = leg if leg in ("near", "next", "far") else "near"
+    _ltp = {"near": "near_ltp", "next": "next_ltp", "far": "far_ltp"}[leg]
+    _vol = {"near": "near_vol", "next": "next_vol", "far": None}[leg]
+    if _ltp not in f.columns:
+        _ltp, _vol, leg = "near_ltp", "near_vol", "near"
+
+    def _last(col):
+        return (f[col].resample(f"{tf_min}min", label="right", closed="right").last()
+                if col in f.columns else None)
+
+    price = f[_ltp].dropna()
+    rs = price.resample(f"{tf_min}min", label="right", closed="right")
     bar = pd.DataFrame({"o": rs.first(), "h": rs.max(), "l": rs.min(), "c": rs.last()})
-    for c in ("next_ltp", "near_basis", "roll_spread", "near_vol"):
-        if c in f.columns:
-            bar[c] = f[c].resample(f"{tf_min}min", label="right", closed="right").last()
+    for c in ("near_ltp", "next_ltp", "far_ltp", "near_basis", "roll_spread"):
+        s = _last(c)
+        if s is not None:
+            bar[c] = s
     bar = bar.dropna(subset=["c"])
     if not len(bar):
         return {"has_data": False, "sym": sym, "tf": tf_min, "note": "warming up"}
 
-    # near_vol is the cumulative day total → per-bar increment.
-    vol = bar.get("near_vol")
+    # Selected-leg volume (cumulative day total → per-bar increment).
+    vol = _last(_vol) if _vol else None
     if vol is not None:
-        vol = vol.diff()
-        vol.iloc[0] = bar["near_vol"].iloc[0]
-        vol = vol.clip(lower=0)
+        v0 = vol.iloc[0]
+        vol = vol.diff(); vol.iloc[0] = v0; vol = vol.clip(lower=0)
+        vol = vol.reindex(bar.index)
+
+    # Rollover activity: next-month share of per-bar (near+next) volume.
+    share = None
+    nv, xv = _last("near_vol"), _last("next_vol")
+    if nv is not None and xv is not None:
+        ni, xi = nv.diff().clip(lower=0), xv.diff().clip(lower=0)
+        ni.iloc[0], xi.iloc[0] = nv.iloc[0], xv.iloc[0]
+        denom = (ni + xi).replace(0, float("nan"))
+        share = (xi / denom * 100).reindex(bar.index)
 
     ts_term = f.get("term_structure")
     term = (ts_term.resample(f"{tf_min}min", label="right", closed="right").last()
             .reindex(bar.index)) if ts_term is not None else None
 
-    # Futures OI (NSE oi-spurts mirror, keyed by NSE name e.g. "NIFTY") — the piece
-    # Fyers lacks. ΔOI × futures-price gives the futures 4-quadrant positioning:
-    #   OI up + price up = long buildup ; OI up + price down = short buildup ;
-    #   OI down + price up = short covering ; OI down + price down = long unwinding.
+    # Consolidated futures OI (NSE oi-spurts, all expiries) × NEAR price → positioning.
     oi_lakh = d_oi = None
     fut_act = ["flat"] * len(bar)
     ofut = _read("futures_oi", date, as_of, NSE_NAME.get(sym, sym))
@@ -208,7 +229,7 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
                 .reindex(bar.index, method="ffill"))
         oi_lakh = oi_s / 1e5
         d_oi = oi_lakh.diff()
-        d_px = bar["c"].diff()
+        d_px = (bar["near_ltp"] if "near_ltp" in bar else bar["c"]).diff()
         eps = max(0.1, 0.10 * float(d_oi.abs().median() or 0))
 
         def _fact(do, dp):
@@ -224,14 +245,16 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         return [None if (s is None or pd.isna(v)) else round(float(v), 2) for v in (s if s is not None else [])]
 
     return {
-        "has_data": True, "sym": sym, "tf": tf_min,
+        "has_data": True, "sym": sym, "tf": tf_min, "leg": leg,
         "ts":     [t.to_pydatetime() for t in bar.index],
         "open":   _c(bar["o"]), "high": _c(bar["h"]), "low": _c(bar["l"]), "close": _c(bar["c"]),
-        "next":   _c(bar.get("next_ltp")),
+        "near":   _c(bar.get("near_ltp")), "next": _c(bar.get("next_ltp")), "far": _c(bar.get("far_ltp")),
         "basis":  _c(bar.get("near_basis")),
         "roll":   _c(bar.get("roll_spread")),
+        "roll_share": _c(share), "has_roll": share is not None,
         "volume": [0.0 if (vol is None or pd.isna(v)) else round(float(v) / 1e5, 3)
                    for v in (vol if vol is not None else [0] * len(bar))],
+        "has_vol": vol is not None,
         "term":   [None if (term is None or pd.isna(v)) else str(v) for v in (term if term is not None else [None] * len(bar))],
         "oi":     _c(oi_lakh), "d_oi": _c(d_oi), "fut_act": fut_act,
         "has_oi": oi_lakh is not None,
