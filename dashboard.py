@@ -1400,9 +1400,9 @@ app.layout = dbc.Container([
                         options=[{"label": "Near expiry", "value": "near"},
                                  {"label": "Next expiry", "value": "next"},
                                  {"label": "Far expiry", "value": "far"}],
-                        value="near", style={"fontSize": "0.72rem"},
-                        # only meaningful in Futures mode (ignored for options)
-                    ), md=2),
+                        value="near", style={"fontSize": "0.72rem"}),
+                        # only shown in Futures mode (toggled by _toggle_leg_col)
+                        id="charts-leg-col", md=2, style={"display": "none"}),
                     dbc.Col(dcc.Dropdown(
                         id="charts-date", clearable=False,
                         options=_CHART_DATE_OPTS, value=_CHART_DATE_DEF,
@@ -2901,6 +2901,12 @@ def _sync_url(sym):
 
 
 # ── Charts section: full-session price/OI/volume/premium for index + timeframe ──
+@app.callback(Output("charts-leg-col", "style"), Input("charts-mode", "value"))
+def _toggle_leg_col(mode):
+    """Show the near/next/far expiry picker only in Futures mode."""
+    return {"display": "block"} if mode == "futures" else {"display": "none"}
+
+
 @app.callback(
     Output("charts-graph", "figure"),
     Input("charts-mode", "value"),
