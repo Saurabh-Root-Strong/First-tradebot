@@ -156,3 +156,56 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         "ce_act":  ce_act, "pe_act": pe_act,
         "last_ts": bar.index[-1].to_pydatetime(),
     }
+
+
+def build_futures_series(sym: str, tf_min: int, date=None, as_of=None) -> dict:
+    """Per-bar near-month futures series for `sym` at `tf_min` minutes, full session.
+
+    Reads the futures_quotes mirror (near/next/far LTP, basis, roll spread, volume).
+    NOTE: Fyers serves futures price + volume but NOT intraday futures OI, so there is
+    no OI/positioning leg here — basis and roll spread are the positioning proxies:
+      basis  = near-future − spot (premium = aggressive longs paying up; discount/
+               collapse = unwinding / bearish carry).
+      roll   = next − near (calendar spread; contango vs backwardation).
+    """
+    f = _read("futures_quotes", date, as_of, sym)
+    if f is None or "near_ltp" not in f.columns:
+        return {"has_data": False, "sym": sym, "tf": tf_min,
+                "note": "warming up — need futures capture"}
+    f = f.set_index("ts").sort_index()
+    near = f["near_ltp"]
+    rs = near.resample(f"{tf_min}min", label="right", closed="right")
+    bar = pd.DataFrame({"o": rs.first(), "h": rs.max(), "l": rs.min(), "c": rs.last()})
+    for c in ("next_ltp", "near_basis", "roll_spread", "near_vol"):
+        if c in f.columns:
+            bar[c] = f[c].resample(f"{tf_min}min", label="right", closed="right").last()
+    bar = bar.dropna(subset=["c"])
+    if not len(bar):
+        return {"has_data": False, "sym": sym, "tf": tf_min, "note": "warming up"}
+
+    # near_vol is the cumulative day total → per-bar increment.
+    vol = bar.get("near_vol")
+    if vol is not None:
+        vol = vol.diff()
+        vol.iloc[0] = bar["near_vol"].iloc[0]
+        vol = vol.clip(lower=0)
+
+    ts_term = f.get("term_structure")
+    term = (ts_term.resample(f"{tf_min}min", label="right", closed="right").last()
+            .reindex(bar.index)) if ts_term is not None else None
+
+    def _c(s):
+        return [None if (s is None or pd.isna(v)) else round(float(v), 2) for v in (s if s is not None else [])]
+
+    return {
+        "has_data": True, "sym": sym, "tf": tf_min,
+        "ts":     [t.to_pydatetime() for t in bar.index],
+        "open":   _c(bar["o"]), "high": _c(bar["h"]), "low": _c(bar["l"]), "close": _c(bar["c"]),
+        "next":   _c(bar.get("next_ltp")),
+        "basis":  _c(bar.get("near_basis")),
+        "roll":   _c(bar.get("roll_spread")),
+        "volume": [0.0 if (vol is None or pd.isna(v)) else round(float(v) / 1e5, 3)
+                   for v in (vol if vol is not None else [0] * len(bar))],
+        "term":   [None if (term is None or pd.isna(v)) else str(v) for v in (term if term is not None else [None] * len(bar))],
+        "last_ts": bar.index[-1].to_pydatetime(),
+    }

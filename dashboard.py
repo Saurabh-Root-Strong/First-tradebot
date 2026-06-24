@@ -1389,7 +1389,12 @@ app.layout = dbc.Container([
                             "color": "#a78bfa", "fontWeight": "700", "fontSize": "0.95rem",
                             "letterSpacing": "0.08em"}),
                         _charts_help(),
-                    ], style={"paddingTop": "6px"}), md=3),
+                    ], style={"paddingTop": "6px"}), md=2),
+                    dbc.Col(dcc.Dropdown(
+                        id="charts-mode", clearable=False,
+                        options=[{"label": "⚙ Options flow", "value": "options"},
+                                 {"label": "🛢 Futures", "value": "futures"}],
+                        value="options", style={"fontSize": "0.75rem"}), md=3),
                     dbc.Col(dcc.Dropdown(
                         id="charts-date", clearable=False,
                         options=_CHART_DATE_OPTS, value=_CHART_DATE_DEF,
@@ -1397,13 +1402,13 @@ app.layout = dbc.Container([
                     dbc.Col(dcc.Dropdown(
                         id="charts-idx", clearable=False,
                         options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
-                        value="NSE:NIFTY50-INDEX", style={"fontSize": "0.75rem"}), md=3),
+                        value="NSE:NIFTY50-INDEX", style={"fontSize": "0.75rem"}), md=2),
                     dbc.Col(dcc.Dropdown(
                         id="charts-tf", clearable=False,
                         options=[{"label": "5 min", "value": 5},
                                  {"label": "15 min", "value": 15},
                                  {"label": "60 min", "value": 60}],
-                        value=15, style={"fontSize": "0.75rem"}), md=3),
+                        value=15, style={"fontSize": "0.75rem"}), md=2),
                 ], className="mb-2 align-items-center"),
                 dcc.Loading(dcc.Graph(id="charts-graph",
                             config={"displayModeBar": False}),
@@ -2890,17 +2895,21 @@ def _sync_url(sym):
 # ── Charts section: full-session price/OI/volume/premium for index + timeframe ──
 @app.callback(
     Output("charts-graph", "figure"),
+    Input("charts-mode", "value"),
     Input("charts-idx",  "value"),
     Input("charts-tf",   "value"),
     Input("charts-date", "value"),
     Input("sel-sym",     "data"),
 )
-def _update_charts(sym, tf, date, sel):
-    """Redraw when the index/timeframe/date changes or the Charts section opens."""
+def _update_charts(mode, sym, tf, date, sel):
+    """Redraw when mode/index/timeframe/date changes or the Charts section opens."""
     from dash.exceptions import PreventUpdate
     if sel != "CHARTS":
         raise PreventUpdate
-    return _footprint_fig(sym or "NSE:NIFTY50-INDEX", int(tf or 15), date=date or None)
+    sym, tf, date = sym or "NSE:NIFTY50-INDEX", int(tf or 15), date or None
+    if mode == "futures":
+        return _futures_fig(sym, tf, date=date)
+    return _footprint_fig(sym, tf, date=date)
 
 
 # ── Callback 2: toggle panels + highlight selected nav card ───────────────────
@@ -4032,6 +4041,68 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
                       font=dict(size=10))
     fig.update_xaxes(rangeslider_visible=False)   # candlestick adds one by default
     for a in fig["layout"]["annotations"]:        # subplot titles
+        a["font"] = dict(size=10.5, color="#94a3b8")
+    return fig
+
+
+def _futures_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
+    """4-panel near-month futures chart — full session, tf-minute bars:
+      1. Near-future price candlestick + close line + next-month line.
+      2. Futures volume per bar.
+      3. Basis (near − spot): premium = longs paying up; discount/collapse = bearish carry.
+      4. Roll spread (next − near): calendar / contango vs backwardation.
+    (No OI panel — Fyers doesn't feed intraday futures OI; basis/roll are the proxies.)"""
+    d = footprint_chart.build_futures_series(sym, int(tf_min), date=date, as_of=_parse_asof(asof_value))
+    if not d.get("has_data"):
+        fig = go.Figure()
+        fig.add_annotation(text=d.get("note", "no data"), showarrow=False,
+                           font=dict(color="#64748b", size=13))
+        fig.update_layout(template="plotly_dark", height=300, paper_bgcolor=BG_CARD,
+                          plot_bgcolor=BG_CARD, xaxis=dict(visible=False), yaxis=dict(visible=False))
+        return fig
+    ts = d["ts"]
+    label = LABELS.get(sym, sym)
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+        row_heights=[0.42, 0.18, 0.22, 0.18],
+        subplot_titles=(f"{label} FUT (near) — {tf_min}m candles  ·  + next-month",
+                        "Futures volume per bar (lakh)",
+                        "Basis = near − spot (₹)  ·  premium=longs paying up, discount=bearish",
+                        "Roll spread = next − near (₹)  ·  calendar / contango"))
+    # 1 — near futures candles + close + next-month line.
+    fig.add_trace(go.Candlestick(
+        x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="near FUT",
+        increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
+        increasing_fillcolor="#22c55e", decreasing_fillcolor="#ef4444",
+        line=dict(width=1), showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=ts, y=d["close"], mode="lines", name="near close",
+                             line=dict(color="#67e8f9", width=1, dash="dot"), opacity=0.6), row=1, col=1)
+    if any(v is not None for v in d.get("next", [])):
+        fig.add_trace(go.Scatter(x=ts, y=d["next"], mode="lines", name="next month",
+                                 line=dict(color="#a78bfa", width=1.2)), row=1, col=1)
+    # 2 — volume.
+    fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
+                         marker_color="#22d3ee", opacity=0.75), row=2, col=1)
+    # 3 — basis (coloured by sign: premium green / discount red).
+    b_clr = ["#22c55e" if (v is not None and v >= 0) else "#ef4444" for v in d["basis"]]
+    fig.add_trace(go.Bar(x=ts, y=d["basis"], name="basis", marker_color=b_clr,
+                         showlegend=False), row=3, col=1)
+    fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=3, col=1)
+    # 4 — roll spread.
+    fig.add_trace(go.Scatter(x=ts, y=d["roll"], mode="lines", name="roll spread",
+                             line=dict(color="#fbbf24", width=1.6), showlegend=False), row=4, col=1)
+    if d.get("last_ts"):
+        x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
+        for rr in (1, 2, 3, 4):
+            fig.add_vrect(x0=x0, x1=d["last_ts"], fillcolor="#67e8f9",
+                          opacity=0.08, line_width=0, row=rr, col=1)
+    fig.update_layout(template="plotly_dark", height=820,
+                      margin=dict(l=54, r=18, t=46, b=28),
+                      paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD, bargap=0.15,
+                      showlegend=True, legend=dict(orientation="h", y=1.06, x=0, font=dict(size=9)),
+                      font=dict(size=10))
+    fig.update_xaxes(rangeslider_visible=False)
+    for a in fig["layout"]["annotations"]:
         a["font"] = dict(size=10.5, color="#94a3b8")
     return fig
 
