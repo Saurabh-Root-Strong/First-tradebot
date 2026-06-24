@@ -1189,6 +1189,20 @@ def _captured_days() -> list:
 _DEFAULT_DAY = _captured_days()[0]
 
 
+def _asof_options():
+    """Replay time checkpoints (15-min) — truncate every chart at the chosen time so
+    you can analyse 'data till HH:MM' and test what the market did next. Leakage-safe:
+    the as_of cutoff is enforced at the data read (read_mirror)."""
+    opts = [{"label": "Full session (live)", "value": "full"}]
+    for m in range(9 * 60 + 30, 15 * 60 + 31, 15):     # 09:30 … 15:30
+        hm = f"{m // 60:02d}:{m % 60:02d}"
+        opts.append({"label": f"⏱ till {hm}", "value": hm})
+    return opts
+
+
+_ASOF_OPTS = _asof_options()
+
+
 app.layout = dbc.Container([
     # ── Header (brand + status, then a horizontal index/nav strip) ──────────────
     html.Div([
@@ -1446,6 +1460,10 @@ app.layout = dbc.Container([
                                  {"label": "15 min", "value": 15},
                                  {"label": "60 min", "value": 60}],
                         value=15, style={"fontSize": "0.72rem"}), md=2),
+                    dbc.Col(dcc.Dropdown(
+                        id="charts-asof", clearable=False,
+                        options=_ASOF_OPTS, value="full",
+                        style={"fontSize": "0.72rem"}), md=2),
                 ], className="mb-2 align-items-center"),
                 # Mode-aware help in a POPUP — opens over the chart, closes via the X /
                 # click-outside, so it never covers or pushes the chart down.
@@ -2952,13 +2970,16 @@ def _toggle_mode_cols(mode):
 @app.callback(Output("charts-strike", "options"), Output("charts-strike", "value"),
               Input("charts-mode", "value"), Input("charts-idx", "value"),
               Input("news-date", "data"), Input("charts-expiry", "value"),
+              Input("charts-asof", "value"),
               State("charts-strike", "value"))
-def _fill_strikes(mode, sym, date, expiry, cur):
-    """Populate the option strike picker (Totals + ATM±5) for the chosen index/date/expiry."""
+def _fill_strikes(mode, sym, date, expiry, asof, cur):
+    """Populate the option strike picker (Totals + open±1000) for the index/date/expiry/as-of."""
     opts = [{"label": "Totals (CE/PE)", "value": "totals"}]
     if mode == "options":
+        asof_iso = f"{date}T{asof}:00+05:30" if (asof and asof != "full" and date) else None
         anchor, ks = footprint_chart.atm_strikes(sym or "NSE:NIFTY50-INDEX", date=date or None,
-                                                 n=10, expiry=expiry or "weekly")
+                                                 n=10, expiry=expiry or "weekly",
+                                                 as_of=_parse_asof(asof_iso))
         for k in ks:
             off = k - (anchor or k)
             tag = "  • OPEN" if off == 0 else f"  ({off:+d})"
@@ -2988,24 +3009,27 @@ def _swap_charts_help(mode):
     Input("charts-expiry", "value"),
     Input("charts-idx",    "value"),
     Input("charts-tf",     "value"),
+    Input("charts-asof",   "value"),
     Input("news-date",     "data"),
     Input("sel-sym",       "data"),
 )
-def _update_charts(mode, leg, strike, expiry, sym, tf, date, sel):
-    """Redraw when mode/leg/strike/expiry/index/timeframe/date changes or section opens."""
+def _update_charts(mode, leg, strike, expiry, sym, tf, asof, date, sel):
+    """Redraw when mode/leg/strike/expiry/index/tf/as-of/date changes or section opens.
+    as_of (replay): truncate every chart at the chosen time — leakage-safe (read_mirror)."""
     from dash.exceptions import PreventUpdate
     if sel != "CHARTS":
         raise PreventUpdate
     sym, tf, date = sym or "NSE:NIFTY50-INDEX", int(tf or 15), date or None
     expiry = expiry or "weekly"
+    asof_iso = f"{date}T{asof}:00+05:30" if (asof and asof != "full" and date) else None
     if mode == "futures":
-        return _futures_fig(sym, tf, date=date, leg=leg or "near")
+        return _futures_fig(sym, tf, asof_value=asof_iso, date=date, leg=leg or "near")
     if strike and strike != "totals":
         try:
-            return _strike_fig(sym, tf, int(strike), date=date, expiry=expiry)
+            return _strike_fig(sym, tf, int(strike), asof_value=asof_iso, date=date, expiry=expiry)
         except (ValueError, TypeError):
             pass
-    return _footprint_fig(sym, tf, date=date, expiry=expiry)
+    return _footprint_fig(sym, tf, asof_value=asof_iso, date=date, expiry=expiry)
 
 
 # ── Callback 2: toggle panels + highlight selected nav card ───────────────────
