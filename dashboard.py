@@ -5236,6 +5236,47 @@ def _update_news_panel(date, _n):
         return no_update
 
 
+def _viewer_seed_latest(date=None) -> None:
+    """VIEWER mode: fill _latest from the last SESSION tick (≤15:30) of each index in
+    the mirror, mapped to the WS field names the overview/sidebar cards expect, so the
+    cards show the day's last/close price instead of blanks (no live WS in viewer mode)."""
+    from core.mirror_io import read_mirror
+    for sym in INDEX_SYMBOLS:
+        try:
+            df = read_mirror("ticks", date, symbol=sym)
+            if df is None or df.empty:
+                continue
+            sess = df[df["ts"].dt.time <= datetime.time(15, 30)]
+            row = (sess if len(sess) else df).iloc[-1]
+            ltp = float(row.get("ltp", 0) or 0)
+            ch  = float(row.get("ch", 0) or 0)
+            with _lock:
+                _latest[sym] = {
+                    "ltp": ltp, "ch": ch, "chp": float(row.get("chp", 0) or 0),
+                    "open_price": float(row.get("day_open", 0) or 0),
+                    "high_price": float(row.get("day_high", 0) or 0),
+                    "low_price":  float(row.get("day_low", 0) or 0),
+                    "prev_close_price": ltp - ch,   # not in tick feed; derive
+                }
+        except Exception:
+            continue
+
+
+def _viewer_seed_loop() -> None:
+    """Re-seed every 15s from the latest captured day (picks up new mirror data)."""
+    import glob
+    import time as _t
+    from core.constants import LIVE_DIR
+    while True:
+        try:
+            days = sorted(os.path.basename(p)[:10]
+                          for p in glob.glob(str(LIVE_DIR / "*_ticks.parquet")))
+            _viewer_seed_latest(days[-1] if days else None)
+        except Exception:
+            pass
+        _t.sleep(15)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import os, webbrowser
@@ -5254,6 +5295,8 @@ if __name__ == "__main__":
     if VIEWER:
         print("  VIEWER MODE — capture disabled. Reading data/intraday/live/ mirrors.")
         print("  Refresh them from the VM with:  python sync_from_vm.py  (or --watch).")
+        _viewer_seed_latest()   # immediate seed so cards aren't blank on first paint
+        threading.Thread(target=_viewer_seed_loop, daemon=True, name="viewer-seed").start()
     else:
         raw_token     = _validate_token()
         _access_token = raw_token
