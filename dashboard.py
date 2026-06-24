@@ -1086,9 +1086,16 @@ _HELP_OPTIONS = {
          "WHAT: total PUT open interest.  WHY: put writing = sellers defending below = SUPPORT/floor.  "
          "HOW: RISING = floor building (bullish); FALLING = puts unwinding = floor cracking (bearish)."),
         ("ATM straddle + IV (amber / purple)", "#fbbf24",
-         "WHAT: ATM call + ATM put added (e.g. 24,100 CE 120 + PE 110 = 230) + the dotted ATM-IV line.  "
-         "WHY: the market's PRICE of expected move (direction stripped) — pure vol+fear+time.  HOW: "
-         "falling in a range = theta bleed → writers win; sudden spike = vol expanding → buy/breakout."),
+         "WHAT: the AT-THE-MONEY call + put added together (the strike nearest the live INDEX, e.g. "
+         "24,100 CE 36 + PE 46 = 82). It re-picks the ATM strike as the index moves, so it is always "
+         "the CURRENT ATM-straddle cost (a small step when the index crosses a strike is normal). "
+         "Dotted purple = ATM IV.  WHY: the straddle PRICE ≈ the market's EXPECTED MOVE — roughly how "
+         "many points the index is expected to travel up OR down by expiry; buy it and you need a "
+         "bigger move than that to profit. Direction-free: pure volatility + fear + time-value.  HOW: "
+         "HIGH / RISING = a big move being priced (event / vol expanding) → option BUYERS favoured, "
+         "breakout brewing; LOW / FALLING in a range = theta (time) decay bleeding premium → WRITERS "
+         "win (sell straddle/strangle); a sudden mid-day SPIKE = vol expansion = a real move starting. "
+         "Into expiry it bleeds toward zero (theta crush) — exactly what 06-23 did (82 → 24)."),
         ("Positioning flow (bottom)", "#a78bfa",
          "WHAT: per-bar ΔOI — calls UP, puts DOWN — red=call-write amber=call-buy green=put-write "
          "lime=put-buy hatched-grey=closing.  WHY: the 'what are they doing' read.  HOW: OI building + "
