@@ -1121,12 +1121,14 @@ _HELP_FUTURES = {
          "WHAT: futures premium/discount to spot.  WHY: premium = longs paying up to carry (bullish); "
          "discount/collapse = bearish carry / unwinding.  HOW: widening premium = aggressive longs."),
         ("Rollover (bottom)", "#fbbf24",
-         "WHAT: two lines — amber = roll spread (how much pricier next month is than near); teal = % "
-         "of futures volume that is in the NEXT month.  WHY: futures EXPIRE, so to KEEP a position you "
-         "must move it near→next ('roll'). This separates a ROLL from an EXIT.  HOW: both lines RISING "
-         "= people are rolling, so a falling near-OI is just moving forward (NOT bearish); both flat "
-         "while near-OI + total OI fall = a real EXIT (bearish).  Mostly only active in the last ~2-3 "
-         "days before monthly expiry — quiet mid-month is normal."),
+         "WHAT: two lines — amber = roll spread = next-month PRICE minus near-month PRICE in ₹ (a price "
+         "gap, NOT open interest; e.g. near 24,100, next 24,200 → 100); teal = % of futures VOLUME in "
+         "the NEXT month. (Open interest is the separate blue 'Futures OI' panel above — contracts, not "
+         "₹.)  WHY: futures EXPIRE, so to KEEP a position you must move it near→next ('roll'). This "
+         "separates a ROLL from an EXIT.  HOW: both lines RISING = people are rolling, so a falling "
+         "near-OI is just moving forward (NOT bearish); both flat while near-OI + total OI fall = a real "
+         "EXIT (bearish).  Mostly only active in the last ~2-3 days before monthly expiry — quiet "
+         "mid-month is normal."),
     ],
     "combos": [
         "Price UP + OI UP (green) + basis premium widening = longs pressing, strong real up.",
