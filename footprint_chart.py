@@ -287,12 +287,12 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
     }
 
 
-def atm_strikes(sym: str, date=None, as_of=None, n: int = 7, expiry="weekly") -> tuple:
+def atm_strikes(sym: str, date=None, as_of=None, n: int = 10, expiry="weekly") -> tuple:
     """(open_anchor, [anchor ± n round strikes]) for the picker.
 
     Anchor = the session OPENING price (the 09:15 open), snapped to the round step
     (STRIKE_DISPLAY_STEP, e.g. NIFTY 100). The ladder is FIXED at market open and
-    spans the day's realistic range — n*step each side (default ±700 for NIFTY) —
+    spans the day's realistic range — n*step each side (default ±1000 for NIFTY) —
     rather than the moving intraday ATM, so the captured strikes don't shift as spot
     drifts. Round-number strikes only (where the real OI sits), filtered to those
     actually captured in chain_snapshots for the chosen `expiry`."""

@@ -1071,7 +1071,7 @@ _HELP_OPTIONS = {
               "defending where (the walls) · VOLUME = IF it is real · STRADDLE = HOW scared/calm "
               "the market is. Read together = WHY a move happened, not just that it did.  "
               "STRIKE PICKER: 'Totals' = aggregate CE/PE; or pick a strike — the ladder is FIXED at "
-              "the 9:15 OPEN ±700 (round-100 strikes, labelled by offset from open e.g. +300 / -700) "
+              "the 9:15 OPEN ±1000 (round-100 strikes, labelled by offset from open e.g. +300 / -700) "
               "— to drill into THAT strike's CE/PE OI, premium and write-vs-buy (where the wall is "
               "built or torn down)."),
     "terms": [
@@ -2951,7 +2951,7 @@ def _fill_strikes(mode, sym, date, expiry, cur):
     opts = [{"label": "Totals (CE/PE)", "value": "totals"}]
     if mode == "options":
         anchor, ks = footprint_chart.atm_strikes(sym or "NSE:NIFTY50-INDEX", date=date or None,
-                                                 n=7, expiry=expiry or "weekly")
+                                                 n=10, expiry=expiry or "weekly")
         for k in ks:
             off = k - (anchor or k)
             tag = "  • OPEN" if off == 0 else f"  ({off:+d})"
