@@ -3949,13 +3949,12 @@ def _render_index_trades(sym) -> "html.Div":
 
 
 def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
-    """5-panel popup chart for one index/timeframe — full session, tf-minute bars:
-      1. Price  — candlestick + close line.
+    """4-panel popup chart for one index/timeframe — full session, tf-minute bars:
+      1. Price  — candlestick + close line, with volume merged at the base.
       2. Option OI — CE (ceiling) vs PE (floor): writing build-up vs unwinding.
-      3. Traded option volume per bar.
-      4. ATM-straddle premium + ATM IV (decay vs vol-expansion).
-      5. Positioning flow — per-bar ΔOI coloured BUY vs WRITE (inferred from IV):
-         the "what are they secretly doing" read. Calls plotted up, puts down.
+      3. ATM-straddle premium + ATM IV (decay vs vol-expansion).
+      4. Positioning flow — per-bar ΔOI coloured BUY vs WRITE (per-leg premium):
+         the "what are they doing" read. Calls plotted up, puts down.
     The clicked lookback window is shaded across every panel."""
     d = footprint_chart.build_series(sym, int(tf_min), date=date, as_of=_parse_asof(asof_value))
     if not d.get("has_data"):
@@ -3969,39 +3968,43 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
     ts = d["ts"]
     label = LABELS.get(sym, sym)
     fig = make_subplots(
-        rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-        row_heights=[0.30, 0.20, 0.12, 0.18, 0.20],
-        specs=[[{}], [{}], [{}], [{"secondary_y": True}], [{}]],
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.045,
+        row_heights=[0.34, 0.22, 0.20, 0.24],
+        specs=[[{"secondary_y": True}], [{}], [{"secondary_y": True}], [{}]],
         subplot_titles=(
-            f"{label} price — {tf_min}m candles", "Option OI — CE vs PE (lakh)",
-            "Traded option volume per bar (lakh)", "ATM straddle premium (₹) + ATM IV (%)",
+            f"{label} price — {tf_min}m candles + volume", "Option OI — CE vs PE (lakh)",
+            "ATM straddle premium (₹) + ATM IV (%)",
             "Positioning flow — ΔOI/bar · calls↑ puts↓ · red=call-write amber=call-buy "
             "green=put-write lime=put-buy · hatched grey=closing"))
-    # 1 — price: candlestick + thin close line.
+    # 1 — price: candlestick + close line, with volume merged at the base (secondary axis).
     fig.add_trace(go.Candlestick(
         x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"],
         name="price", increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
         increasing_fillcolor="#22c55e", decreasing_fillcolor="#ef4444",
-        line=dict(width=1), showlegend=False), row=1, col=1)
+        line=dict(width=1), showlegend=False), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=ts, y=d["close"], mode="lines", name="close",
                              line=dict(color="#67e8f9", width=1, dash="dot"),
-                             connectgaps=True, opacity=0.7), row=1, col=1)
+                             connectgaps=True, opacity=0.7), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
+                         marker_color="rgba(34,211,238,0.45)", showlegend=False),
+                  row=1, col=1, secondary_y=True)
+    _maxv = max([v for v in d["volume"] if v] or [1])
+    fig.update_yaxes(range=[0, _maxv * 4.5], row=1, col=1, secondary_y=True,
+                     showticklabels=False, showgrid=False)
+    fig.update_yaxes(tickformat=",.0f", row=1, col=1, secondary_y=False)   # 24,100 not 24k
     # 2 — OI CE vs PE.
     fig.add_trace(go.Scatter(x=ts, y=d["oi_ce"], mode="lines", name="CE OI (ceiling)",
                              line=dict(color="#ef4444", width=1.6)), row=2, col=1)
     fig.add_trace(go.Scatter(x=ts, y=d["oi_pe"], mode="lines", name="PE OI (floor)",
                              line=dict(color="#22c55e", width=1.6)), row=2, col=1)
-    # 3 — volume.
-    fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
-                         marker_color="#22d3ee", opacity=0.75), row=3, col=1)
-    # 4 — premium (left axis) + ATM IV (right axis): decay vs vol-expansion.
+    # 3 — premium (left axis) + ATM IV (right axis): decay vs vol-expansion.
     fig.add_trace(go.Scatter(x=ts, y=d["premium"], mode="lines", name="ATM straddle",
                              line=dict(color="#fbbf24", width=2),
-                             connectgaps=True), row=4, col=1, secondary_y=False)
+                             connectgaps=True), row=3, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=ts, y=d.get("iv_atm"), mode="lines", name="ATM IV %",
                              line=dict(color="#a78bfa", width=1.3, dash="dot"),
-                             connectgaps=True), row=4, col=1, secondary_y=True)
-    # 5 — positioning flow: per-bar ΔOI, colour = buy vs write (from per-leg premium).
+                             connectgaps=True), row=3, col=1, secondary_y=True)
+    # 4 — positioning flow: per-bar ΔOI, colour = buy vs write (from per-leg premium).
     # Closing (cover/unwind) = one muted grey + a hatch pattern, so it is unmistakable
     # from the solid build bars (no amber-vs-grey confusion).
     _CLOSE = "#64748b"
@@ -4019,22 +4022,22 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
     fig.add_trace(go.Bar(x=ts, y=ce_y, name="calls", showlegend=False,
                          marker=dict(color=ce_c, pattern=dict(shape=ce_pat, solidity=0.45,
                                      fgcolor="#0a0f1a")),
-                         hovertext=ce_t, hoverinfo="x+text"), row=5, col=1)
+                         hovertext=ce_t, hoverinfo="x+text"), row=4, col=1)
     fig.add_trace(go.Bar(x=ts, y=pe_y, name="puts", showlegend=False,
                          marker=dict(color=pe_c, pattern=dict(shape=pe_pat, solidity=0.45,
                                      fgcolor="#0a0f1a")),
-                         hovertext=pe_t, hoverinfo="x+text"), row=5, col=1)
-    fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=5, col=1)
+                         hovertext=pe_t, hoverinfo="x+text"), row=4, col=1)
+    fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=4, col=1)
     # Shade the clicked lookback window across every panel.
     if d.get("last_ts"):
         x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
-        for rr in (1, 2, 3, 4, 5):
+        for rr in (1, 2, 3, 4):
             fig.add_vrect(x0=x0, x1=d["last_ts"], fillcolor="#67e8f9",
                           opacity=0.08, line_width=0, row=rr, col=1)
-    fig.update_yaxes(title_text="IV %", row=4, col=1, secondary_y=True,
+    fig.update_yaxes(title_text="IV %", row=3, col=1, secondary_y=True,
                      showgrid=False, color="#a78bfa")
-    fig.update_layout(template="plotly_dark", height=940,
-                      margin=dict(l=54, r=46, t=46, b=28),
+    fig.update_layout(template="plotly_dark", height=900,
+                      margin=dict(l=58, r=46, t=46, b=28),
                       paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD,
                       barmode="overlay", bargap=0.15, showlegend=True,
                       legend=dict(orientation="h", y=1.05, x=0, font=dict(size=9)),
@@ -4064,25 +4067,33 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
     label = LABELS.get(sym, sym)
     oi_note = "" if d.get("has_oi") else "  (no OI captured this day)"
     fig = make_subplots(
-        rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-        row_heights=[0.30, 0.16, 0.20, 0.18, 0.16],
-        subplot_titles=(f"{label} FUT (near) — {tf_min}m candles  ·  + next-month",
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+        row_heights=[0.40, 0.18, 0.24, 0.18],
+        specs=[[{"secondary_y": True}], [{}], [{}], [{}]],
+        subplot_titles=(f"{label} FUT (near) — {tf_min}m candles + volume  ·  + next-month",
                         f"Futures OI (lakh contracts){oi_note}",
                         "Futures positioning — ΔOI/bar · green=long-buildup red=short-buildup "
                         "· teal=covering amber=unwinding (down=closing)",
-                        "Basis = near − spot (₹)  ·  premium=longs paying up, discount=bearish",
-                        "Futures volume per bar (lakh)"))
-    # 1 — candles + close + next-month.
+                        "Basis = near − spot (₹)  ·  premium=longs paying up, discount=bearish"))
+    # 1 — candles + close + next-month, with volume merged at the base (secondary axis).
     fig.add_trace(go.Candlestick(
         x=ts, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name="near FUT",
         increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
         increasing_fillcolor="#22c55e", decreasing_fillcolor="#ef4444",
-        line=dict(width=1), showlegend=False), row=1, col=1)
+        line=dict(width=1), showlegend=False), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=ts, y=d["close"], mode="lines", name="near close",
-                             line=dict(color="#67e8f9", width=1, dash="dot"), opacity=0.6), row=1, col=1)
+                             line=dict(color="#67e8f9", width=1, dash="dot"), opacity=0.6),
+                  row=1, col=1, secondary_y=False)
     if any(v is not None for v in d.get("next", [])):
         fig.add_trace(go.Scatter(x=ts, y=d["next"], mode="lines", name="next month",
-                                 line=dict(color="#a78bfa", width=1.2)), row=1, col=1)
+                                 line=dict(color="#a78bfa", width=1.2)), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
+                         marker_color="rgba(34,211,238,0.45)", showlegend=False),
+                  row=1, col=1, secondary_y=True)
+    _maxv = max([v for v in d["volume"] if v] or [1])
+    fig.update_yaxes(range=[0, _maxv * 4.5], row=1, col=1, secondary_y=True,
+                     showticklabels=False, showgrid=False)
+    fig.update_yaxes(tickformat=",.0f", row=1, col=1, secondary_y=False)   # 24,100 not 24k
     # 2 — futures OI level.
     fig.add_trace(go.Scatter(x=ts, y=d.get("oi"), mode="lines", name="futures OI",
                              line=dict(color="#38bdf8", width=1.8), connectgaps=True,
@@ -4102,16 +4113,13 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None) -> "go.Figure":
     fig.add_trace(go.Bar(x=ts, y=d["basis"], name="basis", marker_color=b_clr,
                          showlegend=False), row=4, col=1)
     fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=4, col=1)
-    # 5 — volume.
-    fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
-                         marker_color="#22d3ee", opacity=0.75, showlegend=False), row=5, col=1)
     if d.get("last_ts"):
         x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
-        for rr in (1, 2, 3, 4, 5):
+        for rr in (1, 2, 3, 4):
             fig.add_vrect(x0=x0, x1=d["last_ts"], fillcolor="#67e8f9",
                           opacity=0.08, line_width=0, row=rr, col=1)
-    fig.update_layout(template="plotly_dark", height=960,
-                      margin=dict(l=54, r=18, t=46, b=28),
+    fig.update_layout(template="plotly_dark", height=860,
+                      margin=dict(l=58, r=18, t=46, b=28),
                       paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD, bargap=0.15,
                       showlegend=True, legend=dict(orientation="h", y=1.05, x=0, font=dict(size=9)),
                       font=dict(size=10))
