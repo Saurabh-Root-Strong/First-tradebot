@@ -1486,8 +1486,8 @@ app.layout = dbc.Container([
                            style={"color": "#67e8f9", "fontSize": "0.62rem", "padding": "0 0 6px 0",
                                   "textDecoration": "none"}),
                 dbc.Modal([
-                    dbc.ModalHeader(dbc.ModalTitle("Charts — what is this · how to read"),
-                                    close_button=True),
+                    dbc.ModalHeader(dbc.ModalTitle("⚙ Options flow — what is this · how to read",
+                                                   id="charts-help-title"), close_button=True),
                     dbc.ModalBody(html.Div(_charts_help("options"), id="charts-help-box")),
                 ], id="charts-help-modal", is_open=False, size="lg", scrollable=True),
                 dcc.Loading(dcc.Graph(id="charts-graph",
@@ -3009,10 +3009,14 @@ def _open_help_modal(_n):
     return True
 
 
-@app.callback(Output("charts-help-box", "children"), Input("charts-mode", "value"))
+@app.callback(Output("charts-help-box", "children"), Output("charts-help-title", "children"),
+              Input("charts-mode", "value"))
 def _swap_charts_help(mode):
-    """Show the help that matches the selected mode (options vs futures)."""
-    return _charts_help("futures" if mode == "futures" else "options")
+    """Show the help that matches the selected mode (options vs futures), and label
+    the popup title with the mode so it's clear which help you're reading."""
+    if mode == "futures":
+        return _charts_help("futures"), "🛢 Futures — what is this · how to read"
+    return _charts_help("options"), "⚙ Options flow — what is this · how to read"
 
 
 @app.callback(
