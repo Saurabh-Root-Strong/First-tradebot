@@ -130,10 +130,20 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
     if not len(bar):
         return {"has_data": False, "sym": sym, "tf": tf_min, "note": "warming up"}
 
-    vol = bar["cum_vol"].diff()
-    if len(vol):
-        vol.iloc[0] = bar["cum_vol"].iloc[0]          # first bar = volume since open
-    vol = vol.clip(lower=0)                            # guard the stale-open crossover
+    # Per-bar option volume, IMMUNE to the captured strike set changing intraday.
+    # Summing the cumulative total over a shifting strike set then diffing is wrong:
+    # a strike ENTERING dumps its whole day-cumulative as one fake bar spike, and a
+    # strike LEAVING makes the diff negative -> clip(0) wipes the bar. Instead diff
+    # each (strike, side) cumulative column first, clip per-leg, then sum the
+    # increments (NaN on a leg's entry/exit -> skipped, conservative).
+    vpiv = (chain.pivot_table(index="ts", columns=["strike", "side"],
+                              values="volume", aggfunc="last").sort_index())
+    vinc = vpiv.diff()
+    if len(vinc):
+        vinc.iloc[0] = vpiv.iloc[0]                   # first snapshot = volume since open
+    vstep = vinc.clip(lower=0).sum(axis=1)            # total incremental option volume / snapshot
+    vol = (vstep.resample(f"{tf_min}min", label="right", closed="right")
+           .sum().reindex(bar.index).fillna(0.0))
 
     # Per-bar price OHLC from the underlying tick stream (same bars as the level
     # series above) — lets the popup draw a candlestick, not just a close line.
