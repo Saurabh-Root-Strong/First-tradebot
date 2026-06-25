@@ -69,7 +69,9 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
     common = np.array(sorted(set(ce.columns) & set(pe.columns)), dtype=float)
     straddle: dict = {}
     if common.size:
-        for ts in ce.index:
+        # Only timestamps present on BOTH legs — a partial snapshot (CE without PE,
+        # the known L2 capture gap) must skip, not KeyError and blank the whole chart.
+        for ts in ce.index.intersection(pe.index):
             sp = spot_at.asof(ts)
             if pd.isna(sp):
                 continue
