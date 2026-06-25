@@ -46,7 +46,6 @@ _MIN_EOD_OI      = 0.0        # set per-index at runtime (fraction of max handle
 _REL_OI_FRACTION = 0.15       # a strike is "positioned" if its EOD OI >= 15% of the
                               # heaviest leg in the chain (adapts across indices)
 _MIN_OICH        = 5_000      # today's |oich| must clear this to count as action
-_PREM_DEAD       = 0.05       # |ltpch| <= this = flat premium
 _NEUTRAL_BAND    = 0.5        # |score| below this = no clear edge
 _GAP_MIN         = 0.0015     # |gap| above this counts as a directional open
 
@@ -194,12 +193,15 @@ def analyze_reconciliation(strike_map: dict, spot: float, baseline: dict,
                 rows.append(StrikeRecon(sp, leg, eod_oi, eod_chg, t_oich, t_ltpch, effect, 0, 0.0))
                 continue
             w = min(eod_oi / max_eod, 1.0)     # weight by overnight position size
-            # short-covering (OI down + premium up) is the highest-conviction
-            # abandonment — boost it; plain unwinding (premium also down) is softer.
-            conv = 1.0
-            if effect == "ABANDONED":
-                conv = 1.25 if (t_ltpch > _PREM_DEAD) == (leg == "PE") else 1.0
-            contrib = bias * w * conv
+            # No conviction multiplier: distinguishing short-covering from long
+            # unwinding needs the DELTA-ADJUSTED premium residual (Δprem − delta·Δspot,
+            # as in footprint_chart.build_strike_series), not raw ltpch — which is
+            # delta-contaminated (CE rises on any up-move, PE on any down-move). The
+            # old raw-ltpch boost was leg-asymmetric and effectively backwards on CE.
+            # This panel is context-only with an unproven directional edge
+            # (backtest_reconciliation CIs straddle null), so a fudge multiplier is
+            # false precision. Plain bias × overnight-size weight.
+            contrib = bias * w
             score += contrib
             rows.append(StrikeRecon(sp, leg, eod_oi, eod_chg, t_oich, t_ltpch, effect, bias, round(contrib, 3)))
 
