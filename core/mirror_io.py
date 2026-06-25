@@ -35,6 +35,10 @@ def read_mirror(tbl: str, date: str | None = None,
     if df.empty:
         return None
     df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
+    # Drop epoch-junk ts (feed occasionally emits 1901/1970/1979 sentinels). Left in,
+    # one bad row makes a downstream resample span ~125 years -> millions of empty
+    # bins -> hang/OOM. No legitimate NSE intraday row predates 2000.
+    df = df[df["ts"] >= pd.Timestamp("2000-01-01", tz=IST)]
     if as_of is not None:
         df = df[df["ts"] <= pd.Timestamp(as_of)]
     return df.sort_values("ts").reset_index(drop=True) if len(df) else None
