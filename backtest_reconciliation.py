@@ -60,7 +60,9 @@ def collect(days: list[str], con, walls: dict) -> pd.DataFrame:
                     if not spot or not sm:
                         continue
                     anchor = feed.pa_anchor(sym)   # session open (volume-free trend ref)
-                    r = orc.analyze_reconciliation(sm, spot, baseline, gap=gap, vwap=anchor)
+                    index_chg = (spot - prior_close) if prior_close else 0.0
+                    r = orc.analyze_reconciliation(sm, spot, baseline, gap=gap, vwap=anchor,
+                                                   index_chg=index_chg)
                     if not r.has_data:
                         continue
                     fwd = {}

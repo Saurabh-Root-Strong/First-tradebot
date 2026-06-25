@@ -103,14 +103,23 @@ class DuckFeed:
             [sym, self._te]).fetchone()
         if not ts or ts[0] is None:
             return {}
+        # ltpch/delta were added by later ALTERs — older per-day duckdbs lack them,
+        # so select them only when present (NULL placeholder otherwise).
+        have = {r[0] for r in self.con.execute(
+            "select column_name from information_schema.columns "
+            "where table_name='chain_snapshots'").fetchall()}
+        ltpch_c = "ltpch" if "ltpch" in have else "NULL"
+        delta_c = "delta" if "delta" in have else "NULL"
         rows = self.con.execute(
-            "select strike, side, ltp, oi, oich, volume from chain_snapshots "
-            "where symbol=? and epoch(ts)=?", [sym, ts[0]]).fetchall()
+            f"select strike, side, ltp, {ltpch_c}, oi, oich, volume, {delta_c} "
+            "from chain_snapshots where symbol=? and epoch(ts)=?", [sym, ts[0]]).fetchall()
         sm: dict = {}
-        for sp, side, ltp, oi, oich, vol in rows:
+        for sp, side, ltp, ltpch, oi, oich, vol, delta in rows:
             sm.setdefault(float(sp), {})[side] = {
-                "ltp": float(ltp or 0), "oi": float(oi or 0),
-                "oich": float(oich or 0), "volume": float(vol or 0)}
+                "ltp": float(ltp or 0), "ltpch": float(ltpch or 0),
+                "oi": float(oi or 0), "oich": float(oich or 0),
+                "volume": float(vol or 0),
+                "delta": (None if delta is None else float(delta))}
         return sm
 
     def close(self):

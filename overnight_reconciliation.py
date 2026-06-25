@@ -48,6 +48,8 @@ _REL_OI_FRACTION = 0.15       # a strike is "positioned" if its EOD OI >= 15% of
 _MIN_OICH        = 5_000      # today's |oich| must clear this to count as action
 _NEUTRAL_BAND    = 0.5        # |score| below this = no clear edge
 _GAP_MIN         = 0.0015     # |gap| above this counts as a directional open
+_CONV_BOOST      = 1.4        # weight × when the delta-adjusted residual CONFIRMS the
+_CONV_DAMP       = 0.6        # writer story; × when it's option-buyer-driven (contradicts)
 
 
 @dataclass
@@ -61,10 +63,13 @@ class StrikeRecon:
     effect:    str            # REINFORCED | ABANDONED | QUIET
     bias:      int            # +1 bullish / -1 bearish / 0
     contrib:   float          # signed weighted contribution to the net score
+    residual:  float = 0.0    # delta-adjusted premium residual (Δprem − delta·Δindex)
+    flow:      str  = ""      # covering | unwind | writing | buying | "" (delta absent)
 
     def describe(self) -> str:
         arrow = {"REINFORCED": "=", "ABANDONED": "x", "QUIET": "·"}.get(self.effect, "·")
-        return (f"{self.strike:,.0f}{self.leg} {arrow} {self.effect.lower()} "
+        tag = f" · {self.flow}" if self.flow else ""
+        return (f"{self.strike:,.0f}{self.leg} {arrow} {self.effect.lower()}{tag} "
                 f"(EOD OI {self.eod_oi:,.0f}, today {self.today_oich:+,.0f})")
 
 
@@ -143,13 +148,41 @@ def _classify_effect(leg: str, today_oich: float, today_ltpch: float,
         return ("REINFORCED", +1) if rising else ("ABANDONED", -1)
 
 
+def _flow_conviction(effect: str, residual: float, has_delta: bool) -> tuple[str, float]:
+    """Resolve the delta-adjusted premium residual into (flow_label, weight_mult).
+
+    residual = Δpremium − delta·Δindex strips the part of the option move the index
+    alone explains, so its sign reveals WHO drove the OI change (same read as
+    footprint_chart.build_strike_series):
+        OI falling (ABANDONED) + residual>0  = short-COVERING  (writers buying back)
+        OI falling (ABANDONED) + residual<=0 = long UNWIND     (option buyers exiting)
+        OI rising  (REINFORCED) + residual<0 = WRITING         (writers pressing)
+        OI rising  (REINFORCED) + residual>=0 = BUYING         (option buyers paying up)
+    The ceiling/floor model assumes the heavy OI is WRITERS, so writer-driven flow
+    (covering / writing) CONFIRMS the bias → boost; buyer-driven flow (unwind /
+    buying) contradicts the writer reading → damp. Sign of the bias is never
+    flipped — only the conviction weight moves. Delta absent → neutral (×1)."""
+    if not has_delta:
+        return "", 1.0
+    if effect == "ABANDONED":
+        return ("covering", _CONV_BOOST) if residual > 0 else ("unwind", _CONV_DAMP)
+    if effect == "REINFORCED":
+        return ("writing", _CONV_BOOST) if residual < 0 else ("buying", _CONV_DAMP)
+    return "", 1.0
+
+
 def analyze_reconciliation(strike_map: dict, spot: float, baseline: dict,
-                           gap: float = 0.0, vwap: float = 0.0) -> ReconResult:
+                           gap: float = 0.0, vwap: float = 0.0,
+                           index_chg: float = 0.0) -> ReconResult:
     """Reconcile today's live per-strike oich against last night's positioned map.
 
-    strike_map : {strike: {"CE": {oich, ltpch, oi, volume}, "PE": {...}}}  (live)
+    strike_map : {strike: {"CE": {oich, ltpch, oi, volume, delta}, "PE": {...}}} (live)
     baseline   : output of eod_baseline()                                   (frozen)
     gap        : (open - prev_close)/prev_close, for the regime-shift gate.
+    index_chg  : spot − prev_close (index points vs prev close — same anchor as the
+                 per-strike ltpch). Drives the delta-adjusted residual that splits
+                 each OI move into writer-driven (confirms) vs buyer-driven
+                 (contradicts) and weights conviction accordingly. 0 = skip (neutral).
     vwap       : session VWAP — price-action anchor. When given, the OI verdict
                  is flagged pa_confirmed only if spot sits the right side of VWAP
                  (above for bullish, below for bearish), and a regime shift further
@@ -189,21 +222,25 @@ def analyze_reconciliation(strike_map: dict, spot: float, baseline: dict,
             t_oich = float(le.get("oich") or 0)
             t_ltpch = float(le.get("ltpch") or 0)
             effect, bias = _classify_effect(leg, t_oich, t_ltpch, floor_oich)
+            # delta-adjusted premium residual: Δprem − delta·Δindex. delta carries its
+            # native sign (CE>0, PE<0) so the index-explained part is stripped for both
+            # legs. Absent delta (legacy mirrors) → residual unused, conviction neutral.
+            d_raw = le.get("delta")
+            has_delta = d_raw is not None and index_chg != 0.0
+            residual = t_ltpch - (float(d_raw) if d_raw is not None else 0.0) * index_chg
+            flow, conv = _flow_conviction(effect, residual, has_delta)
             if effect == "QUIET" or bias == 0:
-                rows.append(StrikeRecon(sp, leg, eod_oi, eod_chg, t_oich, t_ltpch, effect, 0, 0.0))
+                rows.append(StrikeRecon(sp, leg, eod_oi, eod_chg, t_oich, t_ltpch, effect, 0, 0.0,
+                                        round(residual, 2), flow))
                 continue
             w = min(eod_oi / max_eod, 1.0)     # weight by overnight position size
-            # No conviction multiplier: distinguishing short-covering from long
-            # unwinding needs the DELTA-ADJUSTED premium residual (Δprem − delta·Δspot,
-            # as in footprint_chart.build_strike_series), not raw ltpch — which is
-            # delta-contaminated (CE rises on any up-move, PE on any down-move). The
-            # old raw-ltpch boost was leg-asymmetric and effectively backwards on CE.
-            # This panel is context-only with an unproven directional edge
-            # (backtest_reconciliation CIs straddle null), so a fudge multiplier is
-            # false precision. Plain bias × overnight-size weight.
-            contrib = bias * w
+            # conviction = delta-adjusted residual confirming (writer-driven) vs
+            # contradicting (buyer-driven) the ceiling/floor read. Modulates the WEIGHT
+            # only; the bias sign is set purely by OI direction, never flipped here.
+            contrib = bias * w * conv
             score += contrib
-            rows.append(StrikeRecon(sp, leg, eod_oi, eod_chg, t_oich, t_ltpch, effect, bias, round(contrib, 3)))
+            rows.append(StrikeRecon(sp, leg, eod_oi, eod_chg, t_oich, t_ltpch, effect, bias,
+                                    round(contrib, 3), round(residual, 2), flow))
 
     if not rows:
         res.note = "No positioned strikes in range / no action yet."
