@@ -47,10 +47,22 @@ import pandas as pd
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from core.constants import INDEX_SYMBOLS, STRIKE_STEP, LABELS, IST
+from core.constants import INDEX_SYMBOLS, STRIKE_STEP, LABELS, IST, NIFTY
 from core.mirror_io import read_mirror as _read_mirror
 import footprint_chart as fc
 import hour_forecast as hf
+
+# NSE killed weekly expiries for BANKNIFTY/FINNIFTY/MIDCAP — only NIFTY has a weekly;
+# the others are MONTHLY only. The capture stores one (nearest tradeable) expiry per
+# index, so this is just the honest label for what you'd actually trade.
+def _expiry_kind(sym: str) -> str:
+    return "weekly" if sym == NIFTY else "monthly"
+
+
+# Premium SL / first-target as % of entry, by timeframe (from trade_setup.TF_PROFILES).
+# Wider stop + further target the longer the hold.
+_SLT = {5: (0.30, 0.50), 15: (0.32, 0.55), 60: (0.35, 0.65)}
+_MKT_OPEN = datetime.time(9, 15)
 
 # ── Signal weights (sum to 1.0). The delta-adjusted FLOW carries the most weight:
 # it strips delta·Δindex from the premium, so it reads true demand, not the price
@@ -310,6 +322,69 @@ def _verify(sym: str, date, as_of, horizon_min: int, spot0: float,
     return out
 
 
+def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
+               cur_strength) -> Optional[dict]:
+    """Trade lifecycle for an OPEN directional call: when it TRIGGERED (scan back to
+    the first contiguous same-direction TRADE bar), the entry strike/premium it would
+    have been taken at, SL/target on the premium, live P&L, and a CLOSE/HOLD manage
+    verdict. The manage logic exists to CUT the loser fast — the arrow is measured
+    negative-EV, so a disciplined exit on reversal/theta is the only edge available.
+
+    Replay-only (needs as_of); live shows the trade with manage='HOLD' until graded."""
+    if as_of is None or direction not in ("CE", "PE"):
+        return None
+    side = direction
+    # ── trigger time: walk back on the tf grid while it stayed the same TRADE ─────
+    trig_t = as_of
+    for i in range(1, 13):
+        t_i = as_of - datetime.timedelta(minutes=tf_min * i)
+        if t_i.time() < _MKT_OPEN:
+            break
+        r_i = scan_index(sym, tf_min, date=date, as_of=t_i,
+                         horizon_min=horizon_min, with_lifecycle=False)
+        if r_i.get("verdict") == f"TRADE {direction}":
+            trig_t = t_i
+        else:
+            break
+    # ── entry strike = the ATM at trigger (what you'd actually have bought) ───────
+    spot_trig = _spot_at(sym, date, trig_t)
+    trig_atm = _atm(spot_trig, sym) if spot_trig else None
+    # premium reads use the captured chain (single nearest expiry, stored under the
+    # legacy/"weekly" bucket); _expiry_kind is the honest DISPLAY label only.
+    entry = _opt_premium(sym, date, trig_t, trig_atm, side) if trig_atm else None
+    cur = _opt_premium(sym, date, as_of, trig_atm, side) if trig_atm else None
+    sl_pct, t1_pct = _SLT.get(tf_min, (0.32, 0.55))
+    out = {"trigger": trig_t.strftime("%H:%M"), "entry_strike": trig_atm,
+           "entry_prem": round(entry, 2) if entry else None,
+           "cur_prem": round(cur, 2) if cur else None,
+           "sl": round(entry * (1 - sl_pct), 2) if entry else None,
+           "target": round(entry * (1 + t1_pct), 2) if entry else None,
+           "pnl_pct": None, "manage": "HOLD"}
+
+    manage = "HOLD"
+    if entry and cur:
+        out["pnl_pct"] = round((cur / entry - 1.0) * 100.0, 1)
+        if cur <= entry * (1 - sl_pct):
+            manage = "CLOSE · SL hit"
+        elif cur >= entry * (1 + t1_pct):
+            manage = "BOOK · target hit"
+    # structure reversed against the position → exit
+    if manage == "HOLD" and cur_strength is not None:
+        want_up = direction == "CE"
+        if (cur_strength > 0) != want_up and abs(cur_strength) >= _TRADE_TH * 0.5:
+            manage = "CLOSE · flow reversed"
+    # sideways + theta bleed: held a while, index barely moved, premium decaying
+    if manage == "HOLD" and spot_trig and entry and cur:
+        spot_now = _spot_at(sym, date, as_of)
+        if spot_now:
+            mv = abs(spot_now / spot_trig - 1.0) * 100.0
+            held = (as_of - trig_t).total_seconds() / 60.0
+            if held >= 2 * tf_min and mv < 0.05 and cur < entry:
+                manage = "CLOSE · sideways, theta bleed"
+    out["manage"] = manage
+    return out
+
+
 def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:
     """Forward prediction over horizon_min: UP/DOWN/RANGE + target + band.
     Band scales the 60m realised-vol forecast by sqrt(H/60) (vol ~ sqrt time)."""
@@ -327,9 +402,11 @@ def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:
 
 
 def scan_index(sym: str, tf_min: int, date=None, as_of=None,
-               horizon_min: Optional[int] = None) -> dict:
+               horizon_min: Optional[int] = None, with_lifecycle: bool = True) -> dict:
     """Per-index structural read at instant t + forward prediction over horizon_min
-    (defaults to the bar timeframe) + verify (replay only). Returns a row dict."""
+    (defaults to the bar timeframe) + verify (replay only) + trade lifecycle
+    (trigger time / SL / target / CLOSE-HOLD). with_lifecycle=False inside the
+    lookback scan to avoid recursion. Returns a row dict."""
     horizon_min = int(horizon_min or tf_min)
     label = LABELS.get(sym, sym)
     try:
@@ -377,12 +454,16 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     fwd = _forward(direction, spot, fcst.get("exp_move_pct"), horizon_min)
     verify = _verify(sym, date, as_of, horizon_min, spot,
                      fwd["pdir"], fwd["pred_lo"], fwd["pred_hi"], atm=atm)
+    lifecycle = (_lifecycle(sym, tf_min, date, as_of, direction, horizon_min, strength)
+                 if (with_lifecycle and direction) else None)
     return {
         "sym": sym, "label": label, "has_data": True,
         "tf": tf_min, "horizon": horizon_min, "spot": spot, "atm": atm,
+        "expiry": _expiry_kind(sym),
         "strength": round(strength, 3), "agree": agree, "active": active,
         "verdict": verdict, "direction": direction, "confidence": conf,
         "instrument": (f"{atm} {direction}" if direction and atm else ""),
+        "lifecycle": lifecycle,
         "reasons": reasons,
         "parts": {k: round(parts[k][0], 3) for k in _W},
         "range_lo": fcst.get("lo"), "range_hi": fcst.get("hi"),
@@ -452,6 +533,13 @@ if __name__ == "__main__":
         else:
             pl += "   => (pending — future not reached)"
         print(pl)
+        lc = r.get("lifecycle")
+        if lc:
+            pnl = f" ({lc['pnl_pct']:+.0f}%)" if lc.get("pnl_pct") is not None else ""
+            print(f"      TRADE {r['expiry']}: triggered {lc['trigger']}  "
+                  f"entry {lc['entry_strike']} {r['direction']} ₹{lc['entry_prem']} "
+                  f"→ now ₹{lc['cur_prem']}{pnl}  SL ₹{lc['sl']} T ₹{lc['target']}  "
+                  f"=> {lc['manage']}")
         for why in r["reasons"][:3]:
             print(f"      - {why}")
     print("=" * 74)

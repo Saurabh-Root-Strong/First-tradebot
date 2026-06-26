@@ -3184,16 +3184,38 @@ def _scout_row(r):
     bg    = "#0c1f17" if (trade and side == "CE") else "#1f0c0c" if (trade and side == "PE") else "#0a1020"
     rng   = (f"  range [{r['range_lo']}, {r['range_hi']}]"
              if r.get("range_lo") is not None else "")
+    inst = (f" · {r['instrument']}" if r.get("instrument") else "")
+    if trade and r.get("expiry"):
+        inst += f" ({r['expiry']})"
     head = html.Div([
         html.Span(r["label"], style={"fontWeight": "700", "minWidth": "120px",
                                      "display": "inline-block", "color": "#e2e8f0"}),
-        html.Span(r["verdict"] + (f" · {r['instrument']}" if r.get("instrument") else ""),
-                  style={"fontWeight": "700", "color": clr, "minWidth": "150px",
+        html.Span(r["verdict"] + inst,
+                  style={"fontWeight": "700", "color": clr, "minWidth": "160px",
                          "display": "inline-block"}),
         html.Span(f"str {r['strength']:+.2f}  agree {r['agree']}/{r['active']}  "
                   f"conf {r['confidence']}%{rng}",
                   style={"color": "#94a3b8"}),
     ], style={**MONO, "fontSize": "0.66rem"})
+    # OPEN TRADE lifecycle: when it triggered, entry/SL/target, live P&L, manage call
+    lc = r.get("lifecycle")
+    trade_blk = None
+    if lc:
+        mng = lc.get("manage", "HOLD")
+        is_close = mng.startswith("CLOSE") or mng.startswith("BOOK")
+        mclr = "#ef4444" if mng.startswith("CLOSE") else "#22c55e" if mng.startswith("BOOK") else "#34d399"
+        pnl = lc.get("pnl_pct")
+        pnlclr = "#22c55e" if (pnl or 0) > 0 else "#ef4444" if (pnl or 0) < 0 else "#94a3b8"
+        trade_blk = html.Div([
+            html.Span(f"⏱ triggered {lc['trigger']}  ", style={"color": "#fbbf24", "fontWeight": "700"}),
+            html.Span(f"entry {lc.get('entry_strike')} {side} ₹{lc.get('entry_prem')} "
+                      f"→ ₹{lc.get('cur_prem')} ", style={"color": "#cbd5e1"}),
+            html.Span((f"({pnl:+.0f}%)  " if pnl is not None else ""), style={"color": pnlclr, "fontWeight": "700"}),
+            html.Span(f"SL ₹{lc.get('sl')}  T ₹{lc.get('target')}   ", style={"color": "#64748b"}),
+            html.Span(f"▸ {mng}", style={"color": mclr, "fontWeight": "700",
+                                         "background": "#2a0a0a" if mng.startswith("CLOSE") else "transparent",
+                                         "padding": "0 4px", "borderRadius": "3px"}),
+        ], style={**MONO, "fontSize": "0.62rem", "paddingLeft": "120px", "lineHeight": "1.5"})
     # forward prediction over the selected horizon + (replay) grade
     pdir = r.get("pred_dir", "RANGE")
     pclr = {"UP": "#34d399", "DOWN": "#f87171"}.get(pdir, "#fbbf24")
@@ -3216,7 +3238,8 @@ def _scout_row(r):
     why = html.Div(" · ".join(r["reasons"][:3]),
                    style={**MONO, "fontSize": "0.56rem", "color": "#64748b",
                           "paddingLeft": "120px", "lineHeight": "1.3"})
-    return html.Div([head, pred, why],
+    kids = [head] + ([trade_blk] if trade_blk else []) + [pred, why]
+    return html.Div(kids,
                     style={"background": bg, "border": f"1px solid {clr if trade else '#1e293b'}",
                            "borderRadius": "5px", "padding": "5px 10px", "marginBottom": "4px"})
 
