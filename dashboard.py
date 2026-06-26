@@ -4006,6 +4006,29 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly"
     fig.update_yaxes(range=[0, _maxv * 4.5], row=1, col=1, secondary_y=True,
                      showticklabels=False, showgrid=False)
     fig.update_yaxes(tickformat=",.0f", row=1, col=1, secondary_y=False)   # 24,100 not 24k
+    # OI walls as auto-drawn S/R lines on the price panel: resistance = max-call-OI
+    # strike, support = max-put-OI strike, + max pain. STRUCTURE, not a signal — the
+    # break did NOT predict continuation on captured days (backtest_sr_break.py); read
+    # them as where dealer size sits, draw your own lines with the modebar to mark levels.
+    try:
+        _oiw = read_mirror("oi_snapshots", date, _parse_asof(asof_value), sym)
+        if _oiw is not None and len(_oiw) and "call_wall" in _oiw.columns:
+            _lw = _oiw.sort_values("ts").iloc[-1]
+            for _lvl, _clr, _lab in (
+                    (_lw.get("call_wall"), "#f87171", "R · call wall"),
+                    (_lw.get("put_wall"),  "#4ade80", "S · put wall"),
+                    (_lw.get("max_pain"),  "#a78bfa", "max pain")):
+                try:
+                    _lvl = float(_lvl)
+                except (TypeError, ValueError):
+                    continue
+                if _lvl > 0:
+                    fig.add_hline(y=_lvl, row=1, col=1, secondary_y=False,
+                                  line=dict(color=_clr, width=1, dash="dot"),
+                                  annotation_text=_lab, annotation_position="top left",
+                                  annotation_font=dict(size=8, color=_clr))
+    except Exception:
+        pass
     # 2 — OI CE vs PE.
     fig.add_trace(go.Scatter(x=ts, y=d["oi_ce"], mode="lines", name="CE OI (ceiling)",
                              line=dict(color="#ef4444", width=1.6)), row=2, col=1)
