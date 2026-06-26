@@ -40,6 +40,7 @@ import tempfile
 from pathlib import Path
 
 from core.constants import PROJECT_ROOT, DATA_DIR, LIVE_DIR, IST
+from core.market_calendar import is_trading_day, holiday_name
 from sync_from_vm import DEF_HOST, DEF_KEY            # reuse VM connection config
 
 REMOTE_ROOT = os.environ.get("TRADEBOT_VM_ROOT", "~/tradebot")
@@ -213,9 +214,17 @@ def main() -> None:
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--no-purge", action="store_true",
                     help="skip deleting already-archived days from the VM (keep VM copies)")
+    ap.add_argument("--force", action="store_true",
+                    help="run even on a non-trading day (NSE holiday / weekend)")
     args = ap.parse_args()
     q = args.quiet
-    today = datetime.datetime.now(tz=IST).date().isoformat()
+    _today = datetime.datetime.now(tz=IST).date()
+    if not args.force and not is_trading_day(_today):
+        why = holiday_name(_today) or "weekend"
+        print(f"eod_sync: {_today} is not an NSE trading day ({why}) — "
+              f"no session to archive. Use --force to run anyway.")
+        return
+    today = _today.isoformat()
 
     if not Path(args.key).exists():
         print(f"SSH key not found: {args.key}", file=sys.stderr)

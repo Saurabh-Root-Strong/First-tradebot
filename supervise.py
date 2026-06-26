@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 from core.constants import IST   # single source of truth
+from core.market_calendar import is_trading_day   # NSE holidays + weekends
 HERE = Path(__file__).parent
 PY   = HERE / ".venv" / "Scripts" / "python.exe"
 PY   = PY if PY.exists() else Path(sys.executable)
@@ -80,7 +81,8 @@ def ensure_token() -> bool:
 
 
 def is_market_hours(now: datetime.datetime) -> bool:
-    return now.weekday() < 5 and MKT_OPEN <= now.time() <= MKT_CLOSE
+    # trading day (weekday AND not an NSE holiday) within session hours
+    return is_trading_day(now.date()) and MKT_OPEN <= now.time() <= MKT_CLOSE
 
 
 def heartbeat_age() -> float:

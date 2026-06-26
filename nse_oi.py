@@ -35,6 +35,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from core.constants import (IST, LIVE_DIR, SYM_BY_NSE as INDEX_MAP,   # noqa: E402
                             today_iso as _today)
+from core.market_calendar import is_trading_day   # noqa: E402
 _SPURTS = "https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings"
 _HOME   = "https://www.nseindia.com"
 _HEADERS = {
@@ -122,7 +123,8 @@ def poll_loop(interval: int = 180, market_hours_only: bool = True) -> None:
     """Background loop — call record() every `interval`s during market hours."""
     while True:
         now = datetime.datetime.now(tz=IST)
-        in_mkt = datetime.time(9, 10) <= now.time() <= datetime.time(15, 35) and now.weekday() < 5
+        in_mkt = (datetime.time(9, 10) <= now.time() <= datetime.time(15, 35)
+                  and is_trading_day(now.date()))
         if (not market_hours_only) or in_mkt:
             try:
                 n = record()
