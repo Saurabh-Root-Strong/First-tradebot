@@ -21,15 +21,16 @@ a past day in the dashboard's Replay mode, then advance the clock to watch it pl
 out. The verdict on whether the call PAYS is backtest_scout.py, which replays THIS
 exact strength+gate across every captured day with a day-block CI.
 
-HONESTY — MEASURED, do not trade the arrow: backtest_scout.py (8 days) found the
-scout's directional call has NO edge — IC(strength, fwd_ret) CIs straddle 0 (5m
-slightly contrarian), gated TRADE raw dir-hit ~50-52% (coin-flip), and after a
-realistic option cost hurdle the cost-aware hit is only ~11-23% (i.e. ~77-89% of
-"TRADE" arrows lose money on the option). The ONLY validated product is the
-hour_forecast RANGE band (~70% close-in-band at 15m). So: the "TRADE CE/PE" verdict
-is a STRUCTURAL LEAN / decision-support label, NOT a tradeable directional signal —
-use the range band + structural levels, never buy a naked option off the arrow until
-backtest_scout clears 50% cost-aware OUT of sample. Standing OI tilt = context only.
+HONESTY — MEASURED, do not trade the arrow: backtest_scout.py (8 days, n=73 trades)
+grades the ACTUAL option you'd buy (ATM CE/PE entry at t, exit at t+H, net 3% round-
+trip). Result: buying the arrow WINS only ~14-23% and BLEEDS −2% to −5% mean net per
+trade — the 5m and 30m loss CIs EXCLUDE zero (a statistically significant LOSER), not
+merely "no edge". IC(strength, fwd_ret) CIs straddle 0 (5m slightly contrarian). The
+ONLY validated product is the hour_forecast RANGE band (~70% close-in-band at 15m).
+So: "TRADE CE/PE" is a STRUCTURAL LEAN / decision-support label, NOT a tradeable
+directional signal — trade the range band + structural levels, never buy a naked
+option off the arrow until backtest_scout shows POSITIVE mean net P&L OUT of sample.
+Standing OI tilt = context only.
 
     .venv\\Scripts\\python.exe intraday_scout.py                 # live scan, 15m
     .venv\\Scripts\\python.exe intraday_scout.py 2026-06-25 11:30 15
@@ -227,12 +228,46 @@ def _spot_at(sym: str, date, t) -> Optional[float]:
     return float(s.iloc[-1]["ltp"])
 
 
+# Round-trip option cost as % of premium (entry half-spread + exit half-spread +
+# brokerage/slippage). Index weekly ATM is liquid but the bid/ask still bites; 3%
+# of premium is a conservative-but-realistic intraday round trip. The P&L "win" is
+# net of this — a directionally-right call that didn't move the option past costs
+# is correctly graded a LOSS (the whole point of the option-P&L audit).
+_OPT_RT_COST = 3.0
+
+
+def _opt_premium(sym: str, date, t, strike, side: str, expiry="weekly") -> Optional[float]:
+    """ATM option LTP for (strike, side) at or before t from the chain mirror.
+    Same expiry filter build_series uses, so entry/exit are the same instrument."""
+    if not strike:
+        return None
+    try:
+        ch = _read_mirror("chain_snapshots", date, t, sym)
+    except Exception:
+        return None
+    if ch is None or not len(ch) or "ltp" not in ch.columns:
+        return None
+    ch, ok = fc._filter_expiry(ch, expiry)
+    if not ok or ch is None or not len(ch):
+        return None
+    sub = ch[(ch["side"] == side) & (ch["strike"] == strike)
+             & (ch["ts"] <= pd.Timestamp(t))]
+    if not len(sub):
+        return None
+    v = sub.sort_values("ts").iloc[-1]["ltp"]
+    return float(v) if pd.notna(v) and float(v) > 0 else None
+
+
 def _verify(sym: str, date, as_of, horizon_min: int, spot0: float,
-            pdir: str, lo, hi) -> Optional[dict]:
+            pdir: str, lo, hi, atm=None) -> Optional[dict]:
     """Grade the forward call against what ACTUALLY happened horizon_min after t.
     Returns None when the future is not available yet (LIVE, or replay too close to
     the close) — so live shows a pending prediction, replay shows a graded one.
-    The future read is the answer key only; it never feeds the prediction."""
+    The future read is the answer key only; it never feeds the prediction.
+
+    Includes OPTION P&L for directional calls: buy the ATM CE/PE at t, exit at t+H,
+    net of round-trip cost. opt_win is the HONEST grade — index ticking your way is
+    not the same as the option making money after spread+theta."""
     if as_of is None or not spot0:
         return None                       # live: t+H hasn't happened
     t_end = as_of + datetime.timedelta(minutes=horizon_min)
@@ -258,8 +293,21 @@ def _verify(sym: str, date, as_of, horizon_min: int, spot0: float,
         dir_hit = actual < spot0
     else:                                 # RANGE call: hit if it stayed in band
         dir_hit = in_band
-    return {"actual": round(actual, 2), "move_pct": round(move, 3),
-            "dir_hit": bool(dir_hit), "band_hit": bool(in_band)}
+    out = {"actual": round(actual, 2), "move_pct": round(move, 3),
+           "dir_hit": bool(dir_hit), "band_hit": bool(in_band)}
+
+    # ── OPTION P&L: the trade you'd actually take, net of cost ────────────────────
+    if pdir in ("UP", "DOWN") and atm:
+        side = "CE" if pdir == "UP" else "PE"
+        entry = _opt_premium(sym, date, as_of, atm, side)
+        exit_ = _opt_premium(sym, date, t_end, atm, side)
+        if entry and exit_:
+            pnl = (exit_ / entry - 1.0) * 100.0
+            net = pnl - _OPT_RT_COST
+            out.update({"opt_side": side, "opt_entry": round(entry, 2),
+                        "opt_exit": round(exit_, 2), "opt_pnl_pct": round(pnl, 1),
+                        "opt_net_pct": round(net, 1), "opt_win": bool(net > 0)})
+    return out
 
 
 def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:
@@ -328,7 +376,7 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     # ── forward prediction over the selected horizon + replay verify ─────────────
     fwd = _forward(direction, spot, fcst.get("exp_move_pct"), horizon_min)
     verify = _verify(sym, date, as_of, horizon_min, spot,
-                     fwd["pdir"], fwd["pred_lo"], fwd["pred_hi"])
+                     fwd["pdir"], fwd["pred_lo"], fwd["pred_hi"], atm=atm)
     return {
         "sym": sym, "label": label, "has_data": True,
         "tf": tf_min, "horizon": horizon_min, "spot": spot, "atm": atm,
@@ -397,6 +445,10 @@ if __name__ == "__main__":
             mark = "HIT ✓" if v["dir_hit"] else "MISS ✗"
             pl += (f"   => actual {v['actual']} ({v['move_pct']:+.2f}%) "
                    f"{mark}  band {'✓' if v['band_hit'] else '✗'}")
+            if "opt_net_pct" in v:
+                owin = "WIN" if v["opt_win"] else "LOSS"
+                pl += (f"  | opt {v['opt_side']} {v['opt_entry']}→{v['opt_exit']} "
+                       f"net {v['opt_net_pct']:+.0f}% {owin}")
         else:
             pl += "   => (pending — future not reached)"
         print(pl)

@@ -3230,13 +3230,13 @@ def _charts_scout_panel(tf_min, date, as_of_dt):
         sb,
     ], style={"marginBottom": "5px"})
     note = html.Div([
-        html.Span("⚠ MEASURED (backtest_scout, 8d): the CE/PE arrow has NO edge — "
-                  "raw dir-hit ~50-52% (coin-flip), cost-aware hit only ~11-23% "
-                  "(≈77-89% of arrows lose on the option after spread+theta). ",
+        html.Span("⛔ MEASURED OPTION P&L (backtest_scout, 8d, n=73): buying the ATM "
+                  "CE/PE on the arrow WINS only ~14-23% and BLEEDS −2% to −5% per "
+                  "trade (5m/30m loss CIs exclude 0 = significant loser). ",
                   style={"color": "#f87171", "fontWeight": "700"}),
-        html.Span("Do NOT buy a naked option off the arrow. The RANGE band (~70% "
-                  "in-band) is the only validated product — trade the band/levels, "
-                  "treat the arrow as a structural lean only.",
+        html.Span("Do NOT buy a naked option off the arrow — it is negative-"
+                  "expectancy. The RANGE band (~70% in-band) is the ONLY validated "
+                  "product; trade the band/levels, treat the arrow as context only.",
                   style={"color": "#94a3b8"}),
     ], style={"fontSize": "0.54rem", "marginTop": "5px", "lineHeight": "1.35",
               "background": "#1a0c0c", "border": "1px solid #7f1d1d",

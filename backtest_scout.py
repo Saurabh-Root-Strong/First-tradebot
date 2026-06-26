@@ -53,6 +53,7 @@ HORIZONS = (5, 15, 30, 60)
 # Index weekly ATM round-trip ~ spread + a few minutes theta. Conservative single
 # number in index-% terms; the call must move the index at least this far its way.
 COST_BPS = 6.0                                  # 0.06% of index
+COST_OPT = scout._OPT_RT_COST                   # option round-trip % (single source)
 LEDGER = DATA_DIR / "validation" / "scout_ledger.parquet"
 
 
@@ -89,13 +90,15 @@ def harvest(days: list[str], tf: int) -> pd.DataFrame:
                 if not r.get("has_data") or not r.get("spot"):
                     continue
                 spot_t = r["spot"]
+                is_trade = int(r["verdict"].startswith("TRADE"))
+                atm, dir_ = r.get("atm"), r.get("direction")
                 rec = {
                     "date": date, "sym": sym, "t": hhmm, "spot": spot_t,
                     "strength": r["strength"], "verdict": r["verdict"],
-                    "direction": r["direction"], "pred_dir": r["pred_dir"],
-                    "agree": r["agree"],
+                    "direction": dir_, "pred_dir": r["pred_dir"],
+                    "agree": r["agree"], "atm": atm,
                     "pred_lo": r.get("pred_lo"), "pred_hi": r.get("pred_hi"),
-                    "is_trade": int(r["verdict"].startswith("TRADE")),
+                    "is_trade": is_trade,
                 }
                 # range coverage at the scaled (horizon=tf) band
                 s_h = _spot_at(ticks, t + datetime.timedelta(minutes=tf))
@@ -107,6 +110,16 @@ def harvest(days: list[str], tf: int) -> pd.DataFrame:
                     s_end = _spot_at(ticks, t + datetime.timedelta(minutes=H))
                     rec[f"ret{H}"] = ((s_end / spot_t - 1.0) * 100.0
                                       if (s_end and s_end != spot_t) else np.nan)
+                # OPTION P&L: buy the ATM CE/PE at t, exit at t+H, net of cost — the
+                # honest grade (the actual trade, not the index tick).
+                if is_trade and atm and dir_ in ("CE", "PE"):
+                    entry = scout._opt_premium(sym, date, t, atm, dir_)
+                    rec["opt_entry"] = entry
+                    for H in HORIZONS:
+                        x = scout._opt_premium(sym, date,
+                                               t + datetime.timedelta(minutes=H), atm, dir_)
+                        rec[f"opt_net{H}"] = (((x / entry - 1.0) * 100.0 - scout._OPT_RT_COST)
+                                              if (entry and x) else np.nan)
                 rows.append(rec)
     return pd.DataFrame(rows)
 
@@ -163,6 +176,28 @@ def evaluate(df: pd.DataFrame, reps: int, rng, tf: int) -> None:
         rv = "EDGE" if l1 > 0.5 else ("anti" if h1 < 0.5 else "—")
         print(f"     {H:>2}m  raw {100*hr:4.1f}% [{100*l1:4.1f},{100*h1:4.1f}] {rv}"
               f"   cost-aware {100*nr:4.1f}% [{100*l2:4.1f},{100*h2:4.1f}]  (n={len(sub)})")
+
+    # 3b) OPTION P&L — the honest grade: actual ATM CE/PE bought at t, net of cost
+    print("\n  3b) OPTION P&L (buy ATM CE/PE, exit at +H, net %.0f%% round-trip)"
+          % COST_OPT)
+    if "opt_net15" in df.columns:
+        for H in HORIZONS:
+            col = f"opt_net{H}"
+            sub = df[(df.is_trade == 1)].dropna(subset=[col]) if col in df.columns else df.iloc[0:0]
+            if len(sub) < 5 or sub.date.nunique() < 2:
+                print(f"     {H:>2}m  n={len(sub)} too few"); continue
+            net = sub[col].to_numpy(float)
+            win = (net > 0).astype(float)
+            wr, lw, hw = _boot_ci(lambda a: a.mean(), win, reps=reps, rng=rng,
+                                  groups=sub["date"].to_numpy())
+            mn, lm, hm = _boot_ci(lambda a: a.mean(), net, reps=reps, rng=rng,
+                                  groups=sub["date"].to_numpy())
+            wv = "EDGE" if lw > 0.5 else ("anti" if hw < 0.5 else "—")
+            ev = "EDGE" if lm > 0 else ("bleed" if hm < 0 else "—")
+            print(f"     {H:>2}m  win {100*wr:4.1f}% [{100*lw:4.1f},{100*hw:4.1f}] {wv}"
+                  f"   mean net {mn:+5.1f}% [{lm:+5.1f},{hm:+5.1f}] {ev}  (n={len(sub)})")
+    else:
+        print("     no option premiums captured on these days")
 
     # 4) RANGE band coverage at the scaled horizon
     cib = df.dropna(subset=["close_in_band"])
