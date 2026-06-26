@@ -40,5 +40,11 @@ def read_mirror(tbl: str, date: str | None = None,
     # bins -> hang/OOM. No legitimate NSE intraday row predates 2000.
     df = df[df["ts"] >= pd.Timestamp("2000-01-01", tz=IST)]
     if as_of is not None:
-        df = df[df["ts"] <= pd.Timestamp(as_of)]
+        # Defensive: a tz-naive as_of would raise "Cannot compare tz-naive and
+        # tz-aware" against the IST ts. Localise naive inputs to IST (callers should
+        # pass tz-aware, but one naive caller shouldn't crash the whole read).
+        ts_cut = pd.Timestamp(as_of)
+        if ts_cut.tzinfo is None:
+            ts_cut = ts_cut.tz_localize(IST)
+        df = df[df["ts"] <= ts_cut]
     return df.sort_values("ts").reset_index(drop=True) if len(df) else None

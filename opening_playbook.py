@@ -431,7 +431,12 @@ def playbook_index(sym: str, as_of: Optional[datetime.datetime] = None,
     oi    = _oi_premium_read(sym, as_of, date)
     chain = _chain_read(sym, as_of, date)
     fut   = _futures_read(sym, as_of, date)
-    eod   = _eod_read(sym)
+    # LEAKAGE GUARD: _eod_read hits the LIVE Daily-Cash-Market bridge (current EOD).
+    # That is legitimate for a live call (yesterday's close, known at open) but on a
+    # PAST-day replay (date set) the bridge returns a FUTURE day's EOD -> lookahead.
+    # Skip it in replay; the composite's "eod" part is then 0 and gap falls back to
+    # the exact tick-derived prev_close (ltp-ch), which is already leak-free.
+    eod   = _eod_read(sym) if date is None else {}
     if not orr or not oi:
         out["note"] = "insufficient capture (need ~20 min of candles + OI snapshots)"
         return out
