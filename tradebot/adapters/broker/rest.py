@@ -90,12 +90,28 @@ _fut_cache: dict = {}
 
 
 def futures_symbols(index_sym: str) -> list[dict]:
-    """Build near/next/far futures symbols for the given index."""
+    """Build near/next/far futures symbols for the given index, anchored to the REAL
+    NSE expiry calendar (last Tuesday, holiday-adjusted — core.market_calendar,
+    validated vs fno_bhavcopy). This rolls 'near' to the next month the moment the
+    current month's expiry passes; the old 'current calendar month = near' logic
+    referenced an EXPIRED contract for the days between a mid-month expiry and
+    month-end. Falls back to the calendar-month construction if the expiry calendar
+    is unavailable."""
     ul = _FUT_UNDERLYING.get(index_sym, "")
     if not ul:
         return []
-    now = datetime.datetime.now(tz=IST)
     out = []
+    try:
+        from core.market_calendar import index_future_expiries
+        for i, exp in enumerate(index_future_expiries(n=3)):
+            sym = f"NSE:{ul}{str(exp.year)[2:]}{_MONTH_ABB[exp.month]}FUT"
+            out.append({"symbol": sym, "label": _FUT_LABELS[i],
+                        "month": f"{_MONTH_ABB[exp.month]} {exp.year}",
+                        "expiry": exp.isoformat()})
+        return out
+    except Exception:
+        pass
+    now = datetime.datetime.now(tz=IST)
     for i in range(3):
         mo = (now.month - 1 + i) % 12 + 1
         yr = now.year + (now.month - 1 + i) // 12

@@ -79,3 +79,43 @@ def next_trading_day(d=None) -> datetime.date:
     while not is_trading_day(d):
         d += datetime.timedelta(days=1)
     return d
+
+
+# ── Index F&O expiry calendar ────────────────────────────────────────────────────
+# NSE index monthly expiry = the LAST TUESDAY of the month, rolled BACK to the prior
+# trading day if that Tuesday is a holiday. VALIDATED against Daily_Cash_Market
+# fno_bhavcopy FUTIDX expiry_dates for 2026 — matches all of Jan27, Feb24, Mar30(Mon,
+# holiday-roll off Mar31 Mahavir Jayanti), Apr28, May26, Jun30, Jul28, Aug25. All four
+# indices (NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY) share these monthly futures expiries.
+# (NIFTY also has WEEKLY options every Tuesday; the others are monthly-only — but that
+# is an options concern, handled by intraday_scout._expiry_kind.)
+import calendar as _calendar
+
+
+def monthly_expiry(year: int, month: int) -> datetime.date:
+    """NSE index monthly (futures) expiry for the given month — last Tuesday,
+    holiday-adjusted backward. Authoritative rule (see module note)."""
+    weeks = _calendar.monthcalendar(year, month)
+    tues = [w[_calendar.TUESDAY] for w in weeks if w[_calendar.TUESDAY]]
+    d = datetime.date(year, month, tues[-1])
+    while not is_trading_day(d):
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+def index_future_expiries(today=None, n: int = 3) -> "list[datetime.date]":
+    """The next `n` index-futures monthly expiry dates with expiry >= today
+    (holiday-adjusted). out[0]=near, out[1]=next, out[2]=far. Rolls correctly the
+    moment a month's expiry passes (near becomes next month), fixing the naive
+    'current calendar month = near' bug."""
+    today = _as_date(today) if today is not None else datetime.date.today()
+    out: list[datetime.date] = []
+    y, m = today.year, today.month
+    while len(out) < n:
+        e = monthly_expiry(y, m)
+        if e >= today:
+            out.append(e)
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+    return out
