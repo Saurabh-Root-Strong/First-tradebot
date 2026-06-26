@@ -9,10 +9,13 @@ look at the board: "is there a clean setup on any index, and on which one?"
 Per index it reads the captured chart data at instant t and looks for the
 structural events you watch for on the charts — CE/PE OI crossover, price-vs-OI
 divergence, the delta-adjusted buy/write/cover flow, futures-basis lean — fuses
-them into a signed strength, and gates HARD: a trade is emitted only when enough
-independent signals AGREE. Otherwise the index is NO-TRADE (positioning context
-only). That is what makes "no trade on NIFTY / MIDCAP, trade on BANKNIFTY" fall
-out naturally instead of forcing a call on every index every cycle.
+them into a signed strength, and gates HARD on INDEPENDENT corroboration: a trade is
+emitted only when the anchor (delta-adjusted flow) agrees AND at least one INDEPENDENT
+family (OI-tilt crossover, or futures) agrees too. div (price×ΔOI) shares the ΔOI
+term with flow, so it feeds strength but is NOT counted as independent agreement — no
+trade off two correlated options-OI signals. Otherwise NO-TRADE (positioning context
+only). That is what makes "no trade on NIFTY / MIDCAP, trade on BANKNIFTY" fall out
+naturally instead of forcing a call on every index every cycle.
 
 PARITY BY CONSTRUCTION: it consumes build_series(..., as_of=t), which reads the
 lock-free mirrors with ts<=t. So the SAME function runs live (t=now) and under
@@ -79,7 +82,8 @@ _W = {"flow": 0.40, "div": 0.25, "cross": 0.15, "fut": 0.20}
 _RECENT = 3                 # bars treated as "recent" for flow / divergence
 _TILT_DB = 0.05            # |g| below this = balanced book, no tilt call
 _TRADE_TH = 0.22           # min |strength| to consider a trade
-_MIN_AGREE = 3             # min independent signals agreeing with the sign to TRADE
+# gate (see scan_index): anchor flow must agree + >=1 INDEPENDENT family (cross/fut);
+# div is the same family as flow so it never counts as independent corroboration.
 
 
 def _last(seq, n: int = 1):
@@ -448,9 +452,22 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     tilt = _tilt_signal(ser)                                     # DISPLAY-only context
     strength = sum(_W[k] * parts[k][0] for k in _W)              # signed [-1,1]
     sgn = 1 if strength > 0 else -1 if strength < 0 else 0
-    # agreement = scored signals sharing the strength's sign
-    agree = sum(1 for k in _W if parts[k][0] != 0 and (parts[k][0] > 0) == (sgn > 0))
-    active = sum(1 for k in _W if parts[k][0] != 0)
+
+    # ── HONEST agreement over INDEPENDENT signal families ────────────────────────
+    # flow and div share the per-leg ΔOI term (div = price × ΔOI, flow = residual
+    # demand on the same ΔOI), so div is NOT an independent corroborator of flow —
+    # counting both inflates "agree". Families: OI-flow {flow(anchor)+div}, OI-tilt
+    # {cross}, futures {fut}. The agreement count = anchor flow + the INDEPENDENT
+    # families (cross, fut) that share the sign. div still feeds `strength` (weighted)
+    # as confirmation, but cannot manufacture a passing count.
+    def _agrees(k):
+        return parts[k][0] != 0 and (parts[k][0] > 0) == (sgn > 0)
+    flow_ok = _agrees("flow")
+    indep = [k for k in ("cross", "fut") if _agrees(k)]          # independent families
+    div_confirms = _agrees("div")
+    agree = (1 if flow_ok else 0) + len(indep)                   # honest, max 3
+    active = ((1 if parts["flow"][0] != 0 else 0)
+              + sum(1 for k in ("cross", "fut") if parts[k][0] != 0))
 
     spot = (_last(ser.get("spot") or [], 1) or [None])[-1]
     try:
@@ -459,8 +476,10 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         fcst = {}
     atm = _atm(spot, sym)
 
-    # ── verdict gate: TRADE only on enough agreeing structure ────────────────────
-    if abs(strength) >= _TRADE_TH and agree >= _MIN_AGREE and sgn != 0:
+    # ── verdict gate: anchor flow MUST agree + ≥1 INDEPENDENT family corroborates ─
+    # (div can't be the corroborator — same family as flow). No naked-strength trade
+    # off two correlated options-OI signals.
+    if (abs(strength) >= _TRADE_TH and sgn != 0 and flow_ok and len(indep) >= 1):
         direction = "CE" if sgn > 0 else "PE"
         verdict = f"TRADE {direction}"
     else:
@@ -468,7 +487,14 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         verdict = "NO-TRADE"
     conf = int(round(min(abs(strength) / 0.6, 1.0) * 100))
 
-    reasons = [parts[k][1] for k in ("flow", "div", "cross", "fut") if parts[k][1]]
+    reasons = []
+    for k in ("flow", "div", "cross", "fut"):
+        if not parts[k][1]:
+            continue
+        txt = parts[k][1]
+        if k == "div" and parts["div"][0] != 0:      # mark div as confirm vs diverge
+            txt += " — confirms flow" if div_confirms else " — DIVERGES from flow"
+        reasons.append(txt)
     if tilt[1]:
         reasons.append(tilt[1])
 
