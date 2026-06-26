@@ -3229,10 +3229,18 @@ def _charts_scout_panel(tf_min, date, as_of_dt):
                   style={"color": "#94a3b8", "fontSize": "0.62rem"}),
         sb,
     ], style={"marginBottom": "5px"})
-    note = html.Div("Direction is decision-support (null/contrarian in backtests); the "
-                    "range band is the trustworthy product. Validate via backtest_suggestion.py.",
-                    style={"color": "#475569", "fontSize": "0.52rem", "marginTop": "4px",
-                           "fontStyle": "italic", "lineHeight": "1.3"})
+    note = html.Div([
+        html.Span("⚠ MEASURED (backtest_scout, 8d): the CE/PE arrow has NO edge — "
+                  "raw dir-hit ~50-52% (coin-flip), cost-aware hit only ~11-23% "
+                  "(≈77-89% of arrows lose on the option after spread+theta). ",
+                  style={"color": "#f87171", "fontWeight": "700"}),
+        html.Span("Do NOT buy a naked option off the arrow. The RANGE band (~70% "
+                  "in-band) is the only validated product — trade the band/levels, "
+                  "treat the arrow as a structural lean only.",
+                  style={"color": "#94a3b8"}),
+    ], style={"fontSize": "0.54rem", "marginTop": "5px", "lineHeight": "1.35",
+              "background": "#1a0c0c", "border": "1px solid #7f1d1d",
+              "borderRadius": "4px", "padding": "5px 8px"})
     return html.Div([title] + [_scout_row(r) for r in rows] + [note],
                     style={"background": "#070d18", "border": "1px solid #1e293b",
                            "borderRadius": "6px", "padding": "8px 12px"})

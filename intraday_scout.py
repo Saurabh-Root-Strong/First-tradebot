@@ -18,16 +18,18 @@ PARITY BY CONSTRUCTION: it consumes build_series(..., as_of=t), which reads the
 lock-free mirrors with ts<=t. So the SAME function runs live (t=now) and under
 the replay clock (t=scrubbed past instant) with no lookahead. Predict at 11:30 on
 a past day in the dashboard's Replay mode, then advance the clock to watch it play
-out; the offline scoreboard (does the call actually pay?) is backtest_suggestion.py
-/ backtest_crossover.py, which replay this exact structural read across every
-captured day with a day-block CI.
+out. The verdict on whether the call PAYS is backtest_scout.py, which replays THIS
+exact strength+gate across every captured day with a day-block CI.
 
-HONESTY: index DIRECTION has been null/contrarian in every test in this repo
-(see backtest_crossover, hour_forecast, the verdict-outcomes work). So the scout
-is decision-support, the standing OI tilt is weighted as CONTEXT not a call, and
-the hour_forecast RANGE band (the trustworthy product) rides alongside every row.
-Treat a TRADE row as "this is the cleanest structure on the board right now,"
-not a guarantee — the replay scoreboard is the arbiter.
+HONESTY — MEASURED, do not trade the arrow: backtest_scout.py (8 days) found the
+scout's directional call has NO edge — IC(strength, fwd_ret) CIs straddle 0 (5m
+slightly contrarian), gated TRADE raw dir-hit ~50-52% (coin-flip), and after a
+realistic option cost hurdle the cost-aware hit is only ~11-23% (i.e. ~77-89% of
+"TRADE" arrows lose money on the option). The ONLY validated product is the
+hour_forecast RANGE band (~70% close-in-band at 15m). So: the "TRADE CE/PE" verdict
+is a STRUCTURAL LEAN / decision-support label, NOT a tradeable directional signal —
+use the range band + structural levels, never buy a naked option off the arrow until
+backtest_scout clears 50% cost-aware OUT of sample. Standing OI tilt = context only.
 
     .venv\\Scripts\\python.exe intraday_scout.py                 # live scan, 15m
     .venv\\Scripts\\python.exe intraday_scout.py 2026-06-25 11:30 15
