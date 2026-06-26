@@ -47,10 +47,16 @@ import pandas as pd
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from core.constants import INDEX_SYMBOLS, STRIKE_STEP, LABELS, IST, NIFTY
+from core.constants import INDEX_SYMBOLS, STRIKE_STEP, LABELS, IST, NIFTY, FINNIFTY
 from core.mirror_io import read_mirror as _read_mirror
 import footprint_chart as fc
 import hour_forecast as hf
+
+# Structurally THIN F&O index — sparse OI (audit: ~50% strikes no OI), tiny futures
+# OI (~29k vs NIFTY ~7.4M), stale LTPs on illiquid strikes. Every signal + the
+# option-premium reads are LESS RELIABLE here; flagged so it is never read with the
+# same trust as NIFTY/BANK.
+_THIN = {FINNIFTY}
 
 # NSE killed weekly expiries for BANKNIFTY/FINNIFTY/MIDCAP — only NIFTY has a weekly;
 # the others are MONTHLY only. The capture stores one (nearest tradeable) expiry per
@@ -475,7 +481,7 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     return {
         "sym": sym, "label": label, "has_data": True,
         "tf": tf_min, "horizon": horizon_min, "spot": spot, "atm": atm,
-        "expiry": _expiry_kind(sym),
+        "expiry": _expiry_kind(sym), "thin": sym in _THIN,
         "strength": round(strength, 3), "agree": agree, "active": active,
         "verdict": verdict, "direction": direction, "confidence": conf,
         "instrument": (f"{atm} {direction}" if direction and atm else ""),

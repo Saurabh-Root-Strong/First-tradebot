@@ -1429,8 +1429,13 @@ app.layout = dbc.Container([
                         id="charts-leg-col", md=2, style={"display": "none"}),
                     dbc.Col(dcc.Dropdown(
                         id="charts-expiry", clearable=False,
-                        options=[{"label": "Weekly expiry", "value": "weekly"},
-                                 {"label": "Monthly expiry", "value": "monthly"}],
+                        # Capture stores ONLY the nearest tradeable expiry per index
+                        # (NIFTY weekly · others monthly — NSE killed non-NIFTY
+                        # weeklies). "Monthly" was a phantom that blanked the chart, so
+                        # there is one honest option; value stays "weekly" = the
+                        # legacy/nearest bucket build_series serves.
+                        options=[{"label": "Nearest expiry (NIFTY wk · others monthly)",
+                                  "value": "weekly"}],
                         value="weekly", style={"fontSize": "0.72rem"}),
                         # only shown in Options mode (toggled by _toggle_mode_cols)
                         id="charts-expiry-col", md=2),
@@ -3187,6 +3192,8 @@ def _scout_row(r):
     inst = (f" · {r['instrument']}" if r.get("instrument") else "")
     if trade and r.get("expiry"):
         inst += f" ({r['expiry']})"
+    if r.get("thin"):
+        inst += "  ⚠ thin"
     head = html.Div([
         html.Span(r["label"], style={"fontWeight": "700", "minWidth": "120px",
                                      "display": "inline-block", "color": "#e2e8f0"}),
