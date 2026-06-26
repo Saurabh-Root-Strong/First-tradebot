@@ -1203,20 +1203,6 @@ def _captured_days() -> list:
 _DEFAULT_DAY = _captured_days()[0]
 
 
-def _asof_options():
-    """Replay time checkpoints (15-min) — truncate every chart at the chosen time so
-    you can analyse 'data till HH:MM' and test what the market did next. Leakage-safe:
-    the as_of cutoff is enforced at the data read (read_mirror)."""
-    opts = [{"label": "Full session (live)", "value": "full"}]
-    for m in range(9 * 60 + 30, 15 * 60 + 31, 15):     # 09:30 … 15:30
-        hm = f"{m // 60:02d}:{m % 60:02d}"
-        opts.append({"label": f"⏱ till {hm}", "value": hm})
-    return opts
-
-
-_ASOF_OPTS = _asof_options()
-
-
 app.layout = dbc.Container([
     # ── Header (brand + status, then a horizontal index/nav strip) ──────────────
     html.Div([
@@ -1237,6 +1223,9 @@ app.layout = dbc.Container([
             dbc.Col(html.Div(id="status", style={
                 "textAlign": "right", "fontSize": "0.68rem"}), width="auto"),
         ], className="align-items-center g-0"),
+        # NSE holiday / weekend banner — set by callback from the viewed date so the
+        # "warming up / no ticks" panels on a closed day read as intended, not broken.
+        html.Div(id="holiday-banner"),
         # Horizontal index chips (clickable nav). Today's Trades now lives in the left pane.
         html.Div([
             *[_header_nav_card(sym) for sym in INDEX_SYMBOLS],
@@ -1281,22 +1270,9 @@ app.layout = dbc.Container([
                     value="NSE:NIFTY50-INDEX",
                     style={"fontSize": "0.62rem", "marginTop": "5px", "color": "#0b1320"}),
             ], style={"marginBottom": "6px"}),
-            # Footprint matrix + the SELECTED index's open/today trades (one cockpit).
+            # Footprint matrix for the SELECTED index (own-charts workflow; the
+            # ALL-TRADES / smart-money footer was removed — charts replaced it).
             dcc.Loading(html.Div(id="itf-content"), type="circle", color="#67e8f9"),
-            # Footer: all-indices day summary + open the full Trade Book.
-            html.Div(id="nav-tradebook", n_clicks=0, children=[
-                html.Div("📒 ALL TRADES — TODAY", style={
-                    "letterSpacing": "0.1em", "color": "#cbd5e1", "fontWeight": "700",
-                    "fontSize": "0.58rem", "marginBottom": "4px"}),
-                # All-index smart-money footprint (OI×vol×premium) sits in the head,
-                # so the trade book opens on who's really positioning across all 4.
-                html.Div(id="sm-footprint"),
-                html.Div(id="sidebar-trades"),
-                html.Div("open full book ▸", style={
-                    "color": "#475569", "fontSize": "0.5rem", "marginTop": "4px"}),
-            ], style={"marginTop": "12px", "padding": "10px 12px", "borderRadius": "8px",
-                      "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #fbbf24",
-                      "background": BG_CARD, "cursor": "pointer"}),
         ], md=3, lg=3, style={
             "background": BG_SIDE, "padding": "14px 10px",
             "borderRight": "1px solid #111d2e", "minHeight": "calc(100vh - 120px)"}),
@@ -1474,10 +1450,22 @@ app.layout = dbc.Container([
                                  {"label": "15 min", "value": 15},
                                  {"label": "60 min", "value": 60}],
                         value=15, style={"fontSize": "0.72rem"}), md=2),
-                    dbc.Col(dcc.Dropdown(
-                        id="charts-asof", clearable=False,
-                        options=_ASOF_OPTS, value="full",
-                        style={"fontSize": "0.72rem"}), md=2),
+                    # Replay: pick ANY cutoff minute (truncate every chart at that
+                    # time to study what the market did next). Empty = full/live
+                    # session — the as_of cutoff is leakage-safe (enforced at the
+                    # data read). Native time input → arbitrary HH:MM, not fixed
+                    # 15-min checkpoints. Clear the field (× / backspace) for live.
+                    dbc.Col(dbc.InputGroup([
+                        dbc.InputGroupText("⏱ Replay", style={
+                            "fontSize": "0.62rem", "fontWeight": "700",
+                            "color": "#a78bfa", "background": "#1e293b",
+                            "border": "1px solid #334155"}),
+                        dbc.Input(
+                            id="charts-asof", type="time",
+                            value="", min="09:15", max="15:30", step=60,
+                            placeholder="live",
+                            style={"fontSize": "0.72rem"}),
+                    ], size="sm"), md=3),
                 ], className="mb-2 align-items-center"),
                 # Mode-aware help in a POPUP — opens over the chart, closes via the X /
                 # click-outside, so it never covers or pushes the chart down.
@@ -1493,6 +1481,11 @@ app.layout = dbc.Container([
                 dcc.Loading(dcc.Graph(id="charts-graph",
                             config={"displayModeBar": False}),
                             type="circle", color="#a78bfa"),
+                # Descriptive positioning map (Options mode only): where today's
+                # live OI is REINFORCING vs ABANDONING last night's EOD positions,
+                # per strike, anchored to the DCM EOD baseline. CONTEXT, not a call
+                # — the directional edge is unproven (backtest_reconciliation null).
+                html.Div(id="charts-recon", style={"marginTop": "8px"}),
             ]),
         ], md=9, lg=9, style={"padding": "12px 16px"}),
     ], className="gx-0"),
@@ -2930,20 +2923,17 @@ def _render_trade_rec(rec: dict, sym: str) -> html.Div:
     Output("sel-sym",    "data"),
     Output("sel-expiry", "data"),
     [Input(f"nav-{_slug(s)}", "n_clicks") for s in INDEX_SYMBOLS],
-    Input("nav-tradebook", "n_clicks"),
     Input("nav-liveoi",    "n_clicks"),
     Input("nav-charts",    "n_clicks"),
     State("sel-sym", "data"),
     prevent_initial_call=True,
 )
 def on_nav_click(*args):
-    *_, _tradebook_clicks, _liveoi_clicks, _charts_clicks, current = args
+    *_, _liveoi_clicks, _charts_clicks, current = args
     from dash import callback_context as ctx
     if not ctx.triggered:
         return current, ""
     tid = ctx.triggered[0]["prop_id"].split(".")[0]
-    if tid == "nav-tradebook":
-        return (None, "") if current == "TRADES" else ("TRADES", "")
     if tid == "nav-liveoi":
         return (None, "") if current == "LIVEOI" else ("LIVEOI", "")
     if tid == "nav-charts":
@@ -3048,6 +3038,174 @@ def _update_charts(mode, leg, strike, expiry, sym, tf, asof, date, sel):
         except (ValueError, TypeError):
             pass
     return _footprint_fig(sym, tf, asof_value=asof_iso, date=date, expiry=expiry)
+
+
+# ── Charts: overnight → now per-strike positioning map (DESCRIPTIVE) ───────────
+# Anchors today's live per-strike OI change (oich = Δ vs prev EOD close) against
+# last night's EOD per-strike OI baseline from DCM fno_bhavcopy, and labels each
+# positioned strike REINFORCED (held) vs ABANDONED (covering/unwind). This is the
+# view the user asked for. It is CONTEXT, never a buy/sell call — the directional
+# edge is unproven (backtest_reconciliation.py CIs all straddle the null on the
+# captured days). Reads the lock-free parquet mirrors at the chosen as_of, so it
+# is leakage-safe and works for both live and replay.
+_RECON_CLR = {"bull": "#22c55e", "bear": "#ef4444", "neut": "#94a3b8"}
+
+
+def _charts_recon_panel(sym, date, as_of_dt):
+    """Render the overnight→now reconciliation read for `sym` at `as_of_dt`, or a
+    quiet warming-up note. Pure read (mirrors + DCM read-only) — no writes."""
+    from core.mirror_io import read_mirror
+    from core.constants import NSE_NAME
+    import overnight_reconciliation as orc
+
+    date = date or datetime.date.today().isoformat()
+
+    def _num(v):
+        try:
+            return float(v) if pd.notna(v) else 0.0
+        except Exception:
+            return 0.0
+
+    # ── live/replay strike_map: latest oich/ltpch/oi per (strike, side) ≤ as_of ──
+    chain = read_mirror("chain_snapshots", date, as_of_dt, sym)
+    if chain is None or "oich" not in chain.columns:
+        return _recon_note("Positioning map warming up — option-chain capture not in yet.")
+    last = chain.sort_values("ts").groupby(["strike", "side"]).last().reset_index()
+    sm: dict = {}
+    for _, r in last.iterrows():
+        sm.setdefault(float(r["strike"]), {})[r["side"]] = {
+            "oich": _num(r.get("oich")), "ltpch": _num(r.get("ltpch")),
+            "oi": _num(r.get("oi")), "volume": _num(r.get("volume")),
+            "delta": (None if pd.isna(r.get("delta")) else _num(r.get("delta")))
+                     if "delta" in last.columns else None}
+
+    ticks = read_mirror("ticks", date, as_of_dt, sym)
+    if ticks is None or not len(ticks):
+        return _recon_note("Positioning map warming up — no ticks yet.")
+    spot   = _num(ticks["ltp"].iloc[-1])
+    anchor = _num(ticks["day_open"].iloc[-1]) if "day_open" in ticks.columns else _num(ticks["ltp"].iloc[0])
+    # open gap vs prev close (ch = Δ vs prev close) — gates the regime-shift flag
+    prev_close = spot - _num(ticks["ch"].iloc[-1]) if "ch" in ticks.columns else 0.0
+    gap = (anchor / prev_close - 1.0) if (anchor and prev_close) else 0.0
+    # index points move vs prev close — same anchor as per-strike ltpch; drives the
+    # delta-adjusted residual that splits each OI move writer- vs buyer-driven.
+    index_chg = (spot - prev_close) if prev_close else 0.0
+
+    # ── frozen EOD baseline from DCM (strictly before the selected day) ──────────
+    try:
+        import duckdb
+        from eod_oi_range import DCM_DB
+        if not DCM_DB.exists():
+            return _recon_note("EOD baseline unavailable — Daily_Cash_Market DB not found.")
+        prior = datetime.date.fromisoformat(date) - datetime.timedelta(days=1)
+        con = duckdb.connect(str(DCM_DB), read_only=True)
+        try:
+            baseline = orc.eod_baseline(con, NSE_NAME[sym], as_of_date=prior)
+        finally:
+            con.close()
+    except Exception:
+        return _recon_note("EOD baseline read failed.")
+    if not baseline:
+        return _recon_note("No EOD positioning recorded for this index yet.")
+
+    r = orc.analyze_reconciliation(sm, spot, baseline, gap=gap, vwap=anchor,
+                                   index_chg=index_chg)
+    if not r.has_data:
+        return _recon_note(r.note or "No positioned strikes in range / no action yet.")
+
+    lines = orc.summary_lines(r)
+    head_bias, head_txt = lines[0]
+    body = []
+    for bias, txt in lines[1:]:
+        body.append(html.Div(txt, style={
+            **MONO, "fontSize": "0.66rem", "padding": "2px 0",
+            "color": _RECON_CLR.get(bias, "#94a3b8")}))
+    shift = (html.Span("  ⚡ REGIME SHIFT", style={"color": "#fbbf24", "fontWeight": "700"})
+             if r.regime_shift else "")
+    return html.Div([
+        html.Div([
+            html.Span("🧭 OVERNIGHT → NOW POSITIONING", style={
+                "color": "#a78bfa", "fontWeight": "700", "fontSize": "0.62rem",
+                "letterSpacing": "0.06em"}),
+            html.Span("  ·  context, not a signal", style={
+                "color": "#475569", "fontSize": "0.58rem"}),
+            shift,
+        ], style={"marginBottom": "4px"}),
+        html.Div(head_txt, style={
+            **MONO, "fontSize": "0.7rem", "fontWeight": "700", "paddingBottom": "3px",
+            "color": _RECON_CLR.get(head_bias, "#94a3b8")}),
+        html.Div(body),
+        html.Div("EOD-anchored per-strike OI (oich = Δ vs prev close) vs last night's "
+                 "DCM baseline. Reinforced = position held, abandoned = covering/unwind; "
+                 "the covering/writing vs unwind/buying tag is the delta-adjusted "
+                 "premium residual (writer- vs buyer-driven) and weights conviction. "
+                 "Directional edge unproven — read as positioning structure, not a trade call.",
+                 style={"color": "#475569", "fontSize": "0.55rem", "marginTop": "5px",
+                        "fontStyle": "italic", "lineHeight": "1.3"}),
+    ], style={"background": "#0a1020", "border": "1px solid #1e293b",
+              "borderRadius": "6px", "padding": "8px 12px"})
+
+
+def _recon_note(msg):
+    return html.Div(msg, style={**MONO, "fontSize": "0.6rem", "color": "#475569",
+                                "padding": "6px 12px", "fontStyle": "italic"})
+
+
+@app.callback(
+    Output("charts-recon", "children"),
+    Input("charts-mode", "value"),
+    Input("charts-idx",  "value"),
+    Input("charts-asof", "value"),
+    Input("news-date",   "data"),
+    Input("sel-sym",     "data"),
+)
+def _update_charts_recon(mode, sym, asof, date, sel):
+    """Descriptive overnight→now positioning map under the chart (Options mode only)."""
+    from dash.exceptions import PreventUpdate
+    if sel != "CHARTS":
+        raise PreventUpdate
+    if mode == "futures":
+        return ""        # positioning map is an options-chain read
+    sym, date = sym or "NSE:NIFTY50-INDEX", date or None
+    as_of_dt = None
+    if asof and asof != "full" and date:
+        try:
+            as_of_dt = datetime.datetime.fromisoformat(f"{date}T{asof}:00+05:30")
+        except Exception:
+            as_of_dt = None
+    try:
+        return _charts_recon_panel(sym, date, as_of_dt)
+    except Exception as exc:
+        return _recon_note(f"Positioning map unavailable ({type(exc).__name__}).")
+
+
+@app.callback(
+    Output("holiday-banner", "children"),
+    Output("holiday-banner", "style"),
+    Input("news-date", "data"),
+)
+def _update_holiday_banner(date):
+    """Show an NSE-holiday / weekend banner for the VIEWED date, so a closed day's
+    empty panels read as 'market closed' rather than 'broken / warming up'."""
+    from core.market_calendar import holiday_name
+    d = date or datetime.datetime.now(tz=IST).date().isoformat()
+    try:
+        dd = datetime.date.fromisoformat(str(d)[:10])
+    except Exception:
+        return "", {"display": "none"}
+    hn = holiday_name(dd)
+    if hn:
+        msg, clr, bg, bd = (f"🟠  NSE HOLIDAY — {hn} · markets closed · {dd:%d %b %Y}",
+                            "#fbbf24", "#2a1f06", "#854d0e")
+    elif dd.weekday() >= 5:
+        msg, clr, bg, bd = (f"⚪  Weekend — markets closed · {dd:%d %b %Y}",
+                            "#94a3b8", "#0f172a", "#1e293b")
+    else:
+        return "", {"display": "none"}
+    return msg, {"display": "block", "marginTop": "8px", "padding": "5px 12px",
+                 "background": bg, "border": f"1px solid {bd}", "borderRadius": "6px",
+                 "color": clr, "fontSize": "0.66rem", "fontWeight": "700",
+                 "letterSpacing": "0.04em", **MONO}
 
 
 # ── Callback 2: toggle panels + highlight selected nav card ───────────────────
@@ -3538,131 +3696,8 @@ _TRADE_ST_CLR = {"OPEN": "#fbbf24", "T1": "#4ade80", "T2": "#22c55e", "SL": "#f8
                  "EOD": "#94a3b8", "FLIP": "#a78bfa"}
 
 
-def _render_sidebar_trades() -> "html.Div":
-    """Compact stat line shown inside the clickable 'Today's Trades' nav button."""
-    led   = intraday_trades.get_ledger()
-    today = datetime.datetime.now(tz=IST).date().isoformat()
-    s     = led.stats(today)
-    n_open = len(led.open_trades())
-    if not s.get("n") and n_open == 0:
-        return html.Div("no trades yet", style={"color": "#475569", "fontSize": "0.54rem", **MONO})
-    parts = []
-    if s.get("n"):
-        hit = s.get("hit_rate"); avgr = s.get("avg_r")
-        parts.append(html.Span(f"{s['wins']}W/{s['losses']}L ",
-                               style={"color": "#94a3b8", "fontSize": "0.55rem"}))
-        if hit is not None:
-            parts.append(html.Span(f"{hit:.0f}% ",
-                         style={"color": "#4ade80" if hit >= 50 else "#f87171",
-                                "fontWeight": "700", "fontSize": "0.55rem"}))
-        if avgr is not None:
-            parts.append(html.Span(f"{avgr:+.1f}R ",
-                         style={"color": "#94a3b8", "fontSize": "0.55rem"}))
-        net = s.get("net_avg_r")
-        if net is not None:
-            parts.append(html.Span(f"net {net:+.1f}R ", style={
-                "color": "#4ade80" if net >= 0 else "#f87171",
-                "fontSize": "0.55rem", "fontWeight": "700"}))
-    if n_open:
-        parts.append(html.Span(f"· {n_open} open", style={"color": "#fbbf24", "fontSize": "0.55rem"}))
-    return html.Div(parts, style=MONO)
-
-
-_SM_DIR_CLR   = {"BULLISH": "#22c55e", "BEARISH": "#ef4444", "NEUTRAL": "#94a3b8", "THIN": "#475569"}
-_SM_DIR_ARROW = {"BULLISH": "▲", "BEARISH": "▼", "NEUTRAL": "•", "THIN": "·"}
-_SM_DIR_SHORT = {"BULLISH": "BULL", "BEARISH": "BEAR", "NEUTRAL": "NEUT", "THIN": "THIN"}
-
-
-def _render_smart_money_footprint() -> "html.Div":
-    """All-index smart-money footprint (option+futures flow: OI×volume×premium) for
-    the ALL TRADES head. One tight row per index — direction · conviction · net OI
-    build · whether the footprint LEADS price (institutions positioned before the
-    move = the high-value tell). This is the institutional read across all 4 indices,
-    distinct from the per-TF matrix above which is the SELECTED index only."""
-    if not _SM_AVAILABLE:
-        return html.Div()
-    rows = []
-    for s in INDEX_SYMBOLS:
-        lbl = _IDX_ABBR.get(s, LABELS.get(s, s))
-        try:
-            r = smart_money.footprint_index(s)
-        except Exception:
-            r = None
-        if not r or not r.get("has_data"):
-            rows.append(html.Div([
-                html.Span(lbl, style={"color": "#64748b", "fontSize": "0.5rem",
-                          "minWidth": "48px", "display": "inline-block"}),
-                html.Span((r or {}).get("note", "warming up") if r else "warming up",
-                          style={"color": "#334155", "fontSize": "0.48rem"}),
-            ], style={"display": "flex", "alignItems": "center", "padding": "1px 0"}))
-            continue
-        d   = r["direction"]
-        clr = _SM_DIR_CLR.get(d, "#94a3b8")
-        rows.append(html.Div([
-            html.Span(lbl, style={"color": "#94a3b8", "fontSize": "0.5rem",
-                      "minWidth": "48px", "display": "inline-block"}),
-            html.Span(f"{_SM_DIR_ARROW.get(d, '•')}{_SM_DIR_SHORT.get(d, d)}", style={
-                      "color": clr, "fontWeight": "700", "fontSize": "0.5rem",
-                      "minWidth": "42px", "display": "inline-block"}),
-            html.Span(f"{r['conviction']}%", style={"color": clr, "fontSize": "0.5rem",
-                      "minWidth": "30px", "display": "inline-block"}),
-            html.Span(f"{r['build_L']:.1f}L", style={"color": "#475569", "fontSize": "0.46rem"}),
-            html.Span("⚡leads" if r.get("leads") else "", style={"color": "#fbbf24",
-                      "fontSize": "0.46rem", "fontWeight": "700", "marginLeft": "auto"}),
-        ], style={"display": "flex", "alignItems": "center", "padding": "1px 0"}))
-    return html.Div([
-        html.Div("smart-money footprint · OI×vol×premium", style={
-            "color": "#67e8f9", "fontSize": "0.46rem", "letterSpacing": "0.04em",
-            "opacity": 0.85, "marginBottom": "2px"}),
-        *rows,
-    ], style={"marginBottom": "6px", "paddingBottom": "6px",
-              "borderBottom": "1px solid #1e293b", **MONO})
-
-
-def _trade_levels_bar(t) -> "html.Div":
-    """SL → entry → current → T1 → T2 progress bar for a single trade."""
-    sl = t.get("sl"); t1 = t.get("t1"); t2 = t.get("t2")
-    entry = t.get("entry_ltp"); r = t.get("r_multiple")
-    cur = t.get("exit_ltp") if (t.get("status") or "OPEN") != "OPEN" else t.get("last_ltp")
-    if not (sl and t2 and t2 > sl):
-        return html.Div()
-    span = t2 - sl
-    def pct(x):
-        return 0 if x is None else max(2, min(98, (x - sl) / span * 100))
-    cur_clr = "#4ade80" if (r or 0) > 0 else "#f87171" if (r or 0) < 0 else "#fbbf24"
-    return html.Div([
-        html.Div(style={"position": "absolute", "left": f"{pct(entry)}%", "top": "-1px",
-                        "width": "2px", "height": "9px", "background": "#cbd5e1"}),
-        html.Div(style={"position": "absolute", "left": f"{pct(t1)}%", "top": "-1px",
-                        "width": "2px", "height": "9px", "background": "#22c55e"}),
-        html.Div(style={"position": "absolute", "left": f"{pct(cur)}%", "top": "-3px",
-                        "width": "9px", "height": "9px", "borderRadius": "50%",
-                        "background": cur_clr, "transform": "translateX(-4px)",
-                        "boxShadow": f"0 0 5px {cur_clr}"}),
-    ], style={"position": "relative", "height": "6px", "borderRadius": "3px",
-              "background": "linear-gradient(90deg,#7f1d1d 0%,#3f3f46 42%,#14532d 100%)",
-              "margin": "11px 3px 7px 3px"})
-
-
 _REGIME_CLR = {"BULLISH": "#4ade80", "BEARISH": "#f87171", "NEUTRAL": "#94a3b8"}
 _STAGE_CLR  = {"IMMINENT": "#ef4444", "BUILDING": "#f59e0b", "STABLE": "#22c55e"}
-
-
-def _regime_risk_badge(t, fc=None):
-    """Amber/red forward-looking badge when a regime flip is building against this trade."""
-    if not _REGIME_AVAILABLE:
-        return None
-    try:
-        risk = regime_forecast.trade_regime_risk(t, fc)
-    except Exception:
-        risk = None
-    if not risk:
-        return None
-    clr = _STAGE_CLR.get(risk["stage"], "#f59e0b")
-    return html.Div(risk["msg"][:170], style={
-        "color": clr, "fontSize": "0.54rem", "marginTop": "3px", "fontWeight": "700",
-        "lineHeight": "1.35", "whiteSpace": "normal", "background": "#1a1206",
-        "border": f"1px solid {clr}66", "borderRadius": "3px", "padding": "3px 5px"})
 
 
 def _panel_help(what: str, read: list[str], caveat: str = "") -> "html.Details":
@@ -3686,77 +3721,6 @@ def _panel_help(what: str, read: list[str], caveat: str = "") -> "html.Details":
     ], style={"display": "inline-block", "verticalAlign": "middle"})
 
 
-def _render_regime_radar(asof_value=None, snap=None) -> "html.Div":
-    """
-    Forward-looking Regime Radar with a 30-min time-machine dropdown.
-    Selecting a checkpoint reconstructs the market regime + change-forecast as it
-    stood at that moment (read from the persisted snapshot mirrors).
-    """
-    if not _REGIME_AVAILABLE:
-        return html.Div()
-    marks = regime_forecast.checkpoint_times()
-    opts = [{"label": "● Now (live)", "value": "now"}] + \
-           [{"label": t.strftime("%H:%M"), "value": t.isoformat()} for t in marks]
-    val = asof_value or "now"
-    as_of = _parse_asof(val)
-
-    m = snap.market if snap is not None else regime_forecast.market_forecast(as_of)
-    stage = m.get("stage", "—") if m.get("has_data") else "—"
-    sclr  = _STAGE_CLR.get(stage, "#64748b")
-
-    head = html.Div([
-        html.Span("🛰 REGIME RADAR", style={"color": "#67e8f9", "fontWeight": "700",
-                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
-        html.Span("  forecast as of", style={"color": "#64748b", "fontSize": "0.55rem"}),
-        dcc.Dropdown(id="regime-checkpoint", options=opts, value=val, clearable=False,
-                     style={"width": "130px", "fontSize": "0.62rem", "color": "#0b1320"}),
-        _panel_help(
-            "Per-index regime label + stability + a forecast of the next shift. The 'what mode is "
-            "the market in' layer (trend vs chop, holding vs turning).",
-            ["MARKET … = overall regime + breadth (how many of 4 indices agree).",
-             "per index: regime (BULLISH/BEARISH/NEUTRAL) + STABLE (holding) or BUILDING → X (shifting, with ~ETA).",
-             "the 'as of' dropdown = a time machine — rewind ALL trade-book panels to a past instant.",
-             "switch back to 'Now (live)' to return to real-time."],
-            "Regime is a label, not a direction call. No standalone edge — use it to frame, not to enter."),
-    ], style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "6px",
-              "flexWrap": "wrap"})
-
-    if not m.get("has_data"):
-        body = html.Div("Regime data warming up — need ~12 min of snapshots.",
-                        style={"color": "#475569", "fontSize": "0.6rem"})
-    else:
-        nxt = m.get("next_dir") or "—"
-        market_line = html.Div([
-            html.Span(f"MARKET {m['regime']}", style={
-                "color": _REGIME_CLR.get(m["regime"], "#94a3b8"), "fontWeight": "700",
-                "fontSize": "0.66rem"}),
-            html.Span(f"  · {stage}", style={"color": sclr, "fontWeight": "700", "fontSize": "0.62rem"}),
-            html.Span(f"  next {nxt} in {m['eta']} ({m['confidence']}%)  · {m['coherence']}"
-                      if stage != "STABLE" else f"  holding · {m['coherence']}",
-                      style={"color": "#94a3b8", "fontSize": "0.58rem"}),
-        ], style={"marginBottom": "4px"})
-        rows = []
-        for s in regime_forecast.INDEX_SYMBOLS:
-            f = (m.get("per_index") or {}).get(s, {})
-            if not f.get("has_data"):
-                continue
-            st = f["stage"]
-            rows.append(html.Div([
-                html.Span(LABELS.get(s, s), style={"color": COLORS.get(s, "#94a3b8"),
-                          "fontWeight": "700", "fontSize": "0.58rem", "minWidth": "78px",
-                          "display": "inline-block"}),
-                html.Span(f["regime"], style={"color": _REGIME_CLR.get(f["regime"], "#94a3b8"),
-                          "fontSize": "0.58rem", "fontWeight": "600"}),
-                html.Span(f"  {st}" + (f" → {f['next_dir']} {f['eta']}" if st != "STABLE" and f["next_dir"] else ""),
-                          style={"color": _STAGE_CLR.get(st, "#64748b"), "fontSize": "0.56rem"}),
-            ], style={"marginBottom": "1px"}))
-        body = html.Div([market_line, *rows])
-
-    return html.Div([head, body], style={
-        "marginBottom": "10px", "padding": "8px 10px", "borderRadius": "4px",
-        "background": "#0a1622", "border": f"1px solid {sclr}33", **MONO})
-
-
 _PB_ACTION_CLR = {"BUY CE": "#4ade80", "BUY PE": "#f87171", "WRITE PE": "#fbbf24",
                   "WRITE CE": "#fbbf24", "BUY FUT": "#60a5fa", "SELL FUT": "#60a5fa",
                   "NO TRADE": "#64748b"}
@@ -3765,226 +3729,8 @@ _PB_TONE_CLR = {"bull": "#4ade80", "bear": "#f87171", "flat": "#475569"}
 # signal_types (one canonical source — see sig.arrow/color/action_hint).
 
 
-def _render_opening_playbook(asof_value=None, snap=None) -> "html.Div":
-    """Opening Playbook — the first-20-min F&O morning call, one card per index."""
-    if not _PLAYBOOK_AVAILABLE:
-        return html.Div()
-    try:
-        pb = snap.playbook_all if snap is not None else opening_playbook.playbook_all(_parse_asof(asof_value))
-    except Exception:
-        return html.Div()
-
-    head = html.Div([
-        html.Span("⚡ OPENING PLAYBOOK", style={"color": "#fbbf24", "fontWeight": "700",
-                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
-        html.Span("  first-20-min F&O read · OI · premium · basis · EOD memory · % = conviction, not win-rate",
-                  style={"color": "#64748b", "fontSize": "0.55rem"}),
-        html.Span(f"  · {pb.get('coherence', '')}", style={"color": "#94a3b8", "fontSize": "0.55rem"}),
-        _panel_help(
-            "The first-20-min F&O morning call. The open (gap, opening range, first OI flow, ATM "
-            "premium, last-night EOD) sets the day's structure → it issues ONE concrete morning "
-            "trade. A SHORT-horizon read: sharpest ~9:40, best held 30–60 min, gone by close.",
-            ["% conv = weighted agreement of OR/gap/OI/premium/futures/EOD. NOT a win-rate.",
-             "BULLISH / BEARISH / NEUTRAL = direction.",
-             "WRITE PE = sell puts (bullish, collect premium when IV is pumped); BUY CE = pay for the call.",
-             "X/4 bullish (header) = breadth: how many indices agree.",
-             "wrong below/above N = invalidation level.",
-             "why & factors = click for the per-factor breakdown + flip alert.",
-             "BEST horizon: 30–60 min after the 9:35 call (highest hit-rate ~60%). WORST: holding to EOD "
-             "(decayed, points slightly wrong) and the first <15 min (still a coin-flip).",
-             "Strongest factor = OI flow; OR/gap are weakest (breakouts & gaps mean-revert by close).",
-             "LESS RELIABLE: after ~11am (call is stale), low % conv, NEUTRAL / NO-TRADE reads, while "
-             "'warming up' (thin capture), and on big-gap / breakout days (those tend to fade).",
-             "OI walls are NOT intraday targets (level_touch_backtest.py): the nearest call/put wall sits "
-             "~4.8σ away and is touched at/BELOW random-walk chance — read walls as context, not a level to aim at."],
-            "Decision-support; forward edge UNPROVEN on 7 days (short-horizon dir-hit ~60% but the CI still "
-            "straddles 50%). Read it as a STRUCTURE MAP — gap / range / who's-writing / invalidation — not a "
-            "direction or target bet. The Conductor consumes this (one signal, two views, not two confirmations)."),
-    ], style={"marginBottom": "6px"})
-
-    cards = []
-    for sym in INDEX_SYMBOLS:
-        p = (pb.get("per_index") or {}).get(sym) or {}
-        cd = COLORS.get(sym, "#40c4ff")
-        if not p.get("has_data"):
-            body = html.Div(p.get("note") or "no data", style={"color": "#475569", "fontSize": "0.55rem"})
-            cards.append(dbc.Col([html.Div(LABELS.get(sym, sym), style={
-                "color": cd, "fontWeight": "700", "fontSize": "0.6rem"}), body],
-                md=3, style={"padding": "0 8px"}))
-            continue
-        act = p["action"]; aclr = _PB_ACTION_CLR.get(act, "#94a3b8")
-        strike_txt = f" {p['strike']:,}" if p.get("strike") else ""
-        flip = p.get("flip") or {}
-        dirn = p.get("direction", "NEUTRAL")
-        dclr = sig.color(dirn); dtag = f"{sig.arrow(dirn)} {dirn}"
-        hint = sig.action_hint(act)
-        cards.append(dbc.Col([
-            # Headline (always visible): label · conviction · direction stance
-            html.Div([
-                html.Span(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
-                          "fontSize": "0.6rem", "letterSpacing": "0.06em"}),
-                html.Span(f" {p['conviction']}% conv",
-                          title="Conviction = weighted agreement of OR/gap/OI/premium/futures/EOD "
-                                "factors. NOT a win probability — unvalidated for forward edge.",
-                          style={"color": "#94a3b8", "fontSize": "0.55rem"}),
-                html.Span(dtag, style={"color": dclr, "fontWeight": "700",
-                          "fontSize": "0.52rem", "marginLeft": "auto"}),
-            ], style={"display": "flex", "alignItems": "center"}),
-            # Action + strike, with a plain-English stance clarifier (WRITE/FUT)
-            html.Div([
-                html.Span(f"{act}{strike_txt}", style={"color": aclr, "fontWeight": "700",
-                          "fontSize": "0.82rem"}),
-                html.Span(f"  · {hint}", style={"color": dclr, "fontSize": "0.5rem"}) if hint else None,
-            ], style={"margin": "2px 0"}),
-            html.Div(flip.get("msg", ""), style={"color": "#fb923c", "fontSize": "0.52rem",
-                     "fontWeight": "700", "background": "#27160a", "border": "1px solid #7c2d12",
-                     "borderRadius": "3px", "padding": "2px 4px", "marginBottom": "3px"})
-                if flip.get("flipped") else None,
-            # Invalidation stays visible — the one risk number you must see.
-            html.Div(f"wrong {'below' if dirn == 'BULLISH' else 'above'} "
-                     f"{p['invalidation']:,.0f}", style={"color": "#f87171",
-                     "fontSize": "0.52rem", "marginTop": "2px", "fontWeight": "600"})
-                if p.get("invalidation") and dirn != "NEUTRAL" else None,
-            # Verbose rationale folded into a collapsible, scrollable disclosure.
-            html.Details([
-                html.Summary("why & factors", style={"color": "#64748b",
-                             "fontSize": "0.52rem", "cursor": "pointer", "marginTop": "3px"}),
-                html.Div([
-                    html.Div(p.get("why", ""), style={"color": "#94a3b8", "fontSize": "0.54rem",
-                             "lineHeight": "1.35", "marginBottom": "3px", "whiteSpace": "normal"}),
-                    *[html.Div(m, style={"color": _PB_TONE_CLR.get(tone, "#64748b"),
-                              "fontSize": "0.52rem", "lineHeight": "1.4", "whiteSpace": "normal"})
-                      for tone, m in (p.get("factors") or [])],
-                    html.Div(p.get("margin_note", ""), style={"color": "#a16207",
-                             "fontSize": "0.5rem", "marginTop": "2px"}) if p.get("margin_note") else None,
-                ], style={"maxHeight": "150px", "overflowY": "auto", "marginTop": "3px",
-                          "paddingRight": "4px"}),
-            ]),
-        ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {cd}33"}))
-
-    return html.Div([head, dbc.Row(cards, className="gx-0")], style={
-        "marginBottom": "10px", "padding": "8px 10px", "borderRadius": "4px",
-        "background": "#0d1420", "border": "1px solid #2a2410", **MONO})
-
-
 # ── Session Conductor panel — the unified, evolving stance per index ────────────
 # (LONG/SHORT/FLAT arrow + colour now from signal_types — one canonical source)
-
-
-def _cond_drv_clr(v: float) -> str:
-    return "#4ade80" if v > 0.05 else "#f87171" if v < -0.05 else "#475569"
-
-
-def _render_conductor(asof_value=None, snap=None) -> "html.Div":
-    """One fused, evolving stance per index — resolves the stale-opening-vs-live
-    dissonance into a single directive. Decision-support (does not auto-execute)."""
-    if not _CONDUCTOR_AVAILABLE:
-        return html.Div()
-    try:
-        per = snap.stances() if snap is not None else session_conductor.conduct_all(as_of=_parse_asof(asof_value))
-    except Exception:
-        return html.Div()
-    head = html.Div([
-        html.Span("🎛 SESSION CONDUCTOR", style={"color": "#a78bfa", "fontWeight": "700",
-                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
-        html.Span("  fused stance — opening thesis (decaying) ⊕ regime ⊕ momentum ⊕ OI"
-                  "  ·  decision-support · % = conviction (signal agreement), NOT win-rate",
-                  style={"color": "#64748b", "fontSize": "0.55rem"}),
-        _panel_help(
-            "In plain words: ONE line that tells you what the market is doing RIGHT NOW for this "
-            "index — every refresh, all session. It fuses the morning call (fading by ~11am) + live "
-            "regime + momentum + OI so you don't have to read 4 panels and guess if the old call "
-            "still holds.\n"
-            "EXAMPLE — reading NIFTY at 12:30 you might see: 'LONG · ✓2.1σ · 68% conv · WRITE PE "
-            "24500 · act now · opened LONG→LONG · wrong below 24450 · regime→trend ~40m'. That reads "
-            "as: right now Nifty leans UP, the move is real (not noise), the signals mostly agree, "
-            "the way to play it is sell the 24500 puts, the entry window is open now, this view has "
-            "held since the open, and if Nifty breaks BELOW 24450 the bullish idea is dead — step "
-            "aside. A NEUTRAL/FLAT card with a low σ = chop, no trade.",
-            ["LONG / SHORT / FLAT = net directional stance.",
-             "~0.9σ drift vs ✓2.0σ = move quality. Under 2σ = whipsaw zone, NO edge — don't chase. ≥2σ = confirmed.",
-             "% conv = how much the sub-signals agree. NOT a win-rate.",
-             "WRITE PE / WRITE CE / BUY CE = the instrument expressing the stance (WRITE = sell that wall, collect premium).",
-             "HOLD·wait vs act now = is the entry window open right now.",
-             "opened X → Y = how the stance evolved since the open (shows flips).",
-             "wrong below/above N = invalidation; thesis dead past it.",
-             "⏳ regime → … = forecast of the next regime shift + ETA.",
-             "drivers & why = click for each factor's signed push (+bull / −bear)."],
-            "Decision-support. No measured forward edge (conductor_replay.py validates stability "
-            "only). Read it as structure, not a buy button."),
-    ], style={"marginBottom": "6px"})
-
-    cards = []
-    for sym in INDEX_SYMBOLS:
-        r = per.get(sym) or {}
-        cd = COLORS.get(sym, "#a78bfa")
-        if not r.get("has_data"):
-            cards.append(dbc.Col([
-                html.Div(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700", "fontSize": "0.6rem"}),
-                html.Div(r.get("note", "warming up"), style={"color": "#475569", "fontSize": "0.52rem"})],
-                md=3, style={"padding": "0 8px"}))
-            continue
-        dirn = r["direction"]; dclr = sig.color(dirn)
-        inst = r["instrument"]; aclr = _PB_ACTION_CLR.get(inst["action"], "#94a3b8")
-        strike = f" {inst['strike']:,}" if inst.get("strike") else ""
-        a_hint = sig.action_hint(inst["action"])   # 'WRITE PE → sell puts · bullish'
-        # Move-quality badge: ≥2σ CONFIRMED carries forward edge; 0.7-2σ is drift
-        # (no fwd edge — the whipsaw zone). swing_classifier_backtest.py.
-        confd = bool(r.get("mom_confirmed")); zmax = r.get("zmax", 0.0)
-        badge_clr = "#22c55e" if confd else "#64748b"
-        badge_txt = f"✓ {zmax:.1f}σ" if confd else f"~ {zmax:.1f}σ drift"
-        cards.append(dbc.Col([
-            html.Div([
-                html.Span(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
-                          "fontSize": "0.6rem", "letterSpacing": "0.06em"}),
-                html.Span(f"  {sig.arrow(dirn)} {dirn}", style={"color": dclr,
-                          "fontWeight": "700", "fontSize": "0.56rem"}),
-                html.Span(badge_txt, title=("≥2σ move — has forward edge" if confd
-                          else "0.7-2σ — no forward edge, don't chase the flip"),
-                          style={"color": badge_clr, "fontSize": "0.5rem", "fontWeight": "700",
-                                 "marginLeft": "6px", "padding": "0 4px", "borderRadius": "3px",
-                                 "border": f"1px solid {badge_clr}66"}),
-                html.Span(f"{r['conviction']}% conv",
-                          title="Conviction = agreement across opening thesis ⊕ regime ⊕ momentum ⊕ OI. "
-                                "NOT a win probability — this fused layer has no measured forward edge "
-                                "(conductor_replay.py validates stability only).",
-                          style={"color": "#94a3b8", "fontSize": "0.54rem", "marginLeft": "auto"}),
-            ], style={"display": "flex", "alignItems": "center"}),
-            html.Div([
-                html.Span(f"{inst['action']}{strike}", style={"color": aclr, "fontWeight": "700",
-                          "fontSize": "0.8rem"}),
-                html.Span(f"  · {a_hint}", style={"color": dclr, "fontSize": "0.5rem"}) if a_hint else None,
-            ], style={"margin": "2px 0"}),
-            html.Div(f"{r['transition']}" + ("" if r["act_now"] else " · wait"),
-                     style={"color": "#cbd5e1" if r["act_now"] else "#64748b", "fontSize": "0.5rem",
-                            "fontWeight": "700" if r["act_now"] else "400", "marginBottom": "2px"}),
-            html.Div(f"opened {r.get('opening_dir','?')} ({r.get('opening_action','—')}) → {dirn}"
-                     if r.get("opening_action") else "",
-                     style={"color": "#64748b", "fontSize": "0.5rem", "marginBottom": "2px"}),
-            html.Details([
-                html.Summary("drivers & why", style={"color": "#64748b", "fontSize": "0.5rem", "cursor": "pointer"}),
-                html.Div([html.Div(inst.get("why", ""), style={"color": "#94a3b8",
-                          "fontSize": "0.5rem", "marginBottom": "2px", "whiteSpace": "normal"})] +
-                    [html.Div([
-                        html.Span(("▲" if v > 0.05 else "▼" if v < -0.05 else "·") + " ",
-                                  style={"color": _cond_drv_clr(v)}),
-                        html.Span(f"{name} ", style={"color": "#94a3b8"}),
-                        html.Span(f"{v:+.2f} ", style={"color": _cond_drv_clr(v), "fontWeight": "600"}),
-                        html.Span(str(detail)[:44], style={"color": "#475569"}),
-                    ], style={"fontSize": "0.5rem", "lineHeight": "1.5", "whiteSpace": "normal"})
-                     for name, v, detail in r.get("drivers", [])],
-                    style={"maxHeight": "120px", "overflowY": "auto", "marginTop": "2px"}),
-            ]),
-            html.Div(f"wrong {'below' if dirn == 'LONG' else 'above'} {r['invalidation']:,.0f}"
-                     if r.get("invalidation") and dirn != "FLAT" else "",
-                     style={"color": "#f87171", "fontSize": "0.5rem", "marginTop": "2px"}),
-            html.Div(f"⏳ regime → {r['regime_eta']}" if r.get("regime_eta") else "",
-                     style={"color": "#fb923c", "fontSize": "0.5rem"}),
-        ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {dclr}55"}))
-
-    return html.Div([head, dbc.Row(cards, className="gx-0")], style={
-        "marginBottom": "10px", "padding": "9px 11px", "borderRadius": "4px",
-        "background": "#0c0e18", "border": "1px solid #2a2440", **MONO})
 
 
 # ── Intraday-TF footprint matrix (left pane) ────────────────────────────────────
@@ -3999,7 +3745,10 @@ def _parse_asof(asof_value):
     review mark with live (future-relative) conductor/footprint/forecast data."""
     if asof_value and asof_value != "now":
         try:
-            return datetime.datetime.fromisoformat(asof_value)
+            dt = datetime.datetime.fromisoformat(asof_value)
+            # read_mirror compares against tz-aware IST ts; a naive as_of would raise
+            # "Cannot compare tz-naive and tz-aware". Localise naive inputs to IST.
+            return dt.replace(tzinfo=IST) if dt.tzinfo is None else dt
         except Exception:
             return None
     return None
@@ -4048,42 +3797,24 @@ def _tf_tooltip(c: dict) -> str:
     return "\n".join(out)
 
 
-def _render_index_trades(sym) -> "html.Div":
-    """Compact open + today's-resolved trades for the SELECTED index — the action
-    half of the cockpit, next to the footprint that informs it."""
-    try:
-        led = intraday_trades.get_ledger()
-        today = datetime.datetime.now(tz=IST).date().isoformat()
-        rows = [t for t in led.recent(60, today) if t.get("index_sym") == sym]
-    except Exception:
-        return html.Div()
-    if not rows:
-        return html.Div(f"no {LABELS.get(sym, sym)} trades today", style={
-            "color": "#475569", "fontSize": "0.52rem", "padding": "3px 0", **MONO})
-    # open positions first, then most recent
-    rows.sort(key=lambda t: (0 if (t.get("status") or "OPEN") == "OPEN" else 1,
-                             t.get("opened_ts") or ""))
-    items = []
-    for t in rows[:7]:
-        st = t.get("status") or "OPEN"
-        r = t.get("r_multiple")
-        dirn = t.get("direction"); strike = t.get("strike") or 0
-        tm = (t.get("opened_ts") or "")[11:16]
-        dclr = "#4ade80" if dirn == "CE" else "#f87171"
-        stclr = _TRADE_ST_CLR.get(st, "#94a3b8")
-        rtxt = f"{r:+.2f}R" if r is not None else "live"
-        rclr = "#4ade80" if (r or 0) > 0 else "#f87171" if (r or 0) < 0 else "#fbbf24"
-        items.append(html.Div([
-            html.Span(tm, style={"color": "#475569", "fontSize": "0.5rem",
-                      "minWidth": "30px", "display": "inline-block"}),
-            html.Span(f"{dirn} {strike:,.0f}", style={"color": dclr, "fontWeight": "700",
-                      "fontSize": "0.54rem"}),
-            html.Span(f" {st}", style={"color": stclr, "fontSize": "0.5rem"}),
-            html.Span(rtxt, style={"color": rclr, "fontSize": "0.54rem",
-                      "fontWeight": "700", "marginLeft": "auto"}),
-        ], style={"display": "flex", "alignItems": "center", "padding": "2px 0",
-                  "borderBottom": "1px solid #111d2e"}))
-    return html.Div(items)
+def _crosshair(fig: "go.Figure") -> "go.Figure":
+    """TradingView-style hover crosshair for the stacked-panel charts. A dotted
+    VERTICAL guide spikes across EVERY panel (spikemode='across' on the shared
+    x-axis) so a price bar lines up with its OI / premium / flow bars at the same
+    instant; a dotted HORIZONTAL guide runs to the y-axis. Free-following
+    (spikesnap='cursor'), always drawn (spikedistance=-1).
+
+    The value TAGS at the cursor (time on x, price on y) are drawn by
+    assets/crosshair_price.js — plotly has no native cursor-value axis label. That
+    JS reads the x-axis range back in UTC (the tz-correct wall-clock, since the
+    chart's naive IST timestamps are stored as UTC epoch-ms); do NOT switch it to
+    local time or the time tag drifts +05:30."""
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikedash="dot", spikecolor="#7dd3fc", spikethickness=1)
+    fig.update_yaxes(showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikedash="dot", spikecolor="#7dd3fc", spikethickness=1)
+    fig.update_layout(hovermode="closest", spikedistance=-1, hoverdistance=100)
+    return fig
 
 
 def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly") -> "go.Figure":
@@ -4121,11 +3852,16 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly"
         name="price", increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
         increasing_fillcolor="#22c55e", decreasing_fillcolor="#ef4444",
         line=dict(width=1), showlegend=False), row=1, col=1, secondary_y=False)
+    # close line + volume are CONTEXT only — skip their hover so they don't hijack
+    # the readout with a single close value (the candle below the cursor). The
+    # candlestick OHLC stays the price tooltip, so it matches the crosshair height.
     fig.add_trace(go.Scatter(x=ts, y=d["close"], mode="lines", name="close",
                              line=dict(color="#67e8f9", width=1, dash="dot"),
-                             connectgaps=True, opacity=0.7), row=1, col=1, secondary_y=False)
+                             connectgaps=True, opacity=0.7, hoverinfo="skip"),
+                  row=1, col=1, secondary_y=False)
     fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
-                         marker_color="rgba(34,211,238,0.45)", showlegend=False),
+                         marker_color="rgba(34,211,238,0.45)", showlegend=False,
+                         hoverinfo="skip"),
                   row=1, col=1, secondary_y=True)
     _maxv = max([v for v in d["volume"] if v] or [1])
     fig.update_yaxes(range=[0, _maxv * 4.5], row=1, col=1, secondary_y=True,
@@ -4184,7 +3920,7 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly"
     fig.update_xaxes(rangeslider_visible=False)   # candlestick adds one by default
     for a in fig["layout"]["annotations"]:        # subplot titles
         a["font"] = dict(size=10.5, color="#94a3b8")
-    return fig
+    return _crosshair(fig)
 
 
 def _strike_fig(sym, tf_min: int, strike: int, asof_value=None, date=None, expiry="weekly") -> "go.Figure":
@@ -4222,7 +3958,7 @@ def _strike_fig(sym, tf_min: int, strike: int, asof_value=None, date=None, expir
         line=dict(width=1), showlegend=False), row=1, col=1, secondary_y=False)
     _vol = [(a or 0) + (b or 0) for a, b in zip(d["ce_vol"], d["pe_vol"])]
     fig.add_trace(go.Bar(x=ts, y=_vol, name="volume", marker_color="rgba(34,211,238,0.4)",
-                         showlegend=False), row=1, col=1, secondary_y=True)
+                         showlegend=False, hoverinfo="skip"), row=1, col=1, secondary_y=True)
     _mv = max([v for v in _vol if v] or [1])
     fig.update_yaxes(range=[0, _mv * 4.5], row=1, col=1, secondary_y=True,
                      showticklabels=False, showgrid=False)
@@ -4268,7 +4004,7 @@ def _strike_fig(sym, tf_min: int, strike: int, asof_value=None, date=None, expir
     fig.update_xaxes(rangeslider_visible=False)
     for a in fig["layout"]["annotations"]:
         a["font"] = dict(size=10.5, color="#94a3b8")
-    return fig
+    return _crosshair(fig)
 
 
 def _futures_fig(sym, tf_min: int, asof_value=None, date=None, leg="near") -> "go.Figure":
@@ -4314,11 +4050,11 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None, leg="near") -> "g
         if _lg == d.get("leg") or not any(v is not None for v in d.get(_lg, [])):
             continue
         fig.add_trace(go.Scatter(x=ts, y=d[_lg], mode="lines", name=f"{_lg} mth",
-                                 line=dict(color=_legclr[_lg], width=1, dash="dot"), opacity=0.55),
-                      row=1, col=1, secondary_y=False)
+                                 line=dict(color=_legclr[_lg], width=1, dash="dot"), opacity=0.55,
+                                 hoverinfo="skip"), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Bar(x=ts, y=d["volume"], name="volume",
-                         marker_color="rgba(34,211,238,0.45)", showlegend=False),
-                  row=1, col=1, secondary_y=True)
+                         marker_color="rgba(34,211,238,0.45)", showlegend=False,
+                         hoverinfo="skip"), row=1, col=1, secondary_y=True)
     _maxv = max([v for v in d["volume"] if v] or [1])
     fig.update_yaxes(range=[0, _maxv * 4.5], row=1, col=1, secondary_y=True,
                      showticklabels=False, showgrid=False)
@@ -4364,7 +4100,7 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None, leg="near") -> "g
     fig.update_xaxes(rangeslider_visible=False)
     for a in fig["layout"]["annotations"]:
         a["font"] = dict(size=10.5, color="#94a3b8")
-    return fig
+    return _crosshair(fig)
 
 
 def _render_intraday_tf(sym, asof_value=None, snap=None, clickable=False) -> "html.Div":
@@ -4498,40 +4234,6 @@ def _render_intraday_tf(sym, asof_value=None, snap=None, clickable=False) -> "ht
     ], style={**MONO})
 
 
-def _render_trade_book_footprint(asof_value=None, snap=None) -> "html.Div":
-    """The footprint for all 4 indices, as a strip inside the Trade Book cockpit —
-    so the OI·price·volume read sits next to the conductor stance and the trades."""
-    if not _ITF_AVAILABLE:
-        return html.Div()
-    head = html.Div([
-        html.Span("📊 INTRADAY FOOTPRINT", style={"color": "#67e8f9", "fontWeight": "700",
-                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
-        html.Span("  OI · price · volume per timeframe — who's building vs closing",
-                  style={"color": "#64748b", "fontSize": "0.55rem"}),
-        _panel_help(
-            "Per-timeframe OI · price · volume (5m → 60m) — shows who's building vs closing "
-            "positions at each horizon via the live 4-quadrant footprint (long buildup / writing / "
-            "short cover / unwind).",
-            ["OI bias + futOI today = net option + futures OI lean for the day.",
-             "stack ▲/▼ N/4 TFs agree = how many timeframes line up (the confirmation count).",
-             "per-TF row: price Δ% + σ-move, optOI build/flat, futures OI·vol.",
-             "BALANCED vs SHORT/LONG BUILDUP = that timeframe's footprint label.",
-             "★ = confirmed/tradeable. Intraday futures OI isn't in the Fyers feed (shown where available)."],
-            "Descriptive read of flow. The technical layer has a thin ~+0.04R edge with a "
-            "mean-reversion tilt — context, not a signal on its own."),
-    ], style={"marginBottom": "6px"})
-    cols = [dbc.Col([
-        html.Div(LABELS.get(s, s), style={"color": COLORS.get(s, "#67e8f9"),
-                 "fontWeight": "700", "fontSize": "0.58rem", "letterSpacing": "0.06em",
-                 "marginBottom": "3px"}),
-        _render_intraday_tf(s, asof_value, snap, clickable=True),
-    ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {COLORS.get(s, '#67e8f9')}33"})
-        for s in INDEX_SYMBOLS]
-    return html.Div([head, dbc.Row(cols, className="gx-0")], style={
-        "marginBottom": "10px", "padding": "9px 11px", "borderRadius": "4px",
-        "background": "#0a1118", "border": "1px solid #16323a", **MONO})
-
-
 # ── Multi-timeframe trend ribbon (5m → weekly) ──────────────────────────────────
 _TREND_CLR = {1: "#22c55e", -1: "#ef4444", 0: "#64748b"}
 
@@ -4576,229 +4278,6 @@ def _render_trend_matrix() -> "html.Div":
         "background": "#0c1018", "border": "1px solid #241f3a", **MONO})
 
 
-def _trade_card(t, fc=None) -> "html.Div":
-    st = t.get("status") or "OPEN"
-    r  = t.get("r_multiple")
-    clr = _TRADE_ST_CLR.get(st, "#94a3b8")
-    dirn = t.get("direction"); strike = t.get("strike") or 0
-    entry = t.get("entry_ltp"); sl = t.get("sl"); t1 = t.get("t1"); t2 = t.get("t2")
-    cur = t.get("exit_ltp") if st != "OPEN" else t.get("last_ltp")
-    mfe = t.get("mfe"); mae = t.get("mae")
-    tm = (t.get("opened_ts") or "")[11:16]
-    dir_clr = "#4ade80" if dirn == "CE" else "#f87171"
-    rtxt = f"{r:+.2f}R" if r is not None else "live"
-    r_clr = "#4ade80" if (r or 0) > 0 else "#f87171" if (r or 0) < 0 else "#fbbf24"
-    lvl = lambda lab, v, c: html.Span([html.Span(lab, style={"color": "#475569"}),
-                                       html.Span(f"{v:.1f}", style={"color": c, "fontWeight": "600"})],
-                                      style={"fontSize": "0.55rem", "marginRight": "6px"})
-    return html.Div([
-        html.Div([
-            html.Span(f"{tm} ", style={"color": "#475569", "fontSize": "0.58rem"}),
-            html.Span(f"{dirn} {strike:,.0f} ", style={"color": dir_clr, "fontWeight": "700", "fontSize": "0.74rem"}),
-            html.Span(st, style={"color": clr, "fontWeight": "700", "fontSize": "0.62rem"}),
-            html.Span(f"  {rtxt}", style={"color": r_clr, "fontSize": "0.66rem", "fontWeight": "700"}),
-            html.Span("  T1✓ BE", style={"color": "#22c55e", "fontSize": "0.55rem", "fontWeight": "700"})
-                if (st == "OPEN" and t.get("t1_booked")) else None,
-            html.Span(f"  {t.get('conviction') or ''}", style={"color": "#475569", "fontSize": "0.52rem"}),
-        ]),
-        _trade_levels_bar(t),
-        html.Div([
-            lvl("SL ", sl, "#f87171"), lvl("E ", entry, "#94a3b8"),
-            lvl("● ", cur, "#e2e8f0"), lvl("T1 ", t1, "#22c55e"), lvl("T2 ", t2, "#16a34a"),
-        ]),
-        html.Div(f"peak {mfe:.1f} / low {mae:.1f}" if mfe and mae else "",
-                 style={"color": "#334155", "fontSize": "0.5rem", "marginTop": "2px"}),
-        # Adaptive Layer-10 regime-shift banner (set when a shock fired against this trade).
-        html.Div((t.get("regime_flag") or "")[:160],
-                 style={"color": "#fb923c", "fontSize": "0.54rem", "marginTop": "3px",
-                        "fontWeight": "700", "lineHeight": "1.35", "whiteSpace": "normal",
-                        "background": "#27160a", "border": "1px solid #7c2d12",
-                        "borderRadius": "3px", "padding": "3px 5px"}) if t.get("regime_flag") else None,
-        # Forward-looking regime-RISK forecast (only when a flip is building against an OPEN trade).
-        _regime_risk_badge(t, fc) if st == "OPEN" else None,
-        html.Div((t.get("reason") or "")[:180],
-                 style={"color": "#52708f", "fontSize": "0.52rem", "marginTop": "3px",
-                        "lineHeight": "1.4", "whiteSpace": "normal"}),
-    ], style={"padding": "9px 0", "borderBottom": "1px solid #111d2e", **MONO})
-
-
-def _render_hour_forecast(asof_value=None) -> "html.Div":
-    """Next-~60-min ZONE (calibrated ~68% range) + a directional lean (UNPROVEN).
-    The range is the honest output; the lean is shown faint until the accumulating
-    ledger (backtest_hour_forecast.py) proves it beats a coin-flip out-of-sample."""
-    as_of = _parse_asof(asof_value)
-    head = html.Div([
-        html.Span("🎯 NEXT-HOUR ZONE", style={"color": "#a78bfa", "fontWeight": "700",
-                  "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
-        html.Span("  ~60-min range (calibrated ≈68%) + directional lean",
-                  style={"color": "#64748b", "fontSize": "0.55rem"}),
-        _panel_help(
-            "A forward read for the next ~60 minutes: a price ZONE (where spot likely sits in an "
-            "hour) plus a faint directional lean. The zone is realised-vol based and calibrated to "
-            "~68% hit; the lean reuses the opening-playbook composite.",
-            ["lo – hi = the ~68% zone for spot in ~60 min (±band% shown).",
-             "lean ▲/▼ p_up = directional tilt + prob — UNPROVEN, shown faint on purpose.",
-             "the zone is the trustworthy part (vol forecasts range); direction is not yet validated.",
-             "every session adds a labeled day to the ledger — the lean goes solid only if it clears 50% OOS."],
-            "Scaffold accumulating a track record (backtest_hour_forecast.py). Direction has NO measured "
-            "edge yet — trade the ZONE as context, not the arrow. NOT wired to auto-execution."),
-    ], style={"marginBottom": "6px"})
-
-    cols = []
-    for sym in INDEX_SYMBOLS:
-        cd = COLORS.get(sym, "#a78bfa")
-        f = {}
-        try:
-            f = hour_forecast.forecast(sym, as_of=as_of)
-        except Exception:
-            f = {}
-        if not f.get("has_data"):
-            body = html.Div("warming up — need ticks + OI", style={"color": "#475569", "fontSize": "0.55rem"})
-        else:
-            lo, hi = f.get("lo"), f.get("hi")
-            up = (f.get("p_up") or 0.5) >= 0.5
-            lean_clr = "#22c55e" if up else "#ef4444"
-            zone = (f"{lo:,.0f} – {hi:,.0f}" if (lo is not None and hi is not None) else "—")
-            body = html.Div([
-                html.Div(zone, style={"color": "#e2e8f0", "fontWeight": "700", "fontSize": "0.74rem", **MONO}),
-                html.Div(f"±{f.get('exp_move_pct')}% · ~68% zone" if f.get("exp_move_pct") else "",
-                         style={"color": "#64748b", "fontSize": "0.5rem"}),
-                html.Div([
-                    html.Span("lean ", style={"color": "#475569", "fontSize": "0.52rem"}),
-                    html.Span(f"{'▲' if up else '▼'} {f.get('direction','—')} ",
-                              style={"color": lean_clr, "fontSize": "0.56rem", "opacity": 0.55}),
-                    html.Span(f"p_up {100*(f.get('p_up') or 0):.0f}%  ·  unproven",
-                              style={"color": "#475569", "fontSize": "0.48rem", "opacity": 0.7}),
-                ], style={"marginTop": "2px"}),
-            ])
-        cols.append(dbc.Col([
-            html.Div(LABELS.get(sym, sym), style={"color": cd, "fontWeight": "700",
-                     "fontSize": "0.58rem", "letterSpacing": "0.06em", "marginBottom": "3px"}),
-            body,
-        ], md=3, style={"padding": "0 8px", "borderLeft": f"2px solid {cd}33"}))
-    return html.Div([head, dbc.Row(cols, className="gx-0")], style={
-        "marginBottom": "10px", "padding": "9px 11px", "borderRadius": "4px",
-        "background": "#0a0f1a", "border": "1px solid #211a3a", **MONO})
-
-
-def _render_trade_book(asof_value=None) -> "html.Div":
-    """Full Trade Book cockpit — trades by index with levels, progress, and reason."""
-    led   = intraday_trades.get_ledger()
-    today = datetime.datetime.now(tz=IST).date().isoformat()
-    s     = led.stats(today)
-    rows  = led.recent(200, today)
-    with _lock:
-        spots = {x: dict(_latest.get(x) or {}) for x in INDEX_SYMBOLS}
-
-    # ONE market state for the whole page (L2). Every panel reads its primitives
-    # from this snapshot — the regime forecast / playbook / footprint / conductor
-    # stance are each computed once at the SELECTED instant, not 3-4x per render,
-    # and can never disagree on the instant they describe.
-    _asof = _parse_asof(asof_value)
-    snap = get_snapshot(_asof) if _SNAPSHOT_OK else None
-    forecasts = {}
-    if snap is not None:
-        forecasts = {x: snap.forecast(x) for x in INDEX_SYMBOLS}
-    elif _REGIME_AVAILABLE:
-        for x in INDEX_SYMBOLS:
-            try:
-                forecasts[x] = regime_forecast.forecast_index(x, as_of=_asof)
-            except Exception:
-                forecasts[x] = {}
-    regime_radar = _render_regime_radar(asof_value, snap)
-
-    hdr_stats = []
-    if s.get("n"):
-        hit = s.get("hit_rate"); avgr = s.get("avg_r")
-        net = s.get("net_avg_r"); nhit = s.get("net_hit_rate"); bps = s.get("cost_bps")
-        hdr_stats = [
-            html.Span(f"{s['n']} trades   ", style={"color": "#94a3b8"}),
-            html.Span(f"{s['wins']}W / {s['losses']}L   ", style={"color": "#cbd5e1"}),
-            html.Span(f"{hit:.0f}% hit   " if hit is not None else "",
-                      style={"color": "#4ade80" if (hit or 0) >= 50 else "#f87171", "fontWeight": "700"}),
-            html.Span(f"gross {avgr:+.2f}R" if avgr is not None else "",
-                      style={"color": "#94a3b8"}),
-            html.Span(f"   net {net:+.2f}R" if net is not None else "",
-                      style={"color": "#4ade80" if (net or 0) >= 0 else "#f87171", "fontWeight": "700"}),
-            html.Span((f" ({nhit:.0f}% @{bps:.0f}bps)" if (net is not None and nhit is not None) else ""),
-                      style={"color": "#64748b"}),
-        ]
-    header = html.Div([
-        html.Span("📒 TRADE BOOK — TODAY   ", style={
-            "color": "#fbbf24", "fontWeight": "700", "fontSize": "0.95rem", "letterSpacing": "0.08em"}),
-        html.Span(hdr_stats, style={"fontSize": "0.72rem"}),
-    ], style={"marginBottom": "10px"})
-
-    # ── Session-strategy banner: what the engine is doing RIGHT NOW by clock ──
-    strat = session_strategy()
-    gate_open = strat["allow_new_entry"]
-    gate_clr  = "#22c55e" if gate_open else "#f87171"
-    strat_banner = html.Div([
-        html.Span(f"⏱ {strat['phase']}", style={
-            "color": "#e2e8f0", "fontWeight": "700", "fontSize": "0.7rem", "letterSpacing": "0.06em"}),
-        html.Span("  ENTRIES " + ("OPEN" if gate_open else "BLOCKED"), style={
-            "color": gate_clr, "fontWeight": "700", "fontSize": "0.62rem"}),
-        html.Span(f"  · min-conf {strat['min_conf']}%  · stop ×{strat['stop_mult']:.2f}"
-                  f"  · target ×{strat['target_mult']:.2f}", style={
-            "color": "#64748b", "fontSize": "0.58rem"}),
-        html.Div(strat["bias"], style={
-            "color": "#94a3b8", "fontSize": "0.6rem", "marginTop": "2px", "fontStyle": "italic"}),
-    ], style={"marginBottom": "10px", "padding": "6px 9px", "borderRadius": "4px",
-              "background": "#0c1626", "border": f"1px solid {'#15351f' if gate_open else '#3a1418'}",
-              **MONO})
-
-    pred_dropdown = _prediction_dropdown(is_open=False)
-    conductor = _render_conductor(asof_value, snap)
-    footprint = _render_trade_book_footprint(asof_value, snap)
-    playbook = _render_opening_playbook(asof_value, snap)
-    hour_zone = _render_hour_forecast(asof_value)
-
-    if not rows:
-        return html.Div([header, strat_banner, conductor, hour_zone, footprint, playbook, regime_radar, pred_dropdown, html.Div(
-            "No trades yet today — signals log here as the engine fires across all 4 indices.",
-            style={"color": "#475569", "fontSize": "0.75rem", **MONO})])
-
-    cols = []
-    for sym in INDEX_SYMBOLS:
-        idx_rows = [t for t in rows if t.get("index_sym") == sym]
-        cd = COLORS[sym]
-        sp = spots.get(sym, {})
-        spot_v = sp.get("ltp", 0); chp = sp.get("chp", 0)
-        spot_clr = "#22c55e" if chp >= 0 else "#ef4444"
-        cards = [_trade_card(t, forecasts.get(sym)) for t in idx_rows] or [
-            html.Div("—", style={"color": "#334155", "fontSize": "0.7rem", "padding": "6px 0"})]
-        cols.append(dbc.Col([
-            html.Div([
-                html.Span(LABELS[sym], style={"color": cd, "fontWeight": "700", "fontSize": "0.68rem",
-                                              "letterSpacing": "0.08em"}),
-                html.Span(f"  {spot_v:,.0f} ", style={"color": "#cbd5e1", "fontSize": "0.6rem"}) if spot_v else "",
-                html.Span(f"{chp:+.2f}%" if spot_v else "", style={"color": spot_clr, "fontSize": "0.56rem"}),
-            ], style={"borderBottom": f"2px solid {cd}55", "paddingBottom": "5px", "marginBottom": "4px"}),
-            html.Div(cards),
-        ], md=3, style={"padding": "0 9px"}))
-
-    return html.Div([header, strat_banner, conductor, hour_zone, footprint, playbook, regime_radar, pred_dropdown,
-                     dbc.Row(cols, className="gx-0")],
-                    style={"background": BG_CARD, "border": "1px solid #111d2e",
-                           "borderRadius": "10px", "padding": "16px 18px"})
-
-
-@app.callback(
-    Output("sidebar-trades", "children"),
-    Input("setup-tick",      "n_intervals"),
-)
-def update_sidebar_trades(_):
-    return _render_sidebar_trades()
-
-
-@app.callback(
-    Output("sm-footprint", "children"),
-    Input("setup-tick",    "n_intervals"),
-)
-def update_sm_footprint(_):
-    return _render_smart_money_footprint()
-
-
 @app.callback(
     Output("itf-content", "children"),
     Input("itf-idx",    "value"),
@@ -4818,34 +4297,6 @@ def update_intraday_tf(sym, _):
 )
 def update_trend_matrix(_):
     return _render_trend_matrix()
-
-
-@app.callback(
-    Output("trade-book-panel", "children"),
-    Input("setup-tick",        "n_intervals"),
-    Input("sel-sym",           "data"),
-    Input("regime-asof",       "data"),
-)
-def update_trade_book(_, sel, asof_value):
-    if sel != "TRADES":
-        return no_update
-    # asof_value mirrors the Regime Radar 30-min dropdown ("now" or an ISO mark)
-    # via the regime-asof Store, so the selection persists across the 30s tick.
-    return _render_trade_book(asof_value)
-
-
-@app.callback(
-    Output("regime-asof",      "data"),
-    Input("regime-checkpoint", "value"),
-    State("regime-asof",       "data"),
-    prevent_initial_call=True,
-)
-def set_regime_asof(value, current):
-    # The dropdown is re-created on every Trade Book render, which re-fires this
-    # callback with the same value — pass no_update then, or it would loop.
-    if not value or value == current:
-        return no_update
-    return value
 
 
 def _liveoi_db_fallback(sym: str):
