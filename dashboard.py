@@ -3181,10 +3181,29 @@ def _scout_row(r):
                   f"conf {r['confidence']}%{rng}",
                   style={"color": "#94a3b8"}),
     ], style={**MONO, "fontSize": "0.66rem"})
+    # forward prediction over the selected horizon + (replay) grade
+    pdir = r.get("pred_dir", "RANGE")
+    pclr = {"UP": "#34d399", "DOWN": "#f87171"}.get(pdir, "#fbbf24")
+    pred_txt = (f"↪ next {r.get('horizon', r['tf'])}m: {pdir}"
+                + (f" → {r['pred_target']}" if r.get("pred_target") else "")
+                + (f"  band[{r['pred_lo']}, {r['pred_hi']}]" if r.get("pred_lo") else ""))
+    pred_kids = [html.Span(pred_txt, style={"color": pclr, "fontWeight": "700"})]
+    v = r.get("verify")
+    if v:
+        ok = v["dir_hit"]
+        pred_kids.append(html.Span(
+            f"   ⇒ actual {v['actual']} ({v['move_pct']:+.2f}%) "
+            f"{'HIT ✓' if ok else 'MISS ✗'}  band {'✓' if v['band_hit'] else '✗'}",
+            style={"color": "#22c55e" if ok else "#ef4444", "fontWeight": "700"}))
+    else:
+        pred_kids.append(html.Span("   ⇒ pending (advance the replay clock to grade)",
+                                   style={"color": "#475569"}))
+    pred = html.Div(pred_kids, style={**MONO, "fontSize": "0.6rem",
+                                      "paddingLeft": "120px", "lineHeight": "1.4"})
     why = html.Div(" · ".join(r["reasons"][:3]),
                    style={**MONO, "fontSize": "0.56rem", "color": "#64748b",
                           "paddingLeft": "120px", "lineHeight": "1.3"})
-    return html.Div([head, why],
+    return html.Div([head, pred, why],
                     style={"background": bg, "border": f"1px solid {clr if trade else '#1e293b'}",
                            "borderRadius": "5px", "padding": "5px 10px", "marginBottom": "4px"})
 
@@ -3194,12 +3213,21 @@ def _charts_scout_panel(tf_min, date, as_of_dt):
     rows = scout.scan(int(tf_min or 15), date, as_of_dt)
     when = (f"replay @ {as_of_dt:%H:%M}" if as_of_dt else "LIVE")
     n_trade = sum(1 for r in rows if r.get("has_data") and r["verdict"].startswith("TRADE"))
+    hits = sum(1 for r in rows if r.get("verify") and r["verify"]["dir_hit"])
+    graded = sum(1 for r in rows if r.get("verify"))
+    sb = (html.Span(f"  ·  scoreboard {hits}/{graded} hit",
+                    style={"color": "#22c55e" if hits * 2 >= graded else "#f87171",
+                           "fontSize": "0.62rem", "fontWeight": "700"})
+          if graded else
+          html.Span("  ·  predictions pending (advance the replay clock to grade)",
+                    style={"color": "#475569", "fontSize": "0.58rem"}))
     title = html.Div([
-        html.Span(f"🎯 SCOUT — {tf_min}m  ·  {when}  ·  ", style={
+        html.Span(f"🎯 SCOUT — predict next {tf_min}m  ·  {when}  ·  ", style={
             "color": "#34d399", "fontWeight": "700", "fontSize": "0.7rem",
             "letterSpacing": "0.05em"}),
         html.Span(f"{n_trade} trade{'s' if n_trade != 1 else ''} on the board",
                   style={"color": "#94a3b8", "fontSize": "0.62rem"}),
+        sb,
     ], style={"marginBottom": "5px"})
     note = html.Div("Direction is decision-support (null/contrarian in backtests); the "
                     "range band is the trustworthy product. Validate via backtest_suggestion.py.",

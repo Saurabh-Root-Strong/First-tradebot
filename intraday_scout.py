@@ -35,9 +35,17 @@ not a guarantee — the replay scoreboard is the arbiter.
 from __future__ import annotations
 
 import datetime
+import math
+import sys
 from typing import Optional
 
+import pandas as pd
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from core.constants import INDEX_SYMBOLS, STRIKE_STEP, LABELS, IST
+from core.mirror_io import read_mirror as _read_mirror
 import footprint_chart as fc
 import hour_forecast as hf
 
@@ -203,8 +211,76 @@ def _futures_signal(sym: str, tf_min: int, date, as_of) -> tuple[float, str]:
     return s, ("futures: " + ", ".join(bits)) if bits else "futures lean"
 
 
-def scan_index(sym: str, tf_min: int, date=None, as_of=None) -> dict:
-    """Per-index structural read at instant t. Returns a row dict (always)."""
+def _spot_at(sym: str, date, t) -> Optional[float]:
+    """Last traded price at or before t from the tick mirror (lookahead-bounded)."""
+    try:
+        tk = _read_mirror("ticks", date, t, sym)
+    except Exception:
+        return None
+    if tk is None or not len(tk):
+        return None
+    s = tk[tk["ts"] <= pd.Timestamp(t)]
+    if not len(s):
+        return None
+    return float(s.iloc[-1]["ltp"])
+
+
+def _verify(sym: str, date, as_of, horizon_min: int, spot0: float,
+            pdir: str, lo, hi) -> Optional[dict]:
+    """Grade the forward call against what ACTUALLY happened horizon_min after t.
+    Returns None when the future is not available yet (LIVE, or replay too close to
+    the close) — so live shows a pending prediction, replay shows a graded one.
+    The future read is the answer key only; it never feeds the prediction."""
+    if as_of is None or not spot0:
+        return None                       # live: t+H hasn't happened
+    t_end = as_of + datetime.timedelta(minutes=horizon_min)
+    try:
+        tk = _read_mirror("ticks", date, t_end, sym)
+    except Exception:
+        return None
+    if tk is None or not len(tk):
+        return None
+    mx = tk["ts"].max()
+    # require ticks to actually reach ~t+H, else the horizon isn't resolved yet
+    if pd.isna(mx) or mx < pd.Timestamp(t_end) - pd.Timedelta(minutes=2):
+        return None
+    s = tk[tk["ts"] <= pd.Timestamp(t_end)]
+    if not len(s):
+        return None
+    actual = float(s.iloc[-1]["ltp"])
+    move = (actual / spot0 - 1.0) * 100.0
+    in_band = (lo is not None and hi is not None and lo <= actual <= hi)
+    if pdir == "UP":
+        dir_hit = actual > spot0
+    elif pdir == "DOWN":
+        dir_hit = actual < spot0
+    else:                                 # RANGE call: hit if it stayed in band
+        dir_hit = in_band
+    return {"actual": round(actual, 2), "move_pct": round(move, 3),
+            "dir_hit": bool(dir_hit), "band_hit": bool(in_band)}
+
+
+def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:
+    """Forward prediction over horizon_min: UP/DOWN/RANGE + target + band.
+    Band scales the 60m realised-vol forecast by sqrt(H/60) (vol ~ sqrt time)."""
+    pdir = "UP" if direction == "CE" else "DOWN" if direction == "PE" else "RANGE"
+    if not spot or range_pct_60 is None:
+        return {"pdir": pdir, "target": None, "pred_lo": None, "pred_hi": None,
+                "move_pct": None}
+    band_pct = float(range_pct_60) * math.sqrt(max(horizon_min, 1) / 60.0)
+    band = spot * band_pct / 100.0
+    target = (round(spot + band, 1) if pdir == "UP"
+              else round(spot - band, 1) if pdir == "DOWN" else None)
+    return {"pdir": pdir, "target": target,
+            "pred_lo": round(spot - band, 1), "pred_hi": round(spot + band, 1),
+            "move_pct": round(band_pct, 3)}
+
+
+def scan_index(sym: str, tf_min: int, date=None, as_of=None,
+               horizon_min: Optional[int] = None) -> dict:
+    """Per-index structural read at instant t + forward prediction over horizon_min
+    (defaults to the bar timeframe) + verify (replay only). Returns a row dict."""
+    horizon_min = int(horizon_min or tf_min)
     label = LABELS.get(sym, sym)
     try:
         ser = fc.build_series(sym, tf_min, date, as_of)
@@ -246,9 +322,14 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None) -> dict:
     reasons = [parts[k][1] for k in ("flow", "div", "cross", "fut") if parts[k][1]]
     if tilt[1]:
         reasons.append(tilt[1])
+
+    # ── forward prediction over the selected horizon + replay verify ─────────────
+    fwd = _forward(direction, spot, fcst.get("exp_move_pct"), horizon_min)
+    verify = _verify(sym, date, as_of, horizon_min, spot,
+                     fwd["pdir"], fwd["pred_lo"], fwd["pred_hi"])
     return {
         "sym": sym, "label": label, "has_data": True,
-        "tf": tf_min, "spot": spot, "atm": atm,
+        "tf": tf_min, "horizon": horizon_min, "spot": spot, "atm": atm,
         "strength": round(strength, 3), "agree": agree, "active": active,
         "verdict": verdict, "direction": direction, "confidence": conf,
         "instrument": (f"{atm} {direction}" if direction and atm else ""),
@@ -257,12 +338,17 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None) -> dict:
         "range_lo": fcst.get("lo"), "range_hi": fcst.get("hi"),
         "range_pct": fcst.get("exp_move_pct"),
         "fc_dir": fcst.get("direction"), "p_up": fcst.get("p_up"),
+        # forward call (what happens NEXT over `horizon` min) + its grading
+        "pred_dir": fwd["pdir"], "pred_target": fwd["target"],
+        "pred_lo": fwd["pred_lo"], "pred_hi": fwd["pred_hi"],
+        "pred_move_pct": fwd["move_pct"], "verify": verify,
     }
 
 
-def scan(tf_min: int, date=None, as_of=None) -> list[dict]:
+def scan(tf_min: int, date=None, as_of=None,
+         horizon_min: Optional[int] = None) -> list[dict]:
     """Scan all four indices; rank tradables first by |strength|·agreement."""
-    rows = [scan_index(s, tf_min, date, as_of) for s in INDEX_SYMBOLS]
+    rows = [scan_index(s, tf_min, date, as_of, horizon_min) for s in INDEX_SYMBOLS]
 
     def _rank(r):
         if not r.get("has_data"):
@@ -285,9 +371,13 @@ if __name__ == "__main__":
         tf = int(sys.argv[3])
 
     when = f"{date} {as_of:%H:%M}" if as_of else "LIVE now"
-    print(f"\nINTRADAY SCOUT — {tf}m bars @ {when}")
+    rows = scan(tf, date, as_of)
+    hits = sum(1 for r in rows if r.get("verify") and r["verify"]["dir_hit"])
+    graded = sum(1 for r in rows if r.get("verify"))
+    sb = f"  ·  scoreboard {hits}/{graded} dir-hit" if graded else ""
+    print(f"\nINTRADAY SCOUT — predict next {tf}m @ {when}{sb}")
     print("=" * 74)
-    for r in scan(tf, date, as_of):
+    for r in rows:
         if not r.get("has_data"):
             print(f"  {r['label']:14s} {r['note']}")
             continue
@@ -296,10 +386,19 @@ if __name__ == "__main__":
         if r["instrument"]:
             head += f"  -> {r['instrument']}"
         print(head)
-        if r["range_lo"] is not None:
-            print(f"      range[{r['range_lo']}, {r['range_hi']}]  "
-                  f"({r['fc_dir']} p_up={r['p_up']})")
-        for why in r["reasons"][:4]:
+        # forward call + grade
+        pl = (f"      PREDICT next {r['horizon']}m: {r['pred_dir']}"
+              + (f" -> {r['pred_target']}" if r['pred_target'] else "")
+              + (f"  band[{r['pred_lo']}, {r['pred_hi']}]" if r['pred_lo'] else ""))
+        v = r.get("verify")
+        if v:
+            mark = "HIT ✓" if v["dir_hit"] else "MISS ✗"
+            pl += (f"   => actual {v['actual']} ({v['move_pct']:+.2f}%) "
+                   f"{mark}  band {'✓' if v['band_hit'] else '✗'}")
+        else:
+            pl += "   => (pending — future not reached)"
+        print(pl)
+        for why in r["reasons"][:3]:
             print(f"      - {why}")
     print("=" * 74)
     print("Direction is decision-support (null/contrarian in backtests); the RANGE")
