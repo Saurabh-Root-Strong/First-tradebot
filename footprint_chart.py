@@ -43,6 +43,14 @@ def _filter_expiry(c, kind: str):
     return sub, len(sub) > 0
 
 
+def _wallclock(idx):
+    """Drop tz so plotly plots naive IST wall-clock. Mirror timestamps are tz-aware
+    (UTC+05:30); plotly serializes the offset and the cursor spike re-applies it,
+    so a 11:32 bar shows '05:02 pm' on the crosshair while the axis ticks read IST.
+    Stripping tz makes axis ticks AND cursor spikes agree on the literal wall-clock."""
+    return idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
+
+
 def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") -> dict:
     """Return the bar series for `sym` at `tf_min` minutes. {'has_data': False, ...}
     until enough is captured. tf_min is the bar size AND the highlighted window.
@@ -66,8 +74,18 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
           .pivot_table(index="ts", columns="strike", values="ltp", aggfunc="last").sort_index())
     pe = (chain[chain["side"] == "PE"]
           .pivot_table(index="ts", columns="strike", values="ltp", aggfunc="last").sort_index())
+    # per-strike delta (signed: CE>0, PE<0) — to delta-adjust the ATM premium below.
+    _has_delta = "delta" in chain.columns
+    ce_d = (chain[chain["side"] == "CE"].pivot_table(index="ts", columns="strike",
+            values="delta", aggfunc="last").sort_index()) if _has_delta else None
+    pe_d = (chain[chain["side"] == "PE"].pivot_table(index="ts", columns="strike",
+            values="delta", aggfunc="last").sort_index()) if _has_delta else None
     common = np.array(sorted(set(ce.columns) & set(pe.columns)), dtype=float)
     straddle: dict = {}
+    atm_pce: dict = {}
+    atm_ppe: dict = {}
+    atm_dce: dict = {}
+    atm_dpe: dict = {}
     if common.size:
         # Only timestamps present on BOTH legs — a partial snapshot (CE without PE,
         # the known L2 capture gap) must skip, not KeyError and blank the whole chart.
@@ -79,7 +97,21 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
             cval, pval = ce.at[ts, k], pe.at[ts, k]
             if pd.notna(cval) and pd.notna(pval):
                 straddle[ts] = float(cval) + float(pval)
+                atm_pce[ts] = float(cval)        # per-leg ATM premium AT strike k —
+                atm_ppe[ts] = float(pval)        # same strike as the delta below
+            if ce_d is not None and k in ce_d.columns and ts in ce_d.index:
+                dv = ce_d.at[ts, k]
+                if pd.notna(dv):
+                    atm_dce[ts] = float(dv)
+            if pe_d is not None and k in pe_d.columns and ts in pe_d.index:
+                dv = pe_d.at[ts, k]
+                if pd.notna(dv):
+                    atm_dpe[ts] = float(dv)
     strad = pd.Series(straddle, dtype=float).sort_index()
+    atm_pce_s = pd.Series(atm_pce, dtype=float).sort_index()
+    atm_ppe_s = pd.Series(atm_ppe, dtype=float).sort_index()
+    atm_dce_s = pd.Series(atm_dce, dtype=float).sort_index()
+    atm_dpe_s = pd.Series(atm_dpe, dtype=float).sort_index()
 
     # Cumulative day option volume (summed across strikes) — per-bar later via diff.
     cum_vol = chain.groupby("ts")["volume"].sum().sort_index()
@@ -110,8 +142,14 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
     df["cum_vol"] = cum_vol.reindex(idx, method="ffill")
     df["spot"]    = spot_at.reindex(idx, method="ffill")
     df["iv_atm"]  = iv_atm.reindex(idx, method="ffill") if iv_atm is not None else np.nan
-    df["prem_ce"] = prem_ce.reindex(idx, method="ffill") if prem_ce is not None else np.nan
-    df["prem_pe"] = prem_pe.reindex(idx, method="ffill") if prem_pe is not None else np.nan
+    # classifier premium = the ATM-strike (k) leg premium from the chain — SAME strike
+    # as the delta below (consistent residual); fall back to oi_snapshots ATM premium.
+    df["prem_ce"] = (atm_pce_s.reindex(idx, method="ffill") if len(atm_pce_s)
+                     else prem_ce.reindex(idx, method="ffill") if prem_ce is not None else np.nan)
+    df["prem_pe"] = (atm_ppe_s.reindex(idx, method="ffill") if len(atm_ppe_s)
+                     else prem_pe.reindex(idx, method="ffill") if prem_pe is not None else np.nan)
+    df["dlt_ce"]  = atm_dce_s.reindex(idx, method="ffill") if len(atm_dce_s) else np.nan
+    df["dlt_pe"]  = atm_dpe_s.reindex(idx, method="ffill") if len(atm_dpe_s) else np.nan
 
     # Resample to tf-minute bars: point-in-time (last) for level series; volume is the
     # in-bar increment of the cumulative total.
@@ -125,6 +163,8 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
         "iv_atm":  rs["iv_atm"].last(),
         "prem_ce": rs["prem_ce"].last(),
         "prem_pe": rs["prem_pe"].last(),
+        "dlt_ce":  rs["dlt_ce"].last(),
+        "dlt_pe":  rs["dlt_pe"].last(),
     }).dropna(how="all")
     bar = bar[bar[["premium", "cum_vol"]].notna().any(axis=1)]
     if not len(bar):
@@ -155,32 +195,42 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
         return [None if pd.isna(v) else round(float(v), 2) for v in s]
 
     # ── Positioning flow: who was AGGRESSIVE each bar, per side ──────────────────
-    # Standard OI-premium 4-quadrant, per leg (the leg's OWN ATM premium):
-    #   OI up   + premium up   -> long BUILDUP (aggressive BUYING)
-    #   OI up   + premium flat/down -> short BUILDUP (WRITING, "eating premium")
-    #   OI down + premium up   -> short COVERING ;  OI down + premium down -> long UNWINDING
-    # NOTE: ATM premium also carries ~half the underlying move (delta ~0.5), so on a
-    # strong directional bar the label leans with price — the convention every desk uses.
-    # (ATM IV is a single market-wide value here — kept only as the context line, never
-    # as the per-leg splitter, since atm_call_iv == atm_put_iv in the feed.)
+    # Standard OI-premium 4-quadrant, per leg, but on the DELTA-ADJUSTED premium
+    # residual (residual = Δprem − delta·Δindex), NOT raw Δprem:
+    #   OI up   + residual up   -> long BUILDUP (aggressive BUYING)
+    #   OI up   + residual<=0   -> short BUILDUP (WRITING, "eating premium")
+    #   OI down + residual up   -> short COVERING ; OI down + residual<=0 -> long UNWINDING
+    # WHY residual: ATM premium carries delta·(index move), so raw Δprem makes CE
+    # echo "buy" on any up-bar and PE "buy" on any down-bar — the label just tracks
+    # price on a trending bar. Stripping delta·Δindex isolates true demand. delta is
+    # the REAL captured ATM delta (signed: CE>0, PE<0), so one uniform formula covers
+    # both legs — identical to build_strike_series + overnight_reconciliation. Delta
+    # absent (legacy days) -> .fillna(0) falls back to raw Δprem (old behaviour).
+    # LIMITATION: this pairs TOTAL CE/PE OI change with the ATM strike's premium, so
+    # the aggregate buy/write is indicative; the per-strike chart is the precise read.
+    # (ATM IV is one market-wide value here — context line only, never the splitter,
+    # since atm_call_iv == atm_put_iv in the feed.)
     d_oi_ce, d_oi_pe = bar["oi_ce"].diff(), bar["oi_pe"].diff()
-    d_pr_ce, d_pr_pe = bar["prem_ce"].diff(), bar["prem_pe"].diff()
+    d_spot = bar["spot"].diff()
+    res_ce = bar["prem_ce"].diff() - bar["dlt_ce"].fillna(0.0) * d_spot
+    res_pe = bar["prem_pe"].diff() - bar["dlt_pe"].fillna(0.0) * d_spot
     eps_ce = max(1.0, 0.10 * float(d_oi_ce.abs().median() or 0))
     eps_pe = max(1.0, 0.10 * float(d_oi_pe.abs().median() or 0))
 
-    def _act(d_oi, d_pr, eps):
+    def _act(d_oi, resid, eps):
         if pd.isna(d_oi) or abs(d_oi) < eps:
             return "flat"
         if d_oi > 0:                                              # OI building
-            return "buy" if (pd.notna(d_pr) and d_pr > 0) else "write"
-        return "cover" if (pd.notna(d_pr) and d_pr > 0) else "unwind"   # OI falling
+            return "buy" if (pd.notna(resid) and resid > 0) else "write"
+        return "cover" if (pd.notna(resid) and resid > 0) else "unwind"   # OI falling
 
-    ce_act = [_act(o, p, eps_ce) for o, p in zip(d_oi_ce, d_pr_ce)]
-    pe_act = [_act(o, p, eps_pe) for o, p in zip(d_oi_pe, d_pr_pe)]
+    ce_act = [_act(o, r, eps_ce) for o, r in zip(d_oi_ce, res_ce)]
+    pe_act = [_act(o, r, eps_pe) for o, r in zip(d_oi_pe, res_pe)]
 
+    _wc = _wallclock(bar.index)
     return {
         "has_data": True, "sym": sym, "tf": tf_min,
-        "ts":      [t.to_pydatetime() for t in bar.index],
+        "ts":      [t.to_pydatetime() for t in _wc],
         "premium": [None if pd.isna(v) else round(float(v), 2) for v in bar["premium"]],
         "oi_ce":   [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in bar["oi_ce"]],
         "oi_pe":   [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in bar["oi_pe"]],
@@ -192,7 +242,7 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
         "d_oi_ce": [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in d_oi_ce],
         "d_oi_pe": [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in d_oi_pe],
         "ce_act":  ce_act, "pe_act": pe_act,
-        "last_ts": bar.index[-1].to_pydatetime(),
+        "last_ts": _wc[-1].to_pydatetime(),
     }
 
 
@@ -281,9 +331,10 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
     def _c(s):
         return [None if (s is None or pd.isna(v)) else round(float(v), 2) for v in (s if s is not None else [])]
 
+    _wc = _wallclock(bar.index)
     return {
         "has_data": True, "sym": sym, "tf": tf_min, "leg": leg,
-        "ts":     [t.to_pydatetime() for t in bar.index],
+        "ts":     [t.to_pydatetime() for t in _wc],
         "open":   _c(bar["o"]), "high": _c(bar["h"]), "low": _c(bar["l"]), "close": _c(bar["c"]),
         "near":   _c(bar.get("near_ltp")), "next": _c(bar.get("next_ltp")), "far": _c(bar.get("far_ltp")),
         "basis":  _c(bar.get("near_basis")),
@@ -295,7 +346,7 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
         "term":   [None if (term is None or pd.isna(v)) else str(v) for v in (term if term is not None else [None] * len(bar))],
         "oi":     _c(oi_lakh), "d_oi": _c(d_oi), "fut_act": fut_act,
         "has_oi": oi_lakh is not None,
-        "last_ts": bar.index[-1].to_pydatetime(),
+        "last_ts": _wc[-1].to_pydatetime(),
     }
 
 
@@ -433,13 +484,14 @@ def build_strike_series(sym: str, tf_min: int, strike: int, date=None, as_of=Non
     ce_oi, ce_prem, ce_vol, ce_doi, ce_act = _legbars(ce)
     pe_oi, pe_prem, pe_vol, pe_doi, pe_act = _legbars(pe)
 
+    _wc = _wallclock(idx)
     return {
         "has_data": True, "sym": sym, "tf": tf_min, "strike": int(strike),
-        "ts":    [t.to_pydatetime() for t in idx],
+        "ts":    [t.to_pydatetime() for t in _wc],
         "open":  _col(ohlc.get("o")), "high": _col(ohlc.get("h")),
         "low":   _col(ohlc.get("l")), "close": _col(ohlc.get("c")),
         "ce_oi": ce_oi, "pe_oi": pe_oi, "ce_prem": ce_prem, "pe_prem": pe_prem,
         "ce_vol": ce_vol, "pe_vol": pe_vol, "ce_doi": ce_doi, "pe_doi": pe_doi,
         "ce_act": ce_act, "pe_act": pe_act,
-        "last_ts": idx[-1].to_pydatetime(),
+        "last_ts": _wc[-1].to_pydatetime(),
     }
