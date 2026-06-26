@@ -334,6 +334,7 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     if as_of is None or direction not in ("CE", "PE"):
         return None
     side = direction
+    want = f"TRADE {direction}"
     # ── trigger time: walk back on the tf grid while it stayed the same TRADE ─────
     trig_t = as_of
     for i in range(1, 13):
@@ -342,10 +343,25 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
             break
         r_i = scan_index(sym, tf_min, date=date, as_of=t_i,
                          horizon_min=horizon_min, with_lifecycle=False)
-        if r_i.get("verdict") == f"TRADE {direction}":
+        if r_i.get("verdict") == want:
             trig_t = t_i
         else:
             break
+    # ── refine to the EXACT MINUTE the gate first fired, inside the bar before the
+    # coarse grid trigger (the prior grid bar was NOT this trade, so the cross is in
+    # between). Step a minute at a time; first TRADE minute = the real entry time
+    # (12:27, not 12:30). Step widens for longer TFs to bound the scan cost. ───────
+    step = max(1, tf_min // 15)
+    t_lo = trig_t - datetime.timedelta(minutes=tf_min)
+    m = t_lo + datetime.timedelta(minutes=step)
+    while m < trig_t:
+        if m.time() >= _MKT_OPEN:
+            rm = scan_index(sym, tf_min, date=date, as_of=m,
+                            horizon_min=horizon_min, with_lifecycle=False)
+            if rm.get("verdict") == want:
+                trig_t = m
+                break
+        m += datetime.timedelta(minutes=step)
     # ── entry strike = the ATM at trigger (what you'd actually have bought) ───────
     spot_trig = _spot_at(sym, date, trig_t)
     trig_atm = _atm(spot_trig, sym) if spot_trig else None
