@@ -1485,9 +1485,22 @@ app.layout = dbc.Container([
                                                    id="charts-help-title"), close_button=True),
                     dbc.ModalBody(html.Div(_charts_help("options"), id="charts-help-box")),
                 ], id="charts-help-modal", is_open=False, size="lg", scrollable=True),
-                dcc.Loading(dcc.Graph(id="charts-graph",
-                            config={"displayModeBar": False}),
-                            type="circle", color="#a78bfa"),
+                dcc.Loading(dcc.Graph(
+                    id="charts-graph",
+                    config={
+                        # zoom modebar (+ / − / autoscale / reset) + scroll-zoom,
+                        # plus draw tools for support/resistance lines. 'drawline'
+                        # = draw an S/R line (drag flat for a level); 'eraseshape'
+                        # removes one. Shapes are editable (edits.shapePosition) so
+                        # a level can be dragged after drawing.
+                        "displayModeBar": True, "displaylogo": False,
+                        "scrollZoom": True,
+                        "modeBarButtonsToAdd": ["drawline", "drawrect", "eraseshape"],
+                        "modeBarButtonsToRemove": ["lasso2d", "select2d",
+                                                   "toggleSpikelines"],
+                        "edits": {"shapePosition": True},
+                    }),
+                    type="circle", color="#a78bfa"),
                 # Descriptive positioning map (Options mode only): where today's
                 # live OI is REINFORCING vs ABANDONING last night's EOD positions,
                 # per strike, anchored to the DCM EOD baseline. CONTEXT, not a call
@@ -3933,7 +3946,13 @@ def _crosshair(fig: "go.Figure") -> "go.Figure":
                      spikedash="dot", spikecolor="#7dd3fc", spikethickness=1)
     fig.update_yaxes(showspikes=True, spikemode="across", spikesnap="cursor",
                      spikedash="dot", spikecolor="#7dd3fc", spikethickness=1)
-    fig.update_layout(hovermode="closest", spikedistance=-1, hoverdistance=100)
+    # Hand-drawn support/resistance lines (modebar 'drawline'): amber dashed, the
+    # classic S/R look. dragmode stays 'zoom' so +/- and box-zoom work by default;
+    # the user clicks the draw tool to switch. Shapes are editable/movable (config
+    # edits.shapePosition) so a level can be nudged after drawing.
+    fig.update_layout(hovermode="closest", spikedistance=-1, hoverdistance=100,
+                      newshape=dict(line=dict(color="#fbbf24", width=1.5, dash="dash"),
+                                    opacity=0.9))
     return fig
 
 
@@ -4040,6 +4059,9 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly"
     fig.update_xaxes(rangeslider_visible=False)   # candlestick adds one by default
     for a in fig["layout"]["annotations"]:        # subplot titles
         a["font"] = dict(size=10.5, color="#94a3b8")
+    # keep user zoom + hand-drawn S/R lines across figure refreshes; reset only
+    # when the index/timeframe changes (old levels don't apply to a new chart)
+    fig.update_layout(uirevision=f"{sym}-{tf_min}")
     return _crosshair(fig)
 
 
@@ -4124,6 +4146,9 @@ def _strike_fig(sym, tf_min: int, strike: int, asof_value=None, date=None, expir
     fig.update_xaxes(rangeslider_visible=False)
     for a in fig["layout"]["annotations"]:
         a["font"] = dict(size=10.5, color="#94a3b8")
+    # keep user zoom + hand-drawn S/R lines across figure refreshes; reset only
+    # when the index/timeframe changes (old levels don't apply to a new chart)
+    fig.update_layout(uirevision=f"{sym}-{tf_min}")
     return _crosshair(fig)
 
 
@@ -4220,6 +4245,9 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None, leg="near") -> "g
     fig.update_xaxes(rangeslider_visible=False)
     for a in fig["layout"]["annotations"]:
         a["font"] = dict(size=10.5, color="#94a3b8")
+    # keep user zoom + hand-drawn S/R lines across figure refreshes; reset only
+    # when the index/timeframe changes (old levels don't apply to a new chart)
+    fig.update_layout(uirevision=f"{sym}-{tf_min}")
     return _crosshair(fig)
 
 
