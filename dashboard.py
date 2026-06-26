@@ -1467,6 +1467,13 @@ app.layout = dbc.Container([
                             style={"fontSize": "0.72rem"}),
                     ], size="sm"), md=3),
                 ], className="mb-2 align-items-center"),
+                # SCOUT — multi-index TRADE/NO-TRADE scan at the chosen TF + replay
+                # clock. Scans all 4 indices off the SAME series these charts plot;
+                # says which index has the cleanest crossover/divergence/flow setup
+                # right now (or under the Replay cutoff). Decision-support — direction
+                # is null/contrarian in backtests, the range band is the honest part.
+                dcc.Loading(html.Div(id="charts-scout", style={"marginBottom": "10px"}),
+                            type="circle", color="#34d399"),
                 # Mode-aware help in a POPUP — opens over the chart, closes via the X /
                 # click-outside, so it never covers or pushes the chart down.
                 dbc.Button("ℹ what is this · how to read", id="charts-help-btn",
@@ -3149,6 +3156,83 @@ def _charts_recon_panel(sym, date, as_of_dt):
 def _recon_note(msg):
     return html.Div(msg, style={**MONO, "fontSize": "0.6rem", "color": "#475569",
                                 "padding": "6px 12px", "fontStyle": "italic"})
+
+
+# ── SCOUT panel: multi-index TRADE/NO-TRADE scan ─────────────────────────────────
+def _scout_row(r):
+    """One index row in the scout strip."""
+    if not r.get("has_data"):
+        return html.Div(f"{r['label']}: {r.get('note','warming up')}",
+                        style={**MONO, "fontSize": "0.6rem", "color": "#475569",
+                               "padding": "3px 10px"})
+    trade = r["verdict"].startswith("TRADE")
+    side  = r.get("direction")
+    clr   = ("#34d399" if side == "CE" else "#f87171") if trade else "#64748b"
+    bg    = "#0c1f17" if (trade and side == "CE") else "#1f0c0c" if (trade and side == "PE") else "#0a1020"
+    rng   = (f"  range [{r['range_lo']}, {r['range_hi']}]"
+             if r.get("range_lo") is not None else "")
+    head = html.Div([
+        html.Span(r["label"], style={"fontWeight": "700", "minWidth": "120px",
+                                     "display": "inline-block", "color": "#e2e8f0"}),
+        html.Span(r["verdict"] + (f" · {r['instrument']}" if r.get("instrument") else ""),
+                  style={"fontWeight": "700", "color": clr, "minWidth": "150px",
+                         "display": "inline-block"}),
+        html.Span(f"str {r['strength']:+.2f}  agree {r['agree']}/{r['active']}  "
+                  f"conf {r['confidence']}%{rng}",
+                  style={"color": "#94a3b8"}),
+    ], style={**MONO, "fontSize": "0.66rem"})
+    why = html.Div(" · ".join(r["reasons"][:3]),
+                   style={**MONO, "fontSize": "0.56rem", "color": "#64748b",
+                          "paddingLeft": "120px", "lineHeight": "1.3"})
+    return html.Div([head, why],
+                    style={"background": bg, "border": f"1px solid {clr if trade else '#1e293b'}",
+                           "borderRadius": "5px", "padding": "5px 10px", "marginBottom": "4px"})
+
+
+def _charts_scout_panel(tf_min, date, as_of_dt):
+    import intraday_scout as scout
+    rows = scout.scan(int(tf_min or 15), date, as_of_dt)
+    when = (f"replay @ {as_of_dt:%H:%M}" if as_of_dt else "LIVE")
+    n_trade = sum(1 for r in rows if r.get("has_data") and r["verdict"].startswith("TRADE"))
+    title = html.Div([
+        html.Span(f"🎯 SCOUT — {tf_min}m  ·  {when}  ·  ", style={
+            "color": "#34d399", "fontWeight": "700", "fontSize": "0.7rem",
+            "letterSpacing": "0.05em"}),
+        html.Span(f"{n_trade} trade{'s' if n_trade != 1 else ''} on the board",
+                  style={"color": "#94a3b8", "fontSize": "0.62rem"}),
+    ], style={"marginBottom": "5px"})
+    note = html.Div("Direction is decision-support (null/contrarian in backtests); the "
+                    "range band is the trustworthy product. Validate via backtest_suggestion.py.",
+                    style={"color": "#475569", "fontSize": "0.52rem", "marginTop": "4px",
+                           "fontStyle": "italic", "lineHeight": "1.3"})
+    return html.Div([title] + [_scout_row(r) for r in rows] + [note],
+                    style={"background": "#070d18", "border": "1px solid #1e293b",
+                           "borderRadius": "6px", "padding": "8px 12px"})
+
+
+@app.callback(
+    Output("charts-scout", "children"),
+    Input("charts-tf",   "value"),
+    Input("charts-asof", "value"),
+    Input("news-date",   "data"),
+    Input("sel-sym",     "data"),
+)
+def _update_charts_scout(tf, asof, date, sel):
+    """Multi-index TRADE/NO-TRADE scan at the chosen TF + replay clock (all modes)."""
+    from dash.exceptions import PreventUpdate
+    if sel != "CHARTS":
+        raise PreventUpdate
+    date = date or None
+    as_of_dt = None
+    if asof and asof != "full" and date:
+        try:
+            as_of_dt = datetime.datetime.fromisoformat(f"{date}T{asof}:00+05:30")
+        except Exception:
+            as_of_dt = None
+    try:
+        return _charts_scout_panel(tf, date, as_of_dt)
+    except Exception as exc:
+        return _recon_note(f"Scout unavailable ({type(exc).__name__}: {exc}).")
 
 
 @app.callback(
