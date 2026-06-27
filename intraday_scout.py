@@ -380,7 +380,10 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     entry = _opt_premium(sym, date, trig_t, trig_atm, side) if trig_atm else None
     cur = _opt_premium(sym, date, as_of, trig_atm, side) if trig_atm else None
     sl_pct, t1_pct = _SLT.get(tf_min, (0.32, 0.55))
+    cur_spot = _spot_at(sym, date, as_of)
     out = {"trigger": trig_t.strftime("%H:%M"), "entry_strike": trig_atm,
+           "entry_spot": round(spot_trig, 2) if spot_trig else None,   # INDEX level at trigger
+           "cur_spot": round(cur_spot, 2) if cur_spot else None,       # INDEX level now
            "entry_prem": round(entry, 2) if entry else None,
            "cur_prem": round(cur, 2) if cur else None,
            "sl": round(entry * (1 - sl_pct), 2) if entry else None,
@@ -584,7 +587,8 @@ if __name__ == "__main__":
         lc = r.get("lifecycle")
         if lc:
             pnl = f" ({lc['pnl_pct']:+.0f}%)" if lc.get("pnl_pct") is not None else ""
-            print(f"      TRADE {r['expiry']}: triggered {lc['trigger']}  "
+            print(f"      TRADE {r['expiry']}: triggered {lc['trigger']} @ index "
+                  f"{lc.get('entry_spot')} → {lc.get('cur_spot')}  "
                   f"entry {lc['entry_strike']} {r['direction']} ₹{lc['entry_prem']} "
                   f"→ now ₹{lc['cur_prem']}{pnl}  SL ₹{lc['sl']} T ₹{lc['target']}  "
                   f"=> {lc['manage']}")

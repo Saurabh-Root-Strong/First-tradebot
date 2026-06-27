@@ -3177,6 +3177,30 @@ def _recon_note(msg):
 
 
 # ── SCOUT panel: multi-index TRADE/NO-TRADE scan ─────────────────────────────────
+# Hover-tooltip copy (native `title`) so the panel explains itself.
+_TIP_VERDICT = ("TRADE = anchor FLOW agrees AND >=1 INDEPENDENT family (cross/fut) "
+                "agrees, |strength|>=0.22. NO-TRADE = not enough independent agreement. "
+                "Direction is decision-support only — measured negative-EV in backtests; "
+                "the RANGE band is the validated part, not the arrow.")
+_TIP_STR = ("strength [-1,1] = weighted blend: flow 0.40 (delta-adjusted OI demand), "
+            "div 0.25 (price vs OI), fut 0.20 (futures), cross 0.15 (OI-tilt flip). "
+            "conf = |strength| rescaled — NOT a win probability.")
+_TIP_AGREE = ("Independent families agreeing with the call: flow (anchor) + cross "
+              "(OI-tilt flip) + fut (futures). div shares data with flow so it is "
+              "confirmation only and never counted here.")
+_TIP_RANGE = ("60-MIN volatility cone: spot ± ~1 std-dev of expected move over the "
+              "next hour. Price stays inside ~70% of the time (sized that way by "
+              "design). Tells you HOW FAR it can travel, not which way — use for "
+              "stops / targets / position sizing.")
+_TIP_BAND = ("NEXT-TF volatility cone: spot ± ~1 std-dev expected move over the "
+             "selected timeframe (the 15m/etc cone, narrower than the 60m range "
+             "above). band ✓ = price stayed inside (~70% case); band ✗ = it broke "
+             "out (the ~30% big move). HOW FAR, not which way.")
+_TIP_TRIG = ("Trade lifecycle: the EXACT minute the gate first fired, the INDEX level "
+             "and ATM option premium at that instant, SL/target on the premium, live "
+             "P&L, and the manage call (CLOSE / HOLD / BOOK).")
+
+
 def _scout_row(r):
     """One index row in the scout strip."""
     if not r.get("has_data"):
@@ -3187,22 +3211,29 @@ def _scout_row(r):
     side  = r.get("direction")
     clr   = ("#34d399" if side == "CE" else "#f87171") if trade else "#64748b"
     bg    = "#0c1f17" if (trade and side == "CE") else "#1f0c0c" if (trade and side == "PE") else "#0a1020"
-    rng   = (f"  range [{r['range_lo']}, {r['range_hi']}]"
-             if r.get("range_lo") is not None else "")
     inst = (f" · {r['instrument']}" if r.get("instrument") else "")
     if trade and r.get("expiry"):
         inst += f" ({r['expiry']})"
     if r.get("thin"):
         inst += "  ⚠ thin"
+    _ul = {"textDecoration": "underline dotted", "cursor": "help"}
+    metrics = [
+        html.Span(f"str {r['strength']:+.2f}  ", title=_TIP_STR,
+                  style={"color": "#94a3b8", **_ul}),
+        html.Span(f"agree {r['agree']}/{r['active']}  ", title=_TIP_AGREE,
+                  style={"color": "#94a3b8", **_ul}),
+        html.Span(f"conf {r['confidence']}%", title=_TIP_STR, style={"color": "#94a3b8"}),
+    ]
+    if r.get("range_lo") is not None:
+        metrics.append(html.Span(f"  range [{r['range_lo']}, {r['range_hi']}]",
+                                 title=_TIP_RANGE, style={"color": "#94a3b8", **_ul}))
     head = html.Div([
         html.Span(r["label"], style={"fontWeight": "700", "minWidth": "120px",
                                      "display": "inline-block", "color": "#e2e8f0"}),
-        html.Span(r["verdict"] + inst,
+        html.Span(r["verdict"] + inst, title=_TIP_VERDICT,
                   style={"fontWeight": "700", "color": clr, "minWidth": "160px",
-                         "display": "inline-block"}),
-        html.Span(f"str {r['strength']:+.2f}  agree {r['agree']}/{r['active']}  "
-                  f"conf {r['confidence']}%{rng}",
-                  style={"color": "#94a3b8"}),
+                         "display": "inline-block", "cursor": "help"}),
+        html.Span(metrics),
     ], style={**MONO, "fontSize": "0.66rem"})
     # OPEN TRADE lifecycle: when it triggered, entry/SL/target, live P&L, manage call
     lc = r.get("lifecycle")
@@ -3213,8 +3244,12 @@ def _scout_row(r):
         mclr = "#ef4444" if mng.startswith("CLOSE") else "#22c55e" if mng.startswith("BOOK") else "#34d399"
         pnl = lc.get("pnl_pct")
         pnlclr = "#22c55e" if (pnl or 0) > 0 else "#ef4444" if (pnl or 0) < 0 else "#94a3b8"
+        idx_seg = (f"@ index {lc.get('entry_spot')}→{lc.get('cur_spot')}  "
+                   if lc.get("entry_spot") is not None else "")
         trade_blk = html.Div([
-            html.Span(f"⏱ triggered {lc['trigger']}  ", style={"color": "#fbbf24", "fontWeight": "700"}),
+            html.Span(f"⏱ triggered {lc['trigger']} ", title=_TIP_TRIG,
+                      style={"color": "#fbbf24", "fontWeight": "700", "cursor": "help"}),
+            html.Span(idx_seg, style={"color": "#93c5fd"}),   # INDEX level at trigger → now
             html.Span(f"entry {lc.get('entry_strike')} {side} ₹{lc.get('entry_prem')} "
                       f"→ ₹{lc.get('cur_prem')} ", style={"color": "#cbd5e1"}),
             html.Span((f"({pnl:+.0f}%)  " if pnl is not None else ""), style={"color": pnlclr, "fontWeight": "700"}),
@@ -3229,7 +3264,8 @@ def _scout_row(r):
     pred_txt = (f"↪ next {r.get('horizon', r['tf'])}m: {pdir}"
                 + (f" → {r['pred_target']}" if r.get("pred_target") else "")
                 + (f"  band[{r['pred_lo']}, {r['pred_hi']}]" if r.get("pred_lo") else ""))
-    pred_kids = [html.Span(pred_txt, style={"color": pclr, "fontWeight": "700"})]
+    pred_kids = [html.Span(pred_txt, title=_TIP_BAND,
+                           style={"color": pclr, "fontWeight": "700", "cursor": "help"})]
     v = r.get("verify")
     if v:
         ok = v["dir_hit"]
