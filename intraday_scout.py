@@ -345,33 +345,40 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
         return None
     side = direction
     want = f"TRADE {direction}"
+
+    def _is_trade(t):
+        return scan_index(sym, tf_min, date=date, as_of=t,
+                          with_lifecycle=False, verdict_only=True).get("verdict") == want
+
     # ── trigger time: walk back on the tf grid while it stayed the same TRADE ─────
     trig_t = as_of
     for i in range(1, 13):
         t_i = as_of - datetime.timedelta(minutes=tf_min * i)
         if t_i.time() < _MKT_OPEN:
             break
-        r_i = scan_index(sym, tf_min, date=date, as_of=t_i,
-                         horizon_min=horizon_min, with_lifecycle=False)
-        if r_i.get("verdict") == want:
+        if _is_trade(t_i):
             trig_t = t_i
         else:
             break
     # ── refine to the EXACT MINUTE the gate first fired, inside the bar before the
-    # coarse grid trigger (the prior grid bar was NOT this trade, so the cross is in
-    # between). Step a minute at a time; first TRADE minute = the real entry time
-    # (12:27, not 12:30). Step widens for longer TFs to bound the scan cost. ───────
-    step = max(1, tf_min // 15)
-    t_lo = trig_t - datetime.timedelta(minutes=tf_min)
-    m = t_lo + datetime.timedelta(minutes=step)
-    while m < trig_t:
-        if m.time() >= _MKT_OPEN:
-            rm = scan_index(sym, tf_min, date=date, as_of=m,
-                            horizon_min=horizon_min, with_lifecycle=False)
-            if rm.get("verdict") == want:
-                trig_t = m
-                break
-        m += datetime.timedelta(minutes=step)
+    # coarse grid trigger. BINARY SEARCH the boundary (prior grid bar was NOT this
+    # trade, trig_t IS): find the earliest minute that is already TRADE → real entry
+    # time (12:27, not 12:30). ~log2(tf) probes instead of tf linear. ─────────────
+    lo = trig_t - datetime.timedelta(minutes=tf_min)            # known NOT-trade side
+    hi = trig_t                                                 # known trade side
+    if lo.time() < _MKT_OPEN:
+        lo = trig_t.replace(hour=_MKT_OPEN.hour, minute=_MKT_OPEN.minute,
+                            second=0, microsecond=0)
+    while (hi - lo) > datetime.timedelta(minutes=1):
+        mid = lo + (hi - lo) / 2
+        mid = mid.replace(second=0, microsecond=0)
+        if mid <= lo:
+            break
+        if _is_trade(mid):
+            hi = mid
+        else:
+            lo = mid
+    trig_t = hi
     # ── entry strike = the ATM at trigger (what you'd actually have bought) ───────
     spot_trig = _spot_at(sym, date, trig_t)
     trig_atm = _atm(spot_trig, sym) if spot_trig else None
@@ -431,11 +438,14 @@ def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:
 
 
 def scan_index(sym: str, tf_min: int, date=None, as_of=None,
-               horizon_min: Optional[int] = None, with_lifecycle: bool = True) -> dict:
+               horizon_min: Optional[int] = None, with_lifecycle: bool = True,
+               verdict_only: bool = False) -> dict:
     """Per-index structural read at instant t + forward prediction over horizon_min
     (defaults to the bar timeframe) + verify (replay only) + trade lifecycle
     (trigger time / SL / target / CLOSE-HOLD). with_lifecycle=False inside the
-    lookback scan to avoid recursion. Returns a row dict."""
+    lookback scan to avoid recursion. verdict_only=True returns just the gate
+    verdict/strength/spot (skips hour_forecast + verify + forward) — the cheap probe
+    the lifecycle walk-back/refine uses, ~3-5x faster per call."""
     horizon_min = int(horizon_min or tf_min)
     label = LABELS.get(sym, sym)
     try:
@@ -473,10 +483,6 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
               + sum(1 for k in ("cross", "fut") if parts[k][0] != 0))
 
     spot = (_last(ser.get("spot") or [], 1) or [None])[-1]
-    try:
-        fcst = hf.forecast(sym, as_of=as_of, date=date)         # honest range band
-    except Exception:
-        fcst = {}
     atm = _atm(spot, sym)
 
     # ── verdict gate: anchor flow MUST agree + ≥1 INDEPENDENT family corroborates ─
@@ -488,7 +494,17 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     else:
         direction = ""
         verdict = "NO-TRADE"
+
+    # Fast path for lifecycle probing — skip the expensive forecast/verify/forward.
+    if verdict_only:
+        return {"sym": sym, "has_data": True, "verdict": verdict,
+                "direction": direction, "strength": round(strength, 3), "spot": spot}
+
     conf = int(round(min(abs(strength) / 0.6, 1.0) * 100))
+    try:
+        fcst = hf.forecast(sym, as_of=as_of, date=date)         # honest range band
+    except Exception:
+        fcst = {}
 
     reasons = []
     for k in ("flow", "div", "cross", "fut"):

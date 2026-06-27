@@ -7,10 +7,24 @@ IST-localised ts, optional symbol filter, optional lookahead-free as_of cutoff.
 from __future__ import annotations
 
 import datetime
+import functools
 
 import pandas as pd
 
 from .constants import IST, LIVE_DIR, today_iso
+
+
+@functools.lru_cache(maxsize=32)
+def _load_processed(path_str: str, _mtime_ns: int, _size: int) -> "pd.DataFrame":
+    """Parse + normalise a mirror parquet ONCE (ts→IST, epoch-junk dropped, sorted).
+    Cached by (path, mtime, size) so repeated reads of a STATIC past-day file (the
+    scout/backtest replay hammers the same file hundreds of times per render) skip
+    the disk read + re-parse. A changed file (live append) gets a new mtime → new
+    cache entry, so it is never stale. Only used for past days (see read_mirror)."""
+    df = pd.read_parquet(path_str)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
+    df = df[df["ts"] >= pd.Timestamp("2000-01-01", tz=IST)]
+    return df.sort_values("ts").reset_index(drop=True)
 
 
 def read_mirror(tbl: str, date: str | None = None,
@@ -23,22 +37,30 @@ def read_mirror(tbl: str, date: str | None = None,
     symbol : keep only that symbol's rows.
     Returns a ts-sorted DataFrame (ts in IST), or None if missing/empty.
     """
-    p = LIVE_DIR / f"{date or today_iso()}_{tbl}.parquet"
+    day = date or today_iso()
+    p = LIVE_DIR / f"{day}_{tbl}.parquet"
     if not p.exists() or p.stat().st_size < 100:
         return None
     try:
-        df = pd.read_parquet(p)
+        if day == today_iso():
+            # LIVE file grows all session — read fresh (never cache: avoids stale
+            # reads + unbounded cache growth on the capture box).
+            df = pd.read_parquet(p)
+            df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
+            df = df[df["ts"] >= pd.Timestamp("2000-01-01", tz=IST)]
+            df = df.sort_values("ts").reset_index(drop=True)
+        else:
+            # PAST day = static file → cached parse (mtime/size-keyed, never stale).
+            st = p.stat()
+            df = _load_processed(str(p), st.st_mtime_ns, st.st_size)
     except Exception:
         return None
+    # NOTE: df may be a cached shared frame — only FILTER below (returns new frames),
+    # never mutate it in place.
     if symbol is not None and "symbol" in df.columns:
         df = df[df["symbol"] == symbol]
     if df.empty:
         return None
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    # Drop epoch-junk ts (feed occasionally emits 1901/1970/1979 sentinels). Left in,
-    # one bad row makes a downstream resample span ~125 years -> millions of empty
-    # bins -> hang/OOM. No legitimate NSE intraday row predates 2000.
-    df = df[df["ts"] >= pd.Timestamp("2000-01-01", tz=IST)]
     if as_of is not None:
         # Defensive: a tz-naive as_of would raise "Cannot compare tz-naive and
         # tz-aware" against the IST ts. Localise naive inputs to IST (callers should

@@ -3243,7 +3243,7 @@ def _scout_row(r):
         html.Span(metrics),
     ], style={**MONO, "fontSize": "0.66rem"})
     # OPEN TRADE lifecycle: when it triggered, entry/SL/target, live P&L, manage call
-    lc = r.get("lifecycle")
+    # (lc already fetched above for the held-strike headline)
     trade_blk = None
     if lc:
         mng = lc.get("manage", "HOLD")
