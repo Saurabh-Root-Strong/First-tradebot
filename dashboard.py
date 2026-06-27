@@ -3211,7 +3211,14 @@ def _scout_row(r):
     side  = r.get("direction")
     clr   = ("#34d399" if side == "CE" else "#f87171") if trade else "#64748b"
     bg    = "#0c1f17" if (trade and side == "CE") else "#1f0c0c" if (trade and side == "PE") else "#0a1020"
-    inst = (f" · {r['instrument']}" if r.get("instrument") else "")
+    # For an OPEN trade show the strike you actually HOLD (ATM at trigger), not the
+    # drifting current ATM — they differ when the index moved since entry, which was
+    # confusing (headline 14500 vs entry 14525). Fresh/no-trade rows show current ATM.
+    lc = r.get("lifecycle")
+    if lc and lc.get("entry_strike"):
+        inst = f" · {lc['entry_strike']} {side} (held since {lc['trigger']})"
+    else:
+        inst = (f" · {r['instrument']}" if r.get("instrument") else "")
     if trade and r.get("expiry"):
         inst += f" ({r['expiry']})"
     if r.get("thin"):
