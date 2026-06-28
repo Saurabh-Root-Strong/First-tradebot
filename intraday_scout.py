@@ -72,6 +72,7 @@ def _expiry_kind(sym: str) -> str:
 # Wider stop + further target the longer the hold.
 _SLT = {5: (0.30, 0.50), 15: (0.32, 0.55), 60: (0.35, 0.65)}
 _MKT_OPEN = datetime.time(9, 15)
+_TRIG_MAX_MIN = 120        # cap the contiguous-run trigger walk-back (minutes)
 
 # ── Signal weights (sum to 1.0). The delta-adjusted FLOW carries the most weight:
 # it strips delta·Δindex from the premium, so it reads true demand, not the price
@@ -350,35 +351,25 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
         return scan_index(sym, tf_min, date=date, as_of=t,
                           with_lifecycle=False, verdict_only=True).get("verdict") == want
 
-    # ── trigger time: walk back on the tf grid while it stayed the same TRADE ─────
+    # ── trigger = start of the CURRENT contiguous run of THIS exact trade verdict
+    # ending at as_of. Walk back MINUTE BY MINUTE; stop at the first minute that is not
+    # this trade. The gate is NON-MONOTONIC on a forming bar — strength swings as the
+    # partial bar fills (NIFTY 2026-06-25: TRADE@09:39-40, NO-TRADE@09:41-47, then
+    # TRADE@09:48) — so the old tf-grid walk + binary-search boundary was WRONG: it
+    # reported an earlier LAPSED blip (09:39) as the trigger for a trade that actually
+    # (re)fired at 09:48, and priced entry off that stale minute (a phantom +P&L).
+    # Minute resolution is the honest "held since". Naturally cheap — a flickery signal
+    # stops on the first step back; only a genuinely persistent hold walks far (capped
+    # at _TRIG_MAX_MIN). ──────────────────────────────────────────────────────────
     trig_t = as_of
-    for i in range(1, 13):
-        t_i = as_of - datetime.timedelta(minutes=tf_min * i)
+    for i in range(1, _TRIG_MAX_MIN + 1):
+        t_i = as_of - datetime.timedelta(minutes=i)
         if t_i.time() < _MKT_OPEN:
             break
         if _is_trade(t_i):
             trig_t = t_i
         else:
             break
-    # ── refine to the EXACT MINUTE the gate first fired, inside the bar before the
-    # coarse grid trigger. BINARY SEARCH the boundary (prior grid bar was NOT this
-    # trade, trig_t IS): find the earliest minute that is already TRADE → real entry
-    # time (12:27, not 12:30). ~log2(tf) probes instead of tf linear. ─────────────
-    lo = trig_t - datetime.timedelta(minutes=tf_min)            # known NOT-trade side
-    hi = trig_t                                                 # known trade side
-    if lo.time() < _MKT_OPEN:
-        lo = trig_t.replace(hour=_MKT_OPEN.hour, minute=_MKT_OPEN.minute,
-                            second=0, microsecond=0)
-    while (hi - lo) > datetime.timedelta(minutes=1):
-        mid = lo + (hi - lo) / 2
-        mid = mid.replace(second=0, microsecond=0)
-        if mid <= lo:
-            break
-        if _is_trade(mid):
-            hi = mid
-        else:
-            lo = mid
-    trig_t = hi
     # ── entry strike = the ATM at trigger (what you'd actually have bought) ───────
     spot_trig = _spot_at(sym, date, trig_t)
     trig_atm = _atm(spot_trig, sym) if spot_trig else None
