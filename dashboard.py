@@ -1456,21 +1456,28 @@ app.layout = dbc.Container([
                                  {"label": "60 min", "value": 60}],
                         value=15, style={"fontSize": "0.72rem"}), md=2),
                     # Replay: pick ANY cutoff minute (truncate every chart at that
-                    # time to study what the market did next). Empty = full/live
+                    # time to study what the market did next). Cleared = full/live
                     # session — the as_of cutoff is leakage-safe (enforced at the
-                    # data read). Native time input → arbitrary HH:MM, not fixed
-                    # 15-min checkpoints. Clear the field (× / backspace) for live.
-                    dbc.Col(dbc.InputGroup([
-                        dbc.InputGroupText("⏱ Replay", style={
-                            "fontSize": "0.62rem", "fontWeight": "700",
-                            "color": "#a78bfa", "background": "#1e293b",
-                            "border": "1px solid #334155"}),
-                        dbc.Input(
-                            id="charts-asof", type="time",
-                            value="", min="09:15", max="15:30", step=60,
-                            placeholder="live",
-                            style={"fontSize": "0.72rem"}),
-                    ], size="sm"), md=3),
+                    # data read). A searchable dropdown (NOT a native <input type=time>,
+                    # whose picker always lists 00-23h and ignores min/max) so ONLY
+                    # market minutes 09:15-15:30 are offered — no junk 17:00 / 22:00.
+                    # Type "1130" to jump; clear (×) for live.
+                    dbc.Col([
+                        html.Div([
+                            html.Span("⏱ Replay", style={
+                                "fontSize": "0.62rem", "fontWeight": "700",
+                                "color": "#a78bfa", "whiteSpace": "nowrap"}),
+                            dcc.Dropdown(
+                                id="charts-asof",
+                                options=[{"label": f"{h:02d}:{m:02d}",
+                                          "value": f"{h:02d}:{m:02d}"}
+                                         for h in range(9, 16) for m in range(60)
+                                         if (9, 15) <= (h, m) <= (15, 30)],
+                                value=None, clearable=True, placeholder="live",
+                                style={"fontSize": "0.72rem", "minWidth": "110px"}),
+                        ], style={"display": "flex", "alignItems": "center",
+                                  "gap": "6px"}),
+                    ], md=3),
                 ], className="mb-2 align-items-center"),
                 # SCOUT — multi-index TRADE/NO-TRADE scan at the chosen TF + replay
                 # clock. Scans all 4 indices off the SAME series these charts plot;
