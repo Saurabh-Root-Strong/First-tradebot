@@ -287,7 +287,15 @@ def simulate(grid: pd.DataFrame, label: str, fy_sym: str, cfg: dict) -> list[dic
                     closed = ("SL", d["sl"], -1.0)
             elif hit_t2:
                 base_r = (d["t2"] - d["entry"]) / risk * (1 if long else -1)
-                r = round(0.5 * d["r_t1"] + 0.5 * base_r, 2) if d["booked"] else round(base_r, 2)
+                if d["booked"]:
+                    r = round(0.5 * d["r_t1"] + 0.5 * base_r, 2)
+                elif hit_t1:
+                    # bar spans T1→T2 in one move: realistically half books at T1 and
+                    # the rest at T2 — NOT full size at T2 (which overstated by ~0.75R).
+                    r_t1 = (d["t1"] - d["entry"]) / risk * (1 if long else -1)
+                    r = round(0.5 * r_t1 + 0.5 * base_r, 2)
+                else:
+                    r = round(base_r, 2)
                 closed = ("T2", d["t2"], r)
             elif (not d["booked"]) and hit_t1:
                 d["booked"] = True

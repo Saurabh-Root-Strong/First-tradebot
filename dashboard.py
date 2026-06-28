@@ -4696,7 +4696,13 @@ def open_footprint_modal(clicks, asof_value):
         sym, tf = ident["sym"], int(ident["tf"])
     except Exception:
         return no_update, no_update, no_update
-    fig = _footprint_fig(sym, tf, asof_value)
+    # Thread the replay DATE too, not just the time: if asof_value carries a past
+    # day (e.g. regime-asof ever wired to replay), build_series must read THAT day's
+    # mirror — passing time-only with date=None would read today's file under a past
+    # as_of (empty, or a cross-day leak). None when live ("now").
+    _aod = _parse_asof(asof_value)
+    fig = _footprint_fig(sym, tf, asof_value,
+                         date=(_aod.date().isoformat() if _aod else None))
     title = f"{LABELS.get(sym, sym)} · {tf}m footprint — ATM premium · OI · volume"
     return True, fig, title
 

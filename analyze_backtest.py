@@ -88,11 +88,13 @@ def main() -> None:
     print("\n" + "=" * 72)
     print("  CONCENTRATION")
     print("=" * 72)
+    def _pct(a, b):
+        return f"{100*a/b:.0f}%" if b else "n/a"
     print(f"  Net total R                 : {net:,.0f}")
-    print(f"  Top-10 symbols contribute   : {top10:,.0f} R  ({100*top10/net:.0f}% of net)")
+    print(f"  Top-10 symbols contribute   : {top10:,.0f} R  ({_pct(top10, net)} of net)")
     print(f"  Bottom-10 symbols drag       : {bot10:,.0f} R")
     print(f"  Profitable symbols          : {pos_syms} / {len(by_sym)} "
-          f"({100*pos_syms/len(by_sym):.0f}%)")
+          f"({_pct(pos_syms, len(by_sym))})")
 
     # 5. Direction split per year as a compact verdict matrix
     print("\n" + "=" * 72)
