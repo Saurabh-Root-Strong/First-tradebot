@@ -137,8 +137,12 @@ def vectorized_scores(df: pd.DataFrame) -> pd.Series:
         [r < 30, r > 70, (r > 55) & (r > rp), (r < 45) & (r < rp)],
         [2.0, -2.0, 1.0, -1.0], default=0.0), index=idx)
 
-    # 5. VWAP (NaN vwap → comparison False → -1, exactly as _analyze)
-    s5 = pd.Series(np.where(close > vw, 1.0, -1.0), index=idx)
+    # 5. VWAP — score ONLY when VWAP is defined, matching _analyze's notna guard.
+    # _vwap returns NaN when cumulative volume is 0 (index 5-min bars frequently have
+    # zero traded volume from Fyers), and _analyze SKIPS the rule then (scores 0).
+    # The old np.where scored -1 on NaN VWAP, a spurious bearish tick that diverged
+    # from live by exactly +1.0 on every no-volume bar (~half of them).
+    s5 = pd.Series(np.where(vw.isna(), 0.0, np.where(close > vw, 1.0, -1.0)), index=idx)
 
     # 6. Volume confirmation
     hv = vol > avg_vol * 1.5
