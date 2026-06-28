@@ -3052,8 +3052,9 @@ def _swap_charts_help(mode):
     Input("charts-asof",   "value"),
     Input("news-date",     "data"),
     Input("sel-sym",       "data"),
+    Input("setup-tick",    "n_intervals"),   # live refresh (uirevision keeps zoom/drawn lines)
 )
-def _update_charts(mode, leg, strike, expiry, sym, tf, asof, date, sel):
+def _update_charts(mode, leg, strike, expiry, sym, tf, asof, date, sel, _tick):
     """Redraw when mode/leg/strike/expiry/index/tf/as-of/date changes or section opens.
     as_of (replay): truncate every chart at the chosen time — leakage-safe (read_mirror)."""
     from dash.exceptions import PreventUpdate
@@ -3301,19 +3302,21 @@ def _scout_row(r):
                            "borderRadius": "5px", "padding": "5px 10px", "marginBottom": "4px"})
 
 
-def _charts_scout_panel(tf_min, date, as_of_dt):
+def _charts_scout_panel(tf_min, date, as_of_dt, live=False):
     import intraday_scout as scout
     rows = scout.scan(int(tf_min or 15), date, as_of_dt)
-    when = (f"replay @ {as_of_dt:%H:%M}" if as_of_dt else "LIVE")
+    when = ("LIVE" if live else
+            f"replay @ {as_of_dt:%H:%M}" if as_of_dt else f"{date} full day")
     n_trade = sum(1 for r in rows if r.get("has_data") and r["verdict"].startswith("TRADE"))
     hits = sum(1 for r in rows if r.get("verify") and r["verify"]["dir_hit"])
     graded = sum(1 for r in rows if r.get("verify"))
+    _pend = ("  ·  live — calls grade themselves once the horizon elapses"
+             if live else "  ·  predictions pending (advance the replay clock to grade)")
     sb = (html.Span(f"  ·  scoreboard {hits}/{graded} hit",
                     style={"color": "#22c55e" if hits * 2 >= graded else "#f87171",
                            "fontSize": "0.62rem", "fontWeight": "700"})
           if graded else
-          html.Span("  ·  predictions pending (advance the replay clock to grade)",
-                    style={"color": "#475569", "fontSize": "0.58rem"}))
+          html.Span(_pend, style={"color": "#475569", "fontSize": "0.58rem"}))
     title = html.Div([
         html.Span(f"🎯 SCOUT — predict next {tf_min}m  ·  {when}  ·  ", style={
             "color": "#34d399", "fontWeight": "700", "fontSize": "0.7rem",
@@ -3345,21 +3348,30 @@ def _charts_scout_panel(tf_min, date, as_of_dt):
     Input("charts-asof", "value"),
     Input("news-date",   "data"),
     Input("sel-sym",     "data"),
+    Input("setup-tick",  "n_intervals"),
 )
-def _update_charts_scout(tf, asof, date, sel):
-    """Multi-index TRADE/NO-TRADE scan at the chosen TF + replay clock (all modes)."""
+def _update_charts_scout(tf, asof, date, sel, _tick):
+    """Multi-index TRADE/NO-TRADE scan. LIVE (no Replay time, today): as_of=now so the
+    trade lifecycle (trigger/entry/SL/target/manage/P&L) renders, and the 30s tick
+    refreshes the board so a NEW trigger appears on its own. An explicit Replay time
+    pins a past instant on the chosen day; a past date with no time = that full day."""
     from dash.exceptions import PreventUpdate
     if sel != "CHARTS":
         raise PreventUpdate
-    date = date or None
-    as_of_dt = None
-    if asof and asof != "full" and date:
+    today = datetime.datetime.now(IST).date().isoformat()
+    live = False
+    if asof and asof != "full":                       # explicit Replay minute
+        day = date or today
         try:
-            as_of_dt = datetime.datetime.fromisoformat(f"{date}T{asof}:00+05:30")
+            as_of_dt = datetime.datetime.fromisoformat(f"{day}T{asof}:00+05:30")
         except Exception:
-            as_of_dt = None
+            day, as_of_dt, live = today, datetime.datetime.now(IST), True
+    elif date and date != today:                      # browsing a full PAST day
+        day, as_of_dt = date, None
+    else:                                              # LIVE now
+        day, as_of_dt, live = today, datetime.datetime.now(IST), True
     try:
-        return _charts_scout_panel(tf, date, as_of_dt)
+        return _charts_scout_panel(tf, day, as_of_dt, live=live)
     except Exception as exc:
         return _recon_note(f"Scout unavailable ({type(exc).__name__}: {exc}).")
 
