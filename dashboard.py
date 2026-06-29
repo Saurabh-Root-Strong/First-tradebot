@@ -3285,9 +3285,18 @@ def _scout_playbook(r):
     phase = op.get("phase")
 
     body = []
-    # ── 0. opening regime (only shown in the open) ───────────────────────────────
-    if phase in ("OPENING", "SETTLING"):
-        body.append(hdr("⓪ OPENING — READ THIS FIRST", "#fbbf24"))
+    # ── 0. opening / data-warmup regime ──────────────────────────────────────────
+    if op.get("warming") or phase in ("OPENING", "SETTLING"):
+        body.append(hdr("⓪ OPENING / WARMUP — READ THIS FIRST", "#fbbf24"))
+        if op.get("warming") and op.get("data_start"):
+            ra = op.get("ready_at")
+            body.append(line(
+                f"DATA WARMUP: live feed running since {op['data_start']}; the scout needs "
+                f"~{20}m of data before it trades"
+                + (f", so it starts calling trades from ~{ra:%H:%M}." if ra else ".")
+                + " If the feed dropped earlier and resumed, this clock re-anchored to the "
+                "resume — not 09:15. No trade until then (signals on thin data are noise).",
+                "#fbbf24"))
         gp = op.get("gap_pct"); gt = op.get("gap_type", "open")
         body.append(line(
             f"It is the opening window. Today is a {gt}"
@@ -3529,8 +3538,8 @@ def _scout_row(r):
     # opening-phase banner (gap type + cool-off / provisional warning)
     op = r.get("opening")
     open_blk = None
-    if op and op.get("phase") != "REGULAR" and op.get("note"):
-        oclr = "#fbbf24" if op["phase"] == "OPENING" else "#60a5fa"
+    if op and op.get("note"):                 # OPENING/SETTLING phase OR a data-warmup
+        oclr = "#fbbf24" if (op.get("warming") or op.get("phase") == "OPENING") else "#60a5fa"
         gp = op.get("gap_pct")
         seg = (f"  gap {gp:+.2f}%" if gp is not None else "")
         seg += (f"  ·  OR [{op['or_lo']}, {op['or_hi']}]"
@@ -3539,7 +3548,7 @@ def _scout_row(r):
                             style={**MONO, "fontSize": "0.6rem", "color": oclr,
                                    "fontWeight": "700", "paddingLeft": "120px",
                                    "lineHeight": "1.4", "background": "#15110a"
-                                   if op["phase"] == "OPENING" else "#0a1422",
+                                   if (op.get("warming") or op.get("phase") == "OPENING") else "#0a1422",
                                    "borderRadius": "3px", "padding": "2px 6px",
                                    "marginLeft": "120px", "marginTop": "2px"})
     kids = ([head] + ([open_blk] if open_blk else []) + ([trade_blk] if trade_blk else [])

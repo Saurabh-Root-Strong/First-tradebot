@@ -77,6 +77,9 @@ _OPEN_SETTLE = datetime.time(9, 35)  # NO trade before this — market still coo
 _OPEN_VALID = datetime.time(9, 45)   # range/backtest calibration only validated from here
 _GAP_FLAT = 0.30                     # |gap%| below this = flat open
 _GAP_SHARP = 0.75                    # |gap%| at/above this = sharp gap
+_WARMUP_MIN = 20                     # minutes of CONTIGUOUS live data before the scout
+                                     # trades — re-anchors if the feed drops then resumes
+_DATA_GAP_S = 300                    # a >5-min hole in ticks = feed outage → warmup resets
 _TRIG_MAX_MIN = 120        # cap the contiguous-run trigger walk-back (minutes)
 
 # ── Signal weights (sum to 1.0). The delta-adjusted FLOW carries the most weight:
@@ -326,6 +329,23 @@ def _opening_context(sym: str, date, as_of) -> Optional[dict]:
         "or_lo": round(or_lo, 1) if or_lo else None,
         "or_hi": round(or_hi, 1) if or_hi else None,
     })
+    # ── DATA WARMUP: re-anchor the cool-off to when the live feed actually started /
+    # RESUMED. The scout needs _WARMUP_MIN of CONTIGUOUS ticks before it trades, measured
+    # from the start of the current unbroken run — so a feed that dies and comes back at
+    # 13:00 restarts the 20-min clock from 13:00, not from 09:15. Floored at the normal
+    # 09:35 settle so an early/pre-open feed can't trade before the market cools off.
+    settle_dt = as_of.replace(hour=_OPEN_SETTLE.hour, minute=_OPEN_SETTLE.minute,
+                              second=0, microsecond=0)
+    sess = tk[tk["ts"].dt.time >= _MKT_OPEN]
+    if len(sess):
+        gaps = sess["ts"].diff().dt.total_seconds()
+        resumed = sess["ts"][gaps > _DATA_GAP_S]            # ts right after each outage
+        run_start = resumed.iloc[-1] if len(resumed) else sess["ts"].iloc[0]
+        ready = max(settle_dt,
+                    (run_start + pd.Timedelta(minutes=_WARMUP_MIN)).to_pydatetime())
+        out["data_start"] = run_start.strftime("%H:%M")
+        out["ready_at"] = ready                              # datetime (in-process use)
+        out["warming"] = as_of < ready
     # opening book (net OI build + walls) — morning context only, skip later to stay light
     if t <= datetime.time(10, 30):
         out["oi_build"] = _opening_oi_build(sym, date, as_of)
@@ -429,7 +449,7 @@ def _verify(sym: str, date, as_of, horizon_min: int, spot0: float,
 
 
 def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
-               cur_strength) -> Optional[dict]:
+               cur_strength, not_before=None) -> Optional[dict]:
     """Trade lifecycle for an OPEN directional call: when it TRIGGERED (scan back to
     the first contiguous same-direction TRADE bar), the entry strike/premium it would
     have been taken at, SL/target on the premium, live P&L, and a CLOSE/HOLD manage
@@ -461,6 +481,8 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
         t_i = as_of - datetime.timedelta(minutes=i)
         if t_i.time() < _MKT_OPEN:
             break
+        if not_before is not None and t_i < not_before:
+            break                              # never report a trigger before data-ready
         if _is_trade(t_i):
             trig_t = t_i
         else:
@@ -614,13 +636,21 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
 
     # ── opening context (gap type / opening range / session phase) ───────────────
     opening = _opening_context(sym, date, as_of)
+    ready_at = opening.get("ready_at") if opening else None
     if opening:
         ph = opening["phase"]
         gt = opening.get("gap_type", "")
-        if ph == "OPENING":
-            opening["note"] = (f"OPENING ({gt}) — market still settling, NO trade until "
-                               f"~09:35 (gap/cool-off regime is unvalidated)")
-            opening["suppressed"] = in_open and abs(strength) >= _TRADE_TH
+        if opening.get("warming"):
+            # data-driven cool-off (covers the normal 09:15-09:35 open AND a late start /
+            # feed resume) — needs _WARMUP_MIN of contiguous data before trading.
+            if verdict.startswith("TRADE"):
+                verdict, direction = "NO-TRADE", ""
+            ds = opening.get("data_start")
+            opening["note"] = (
+                f"DATA WARMUP — live feed since {ds}; need {_WARMUP_MIN}m of data, scout "
+                f"trades from {ready_at:%H:%M}" if ready_at else
+                "DATA WARMUP — accumulating data before trading")
+            opening["suppressed"] = abs(strength) >= _TRADE_TH
         elif ph == "SETTLING":
             opening["note"] = (f"SETTLING ({gt}) — provisional: range/edge only fully "
                                f"validated from ~09:45. Half size, confirm the opening "
@@ -630,7 +660,8 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     fwd = _forward(direction, spot, fcst.get("exp_move_pct"), horizon_min)
     verify = _verify(sym, date, as_of, horizon_min, spot,
                      fwd["pdir"], fwd["pred_lo"], fwd["pred_hi"], atm=atm)
-    lifecycle = (_lifecycle(sym, tf_min, date, as_of, direction, horizon_min, strength)
+    lifecycle = (_lifecycle(sym, tf_min, date, as_of, direction, horizon_min, strength,
+                            not_before=ready_at)
                  if (with_lifecycle and direction) else None)
     return {
         "opening": opening,
