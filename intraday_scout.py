@@ -77,9 +77,14 @@ _OPEN_SETTLE = datetime.time(9, 35)  # NO trade before this — market still coo
 _OPEN_VALID = datetime.time(9, 45)   # range/backtest calibration only validated from here
 _GAP_FLAT = 0.30                     # |gap%| below this = flat open
 _GAP_SHARP = 0.75                    # |gap%| at/above this = sharp gap
-_WARMUP_MIN = 20                     # minutes of CONTIGUOUS live data before the scout
-                                     # trades — re-anchors if the feed drops then resumes
-_DATA_GAP_S = 300                    # a >5-min hole in ticks = feed outage → warmup resets
+_WARMUP_MIN = 20                     # minutes of live data before the scout trades — from
+                                     # the SESSION start, re-anchored only on a true cold-restart
+_RESUME_RESET_S = 1800               # only a >30-min outage re-anchors the warmup clock. A
+                                     # shorter blip (WS reconnect, a process restart) leaves the
+                                     # accumulated OI/flow/price picture intact — the scout reads
+                                     # the full session, so a few missing minutes don't invalidate
+                                     # it. Resetting 20min on every brief blip wrongly muted a
+                                     # whole session after midday restarts (2026-06-29).
 _TRIG_MAX_MIN = 120        # cap the contiguous-run trigger walk-back (minutes)
 
 # ── Signal weights (sum to 1.0). The delta-adjusted FLOW carries the most weight:
@@ -329,17 +334,20 @@ def _opening_context(sym: str, date, as_of) -> Optional[dict]:
         "or_lo": round(or_lo, 1) if or_lo else None,
         "or_hi": round(or_hi, 1) if or_hi else None,
     })
-    # ── DATA WARMUP: re-anchor the cool-off to when the live feed actually started /
-    # RESUMED. The scout needs _WARMUP_MIN of CONTIGUOUS ticks before it trades, measured
-    # from the start of the current unbroken run — so a feed that dies and comes back at
-    # 13:00 restarts the 20-min clock from 13:00, not from 09:15. Floored at the normal
-    # 09:35 settle so an early/pre-open feed can't trade before the market cools off.
+    # ── DATA WARMUP: anchor the cool-off to when the live feed started for the session.
+    # The scout needs _WARMUP_MIN of data before it trades. Only a TRUE cold-restart (an
+    # outage > _RESUME_RESET_S, i.e. >30min, that makes the session picture stale) re-anchors
+    # the clock to the resume; a brief blip (WS reconnect / a process restart, common when
+    # the laptop is moved or the feed flickers) does NOT — the accumulated OI/flow/price is
+    # intact and the scout reads the whole session, so a few missing minutes shouldn't mute
+    # it. Floored at the 09:35 settle so an early/pre-open feed can't trade before the open
+    # cools off.
     settle_dt = as_of.replace(hour=_OPEN_SETTLE.hour, minute=_OPEN_SETTLE.minute,
                               second=0, microsecond=0)
     sess = tk[tk["ts"].dt.time >= _MKT_OPEN]
     if len(sess):
         gaps = sess["ts"].diff().dt.total_seconds()
-        resumed = sess["ts"][gaps > _DATA_GAP_S]            # ts right after each outage
+        resumed = sess["ts"][gaps > _RESUME_RESET_S]        # ts after a STALE-making outage
         run_start = resumed.iloc[-1] if len(resumed) else sess["ts"].iloc[0]
         ready = max(settle_dt,
                     (run_start + pd.Timedelta(minutes=_WARMUP_MIN)).to_pydatetime())
