@@ -198,15 +198,24 @@ def report(df, rng):
     print("autocorrelation twice — no new edge — keep MTF as context display, don't gate.")
 
 
+_CACHE = os.environ.get("MTF_CACHE", "")
+
+
 def main():
     rng = np.random.default_rng(SEED)
-    days = _captured_days()
-    if len(days) < 2:
-        print("need >=2 captured days"); return
-    print(f"captured days: {days}")
-    df = harvest(days)
-    if len(df) == 0:
-        print("no triggers"); return
+    if _CACHE and os.path.exists(_CACHE):
+        df = pd.read_parquet(_CACHE)
+        print(f"loaded cache {_CACHE}  rows={len(df)}")
+    else:
+        days = _captured_days()
+        if len(days) < 2:
+            print("need >=2 captured days"); return
+        print(f"captured days: {days}")
+        df = harvest(days)
+        if len(df) == 0:
+            print("no triggers"); return
+        if _CACHE:
+            df.to_parquet(_CACHE); print(f"cached -> {_CACHE}")
     report(df, rng)
 
 
