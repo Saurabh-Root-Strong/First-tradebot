@@ -3836,6 +3836,45 @@ def _scout_detect(state, now, persist):
     return events
 
 
+def _rehydrate_scout_state(state, today):
+    """Rebuild the per-symbol open-position state from the persisted scout_alerts log
+    on poller startup. Without this, a mid-day restart resets _SCOUT_ALERT_STATE to
+    empty → every still-open trade re-fires as a DUPLICATE 'NEW' and in-flight SL/
+    TARGET tracking is lost (the morning of a trade silently re-opens). Replays the
+    day's NEW/BAND/SL/TARGET rows per symbol and restores the last UNRESOLVED episode
+    so detection resumes exactly where it left off. Band levels (pred_lo/hi) aren't
+    stored, so a post-restart band break only re-fires once the trade re-opens — an
+    accepted, conservative loss vs. spamming dup alerts."""
+    import pandas as pd
+    from core.mirror_io import read_mirror
+    df = read_mirror("scout_alerts", today)
+    if df is None or df.empty:
+        return 0
+    def _v(x):
+        return None if x is None or (isinstance(x, float) and pd.isna(x)) else x
+    for sym, g in df.groupby("symbol"):                  # df is ts-ascending
+        st: dict = {}
+        for _, r in g.iterrows():
+            kind = str(r.get("kind") or "")
+            if kind == "NEW":
+                strike = _v(r.get("strike"))
+                st["open"] = {
+                    "day": today, "dir": _v(r.get("side")),
+                    "strike": int(strike) if strike is not None else None,
+                    "entry": _v(r.get("entry")), "sl": _v(r.get("sl")),
+                    "tgt": _v(r.get("tgt")), "bl": None, "bh": None, "bb": False,
+                    "trig": r["ts"].strftime("%H:%M"),
+                    "label": _v(r.get("label")) or str(sym),
+                    "thin": bool(r.get("thin")), "spot": _v(r.get("spot"))}
+            elif kind == "BAND" and st.get("open"):
+                st["open"]["bb"] = True                   # band already broken → don't re-fire
+            elif kind in ("SL", "TARGET") and st.get("open"):
+                st["open"] = None                        # episode closed → free the slot
+        if st.get("open"):
+            state[str(sym)] = st
+    return sum(1 for v in state.values() if v.get("open"))
+
+
 def _scout_alert_poller():
     """AUTHORITATIVE scout-alert detector — a server-side background thread (started
     only by the live capturer, not in VIEWER mode). Scans all 4 indices every 30s
@@ -3844,6 +3883,13 @@ def _scout_alert_poller():
     record; the browser just reads it. Owns _SCOUT_ALERT_STATE so position tracking
     (and thus SL/TARGET/dedup) is single-sourced. Decision-support only."""
     import time as _time
+    try:
+        n = _rehydrate_scout_state(
+            _SCOUT_ALERT_STATE, datetime.datetime.now(IST).date().isoformat())
+        print(f"  Scout-alert state rehydrated from today's log "
+              f"({n} open position(s)) — restart-safe, no dup NEW")
+    except Exception as e:
+        print(f"  Scout-alert rehydrate skipped: {e}")
     while True:
         try:
             now = datetime.datetime.now(IST)
