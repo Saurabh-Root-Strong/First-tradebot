@@ -40,3 +40,6 @@ fyersDataSocket.log
 
 # ── Claude Code local memory (machine-specific, not project code) ─────────────
 .claude/
+
+# backtest harvest caches (derived, machine-specific)
+bt_cache/

@@ -155,6 +155,9 @@ def harvest(days):
                 s30 = today[today["ts"] <= pd.Timestamp(t - datetime.timedelta(minutes=30))]
                 spot30 = float(s30.iloc[-1]["ltp"]) if len(s30) else spot
                 drift = (spot / spot30 - 1.0) * 100.0 if spot30 else 0.0
+                day_open = float(upto.iloc[0]["ltp"])
+                net_sofar = (spot / day_open - 1.0) * 100.0 if day_open else 0.0
+                day_dir = 1 if net_sofar > 0.15 else (-1 if net_sofar < -0.15 else 0)
                 fwd = {}
                 for H in HORIZONS:
                     sH = today[today["ts"] <= pd.Timestamp(t + datetime.timedelta(minutes=H))]
@@ -179,7 +182,7 @@ def harvest(days):
                     brk_sign = 1 if (up_brk and not dn_brk) else (-1 if (dn_brk and not up_brk) else 0)
                     rec = {"date": date, "sym": sym, "t": hhmm, "cfg": cfg, "drift": drift,
                            "n_levels": len(levels), "at_level": bool(rev_sign),
-                           "is_brk": bool(brk_sign), "brk_dir": int(brk_sign)}
+                           "is_brk": bool(brk_sign), "brk_dir": int(brk_sign), "day_dir": day_dir}
                     for H in HORIZONS:
                         r = ((fwd[H] / spot - 1.0) * 100.0) if (fwd[H] and fwd[H] != spot) else np.nan
                         rec[f"rev{H}"] = rev_sign * r if rev_sign else np.nan
@@ -245,6 +248,11 @@ def report(df, rng):
     for lbl, d in (("UP-break  ", bk[bk.brk_dir > 0]), ("DOWN-break", bk[bk.brk_dir < 0])):
         cells = "  ".join(_row(d, "brk", H, rng) for H in HORIZONS)
         print(f"    {lbl}  {cells}")
+    print("  break-dir x DAY-so-far regime (is up-break failure a confound or a real asymmetry?)")
+    for bd, bl in ((1, "UP-break"), (-1, "DOWN-break")):
+        for dd, dl in ((1, "up-day"), (-1, "down-day")):
+            d = bk[(bk.brk_dir == bd) & (bk.day_dir == dd)]
+            print(f"    {bl:10s} on {dl:8s}  {_row(d, 'brk', 15, rng)}")
 
     print("=" * 92)
     print("READ: REVERSION>50 (db clears) = that TF-set turns price (fade works);")
