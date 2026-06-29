@@ -3738,62 +3738,56 @@ def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
             "band_dir": band_dir}
 
 
-@app.callback(
-    Output("scout-seen",       "data"),
-    Output("scout-alerts",     "data"),
-    Output("scout-alert-fire", "data"),
-    Input("setup-tick", "n_intervals"),
-    State("scout-seen",       "data"),
-    State("scout-alerts",     "data"),
-    State("scout-alert-fire", "data"),
-)
-def _detect_scout_alerts(_tick, seen, alerts, fire):
-    """Every 30s during market hours, scan all 4 indices live and emit lifecycle
-    alerts — REGARDLESS of the open section (background):
+# Server-side per-index open/last position state. OWNED by the alert poller thread
+# (the authoritative detector + writer). A single owner means: alerts are captured
+# whether or not a browser tab is open, and there are NO duplicate rows from several
+# tabs each running their own detection. The browser callback uses its own (browser)
+# copy purely for the charts-overlay/beep and NEVER writes.
+_SCOUT_ALERT_STATE: dict = {}
+
+
+def _scout_detect(state, now, persist):
+    """Core scout-alert detection over all 4 indices for one instant.
+
+    Mutates `state` (per-symbol {open, last}) in place and returns the list of fired
+    alert recs:
       • NEW    — a TRADE just opened (CALL/PUT buy lean)
       • SL     — the open trade's premium hit the stop
       • TARGET — the open trade booked the target
       • BAND   — index broke the forward range band snapshot at trigger (move > expected)
-    Each index carries an OPEN-POSITION in scout-seen that PERSISTS across gate
-    flicker (the verdict blinks TRADE/NO-TRADE on a forming bar) until it actually
-    exits — so NEW fires once (not on every blink) and SL/TARGET are checked
-    gate-independently via the live premium, so a stop hit during a NO-TRADE blink is
-    still caught. Bumps the fire counter → clientside notification + beep.
-    Decision-support only (arrow negative-EV)."""
-    from dash.exceptions import PreventUpdate
-    now = datetime.datetime.now(IST)
-    if not (datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
-        raise PreventUpdate
+    Each index carries an OPEN-POSITION that PERSISTS across gate flicker (the verdict
+    blinks TRADE/NO-TRADE on a forming bar) until it really exits — so NEW fires once
+    (not on every blink) and SL/TARGET are checked gate-independently via the live
+    premium (a stop hit during a NO-TRADE blink is still caught).
+
+    persist=True → each fired event is written to the canonical scout_alerts store
+    (intraday_db). Used by the server-side poller (authoritative writer) AND the
+    browser callback (persist=False — UI/beep only; never writes, so multiple tabs
+    can't create duplicate rows). Decision-support only (arrow negative-EV)."""
     import intraday_scout as scout
-    import os as _os
-    from intraday_db import idb
-    # Persist alerts canonically ONLY when this process is the live capturer. In
-    # VIEWER mode (DASH_VIEWER=1) the dashboard reads VM-synced mirrors and must not
-    # write — a write would trigger _export_parquet and CLOBBER the synced mirrors.
-    _persist = _os.environ.get("DASH_VIEWER") != "1"
+    today = now.date().isoformat()
+    events: list = []
+    try:
+        rows = scout.scan(15, today, now)
+    except Exception:
+        return events
 
     def _emit(sym, ev):
         events.append(ev)
-        if _persist:
+        if persist:
             try:
+                from intraday_db import idb
                 idb.write_scout_alert(sym, now, ev)
             except Exception:
                 pass
 
-    seen = dict(seen or {})
-    today = now.date().isoformat()
-    try:
-        rows = scout.scan(15, today, now)
-    except Exception:
-        raise PreventUpdate
-    events = []
     for r in rows:
         if not r.get("has_data"):
             continue
         sym, v = r["sym"], r["verdict"]
         spot = r.get("spot")
         lc = r.get("lifecycle") or {}
-        st = dict(seen.get(sym) or {})
+        st = dict(state.get(sym) or {})
         pos = st.get("open")
         if pos and pos.get("day") != today:              # stale position from a prior day
             pos = None
@@ -3816,7 +3810,7 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
                                   band_dir=("above" if spot > pos["bh"] else "below")))
                     pos["bb"] = True
                 st["open"] = pos
-                seen[sym] = st
+                state[sym] = st
                 continue
             # position closed → record the RESOLVED episode so the charts board can
             # still show what happened (instead of the trade silently vanishing), then
@@ -3838,7 +3832,50 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
                    "label": r["label"], "thin": bool(r.get("thin")), "spot": spot}
             _emit(sym, _scout_alert_rec(now, pos, "NEW"))
             st["open"] = pos
-        seen[sym] = st
+        state[sym] = st
+    return events
+
+
+def _scout_alert_poller():
+    """AUTHORITATIVE scout-alert detector — a server-side background thread (started
+    only by the live capturer, not in VIEWER mode). Scans all 4 indices every 30s
+    during 09:15-15:30 and writes every NEW/SL/TARGET/BAND to the canonical
+    scout_alerts store, WHETHER OR NOT a browser is open. This is the system of
+    record; the browser just reads it. Owns _SCOUT_ALERT_STATE so position tracking
+    (and thus SL/TARGET/dedup) is single-sourced. Decision-support only."""
+    import time as _time
+    while True:
+        try:
+            now = datetime.datetime.now(IST)
+            if datetime.time(9, 15) <= now.time() <= datetime.time(15, 30):
+                _scout_detect(_SCOUT_ALERT_STATE, now, persist=True)
+        except Exception:
+            pass
+        _time.sleep(30)
+
+
+@app.callback(
+    Output("scout-seen",       "data"),
+    Output("scout-alerts",     "data"),
+    Output("scout-alert-fire", "data"),
+    Input("setup-tick", "n_intervals"),
+    State("scout-seen",       "data"),
+    State("scout-alerts",     "data"),
+    State("scout-alert-fire", "data"),
+)
+def _detect_scout_alerts(_tick, seen, alerts, fire):
+    """Browser-side mirror of the scout-alert detector — UI ONLY (never writes; the
+    server-side _scout_alert_poller is the sole authoritative writer). Maintains the
+    browser's scout-seen so the CHARTS board overlay shows HOLDING / last-trade, and
+    bumps the fire counter → clientside notification + beep. The ALERTS panel itself
+    reads the canonical log, not this list. Decision-support only (arrow negative-EV)."""
+    from dash.exceptions import PreventUpdate
+    now = datetime.datetime.now(IST)
+    if not (datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
+        raise PreventUpdate
+    seen = dict(seen or {})
+    today = now.date().isoformat()
+    events = _scout_detect(seen, now, persist=False)   # persist=False → no dup rows
     # purge any prior-day alerts on the first tick of a new session (local store persists
     # across days) so the panel only ever shows TODAY's trade history.
     log = [a for a in (alerts or []) if a.get("d") == today]
@@ -5777,6 +5814,17 @@ if __name__ == "__main__":
             target=_heartbeat_writer,
             daemon=True, name="heartbeat",
         ).start()
+
+        # AUTHORITATIVE scout-alert detector — logs every NEW/SL/TARGET/BAND to the
+        # canonical scout_alerts store whether or not a browser is open (so the evening
+        # review is complete) and is the SOLE writer (no duplicate rows from multiple
+        # tabs). Only the capturer runs it — never in VIEWER mode (would clobber the
+        # synced mirrors via _export_parquet).
+        threading.Thread(
+            target=_scout_alert_poller,
+            daemon=True, name="scout-alerts",
+        ).start()
+        print("  Scout-alert poller started — 30s, logs NEW/SL/TARGET/BAND")
 
     print(f"  Open  →  http://127.0.0.1:8050")
     print(SEP)
