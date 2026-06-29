@@ -1232,6 +1232,12 @@ app.layout = dbc.Container([
             html.Div(style={"flex": "1 1 auto"}),     # spacer pushes actions to the right
             _header_action_chip("nav-charts", "📈", "CHARTS", "#a78bfa"),
             _header_action_chip("nav-liveoi", "📡", "LIVE OI", "#40c4ff"),
+            _header_action_chip(
+                "nav-alerts", "🔔", "ALERTS", "#fbbf24",
+                extra_child=html.Span(id="alert-badge", children="", style={
+                    "fontSize": "0.55rem", "fontWeight": "800", "color": "#0a0f1a",
+                    "background": "#fbbf24", "borderRadius": "9px", "padding": "0 6px",
+                    "minWidth": "16px", "textAlign": "center", "display": "none"})),
         ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px",
                   "alignItems": "center", "marginTop": "10px"}),
         # Live news / event-impact ticker — always visible across all panels.
@@ -1406,6 +1412,29 @@ app.layout = dbc.Container([
                 html.Div(id="liveoi-content"),
             ]),
 
+            # ALERTS PANEL (hidden until 🔔 clicked) — running log of NEW scout TRADE
+            # triggers detected live (also fires a browser notification + beep). The
+            # arrow is decision-support (negative-EV) — this surfaces the lean, it is
+            # NOT a buy instruction. See the red note in the panel.
+            html.Div(id="alerts-panel", style={"display": "none"}, children=[
+                dbc.Row([
+                    dbc.Col(html.Span("🔔 TRADE ALERTS", style={
+                        "color": "#fbbf24", "fontWeight": "700", "fontSize": "0.9rem",
+                        "letterSpacing": "0.06em", "paddingTop": "6px"}), md=4),
+                    dbc.Col([
+                        html.Button("Enable browser notifications", id="alert-perm-btn",
+                                    n_clicks=0, style={
+                                        "fontSize": "0.62rem", "fontWeight": "700",
+                                        "color": "#fbbf24", "background": "#1e293b",
+                                        "border": "1px solid #fbbf24", "borderRadius": "6px",
+                                        "padding": "4px 10px", "cursor": "pointer"}),
+                        html.Span(id="alert-perm-status", style={
+                            "fontSize": "0.56rem", "color": "#64748b", "marginLeft": "8px"}),
+                    ], md=8, style={"textAlign": "right", "paddingTop": "4px"}),
+                ], className="mb-2 align-items-center"),
+                html.Div(id="alerts-content"),
+            ]),
+
             # CHARTS PANEL (hidden until 'Charts' is clicked) — full-session
             # price candle + OI + volume + premium for a chosen index & timeframe.
             html.Div(id="charts-panel", style={"display": "none"}, children=[
@@ -1530,6 +1559,12 @@ app.layout = dbc.Container([
     # is rendered dynamically inside the Trade Book, and a callback may not use a
     # dynamically-created component as an Input before it exists in the DOM.
     dcc.Store(id="regime-asof", data="now"),
+    # Scout alert state: last verdict per index (to detect a NEW trigger), the alert
+    # log, a fire counter (bumps → clientside notification+beep), and a JS no-op sink.
+    dcc.Store(id="scout-seen",       data={}),
+    dcc.Store(id="scout-alerts",     data=[]),
+    dcc.Store(id="scout-alert-fire", data=0),
+    dcc.Store(id="alert-noop",       data=""),
 
     # Click-to-popup footprint chart (OI · volume · ATM premium per timeframe)
     dbc.Modal([
@@ -2957,11 +2992,12 @@ def _render_trade_rec(rec: dict, sym: str) -> html.Div:
     [Input(f"nav-{_slug(s)}", "n_clicks") for s in INDEX_SYMBOLS],
     Input("nav-liveoi",    "n_clicks"),
     Input("nav-charts",    "n_clicks"),
+    Input("nav-alerts",    "n_clicks"),
     State("sel-sym", "data"),
     prevent_initial_call=True,
 )
 def on_nav_click(*args):
-    *_, _liveoi_clicks, _charts_clicks, current = args
+    *_, _liveoi_clicks, _charts_clicks, _alerts_clicks, current = args
     from dash import callback_context as ctx
     if not ctx.triggered:
         return current, ""
@@ -2970,6 +3006,8 @@ def on_nav_click(*args):
         return (None, "") if current == "LIVEOI" else ("LIVEOI", "")
     if tid == "nav-charts":
         return (None, "") if current == "CHARTS" else ("CHARTS", "")
+    if tid == "nav-alerts":
+        return (None, "") if current == "ALERTS" else ("ALERTS", "")
     for sym in INDEX_SYMBOLS:
         if tid == f"nav-{_slug(sym)}":
             return (None, "") if current == sym else (sym, "")
@@ -2989,6 +3027,8 @@ def _sync_url(sym):
         return "/live-oi"
     if sym == "CHARTS":
         return "/charts"
+    if sym == "ALERTS":
+        return "/alerts"
     if sym in INDEX_SYMBOLS:
         return f"/chain/{_URL_SHORT.get(sym, 'index')}"
     return "/"
@@ -3376,6 +3416,163 @@ def _update_charts_scout(tf, asof, date, sel, _tick):
         return _recon_note(f"Scout unavailable ({type(exc).__name__}: {exc}).")
 
 
+# ── Scout alerts: detect a NEW live TRADE trigger → log it + fire a notification ──
+@app.callback(
+    Output("scout-seen",       "data"),
+    Output("scout-alerts",     "data"),
+    Output("scout-alert-fire", "data"),
+    Input("setup-tick", "n_intervals"),
+    State("scout-seen",       "data"),
+    State("scout-alerts",     "data"),
+    State("scout-alert-fire", "data"),
+)
+def _detect_scout_alerts(_tick, seen, alerts, fire):
+    """Every 30s during market hours, scan all 4 indices live and append any index
+    whose verdict just FLIPPED into a TRADE to the alert log — REGARDLESS of which
+    section is open, so alerts arrive in the background. Bumps the fire counter →
+    clientside browser-notification + beep. Decision-support only (arrow negative-EV)."""
+    from dash.exceptions import PreventUpdate
+    now = datetime.datetime.now(IST)
+    if not (datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
+        raise PreventUpdate
+    import intraday_scout as scout
+    seen = dict(seen or {})
+    alerts = list(alerts or [])
+    fire = int(fire or 0)
+    today = now.date().isoformat()
+    try:
+        rows = scout.scan(15, today, now)
+    except Exception:
+        raise PreventUpdate
+    fired = False
+    for r in rows:
+        if not r.get("has_data"):
+            continue
+        sym, v = r["sym"], r["verdict"]
+        prev = seen.get(sym)
+        seen[sym] = v
+        if v.startswith("TRADE") and v != prev:          # verdict just turned into a trade
+            lc = r.get("lifecycle") or {}
+            alerts.insert(0, {
+                "t": now.strftime("%H:%M"), "label": r["label"], "verdict": v,
+                "direction": r.get("direction"),
+                "strike": lc.get("entry_strike") or r.get("atm"),
+                "entry": lc.get("entry_prem"), "sl": lc.get("sl"),
+                "target": lc.get("target"),
+                "spot": lc.get("entry_spot") or r.get("spot"),
+                "thin": bool(r.get("thin")),
+            })
+            fired = True
+    if fired:
+        return seen, alerts[:50], fire + 1
+    return seen, no_update, no_update          # persist verdicts; no re-render churn
+
+
+@app.callback(
+    Output("alert-badge", "children"),
+    Output("alert-badge", "style"),
+    Input("scout-alerts", "data"),
+)
+def _alert_badge(alerts):
+    n = len(alerts or [])
+    base = {"fontSize": "0.55rem", "fontWeight": "800", "color": "#0a0f1a",
+            "background": "#fbbf24", "borderRadius": "9px", "padding": "0 6px",
+            "minWidth": "16px", "textAlign": "center"}
+    if not n:
+        return "", {**base, "display": "none"}
+    return str(n), {**base, "display": "inline-block"}
+
+
+@app.callback(
+    Output("alerts-content", "children"),
+    Input("scout-alerts", "data"),
+    Input("sel-sym", "data"),
+)
+def _render_alerts(alerts, sel):
+    from dash.exceptions import PreventUpdate
+    if sel != "ALERTS":
+        raise PreventUpdate
+    note = html.Div([
+        html.Span("⛔ Decision-support only. ", style={"color": "#f87171", "fontWeight": "700"}),
+        html.Span("The CE/PE arrow is measured negative-EV — these are structural "
+                  "leans, NOT buy instructions. Trade the range band / levels.",
+                  style={"color": "#94a3b8"}),
+    ], style={"fontSize": "0.56rem", "marginBottom": "8px", "background": "#1a0c0c",
+              "border": "1px solid #7f1d1d", "borderRadius": "4px", "padding": "5px 8px"})
+    if not alerts:
+        return html.Div([note, html.Div(
+            "No triggers yet today — the board is scanned every 30s during market hours.",
+            style={"color": "#475569", "fontSize": "0.7rem", "padding": "10px"})])
+    rows = []
+    for a in alerts:
+        side = a.get("direction")
+        clr = "#34d399" if side == "CE" else "#f87171"
+        act = "CALL BUY" if side == "CE" else "PUT BUY"
+        bits = [
+            html.Span(f"{a['t']}  ", style={"color": "#fbbf24", "fontWeight": "700"}),
+            html.Span(f"{a['label']}  ", style={"color": "#e2e8f0", "fontWeight": "700",
+                                                "minWidth": "110px", "display": "inline-block"}),
+            html.Span(f"{act} {a.get('strike') or ''} {side}",
+                      style={"color": clr, "fontWeight": "700"}),
+            html.Span(f"  @ index {a.get('spot')}", style={"color": "#93c5fd"}),
+            html.Span(f"   entry ₹{a.get('entry')}  SL ₹{a.get('sl')}  T ₹{a.get('target')}",
+                      style={"color": "#cbd5e1"}),
+        ]
+        if a.get("thin"):
+            bits.append(html.Span("  ⚠ thin", style={"color": "#f59e0b"}))
+        rows.append(html.Div(bits, style={**MONO, "fontSize": "0.66rem", "padding": "5px 8px",
+                                          "borderBottom": "1px solid #1e293b"}))
+    return html.Div([note] + rows)
+
+
+# Clientside: on a new alert, browser notification + a short beep.
+app.clientside_callback(
+    """
+    function(fireN, alerts){
+        if(!fireN || !alerts || !alerts.length){ return ''; }
+        var a = alerts[0];
+        var side = a.direction;
+        var act = (side === 'CE') ? 'CALL BUY' : 'PUT BUY';
+        var msg = act + ' ' + (a.strike||'') + ' ' + side + ' @ ' + a.spot +
+                  '  entry ' + a.entry + '  SL ' + a.sl + '  T ' + a.target;
+        try {
+            if ('Notification' in window && Notification.permission === 'granted'){
+                new Notification('\\uD83D\\uDD14 ' + a.label + '  ' + a.t, { body: msg });
+            }
+        } catch(e){}
+        try {
+            var AC = window.AudioContext || window.webkitAudioContext;
+            var ctx = new AC();
+            var o = ctx.createOscillator(), g = ctx.createGain();
+            o.connect(g); g.connect(ctx.destination);
+            o.type = 'sine'; o.frequency.value = 880; g.gain.value = 0.12;
+            o.start(); o.stop(ctx.currentTime + 0.18);
+        } catch(e){}
+        return '';
+    }
+    """,
+    Output("alert-noop", "data"),
+    Input("scout-alert-fire", "data"),
+    State("scout-alerts", "data"),
+)
+
+# Clientside: request notification permission on the button click (a user gesture,
+# which browsers require to show the permission prompt).
+app.clientside_callback(
+    """
+    function(n){
+        if(!n){ return ''; }
+        if(!('Notification' in window)){ return 'This browser has no notifications.'; }
+        Notification.requestPermission();
+        return 'Allow notifications in the browser prompt — then alerts pop even off-tab.';
+    }
+    """,
+    Output("alert-perm-status", "children"),
+    Input("alert-perm-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+
 @app.callback(
     Output("charts-recon", "children"),
     Input("charts-mode", "value"),
@@ -3440,6 +3637,7 @@ def _update_holiday_banner(date):
     Output("trade-book-panel", "style"),
     Output("live-oi-panel",   "style"),
     Output("charts-panel",    "style"),
+    Output("alerts-panel",    "style"),
     Output("oc-title",        "children"),
     *[Output(f"nav-{_slug(s)}", "style") for s in INDEX_SYMBOLS],
     Input("sel-sym", "data"),
@@ -3448,13 +3646,15 @@ def toggle_view(sym):
     is_trades = (sym == "TRADES")
     is_liveoi = (sym == "LIVEOI")
     is_charts = (sym == "CHARTS")
-    is_index  = bool(sym) and not is_trades and not is_liveoi and not is_charts
+    is_alerts = (sym == "ALERTS")
+    is_index  = bool(sym) and not is_trades and not is_liveoi and not is_charts and not is_alerts
 
     ov_style = {"display": "block"} if not sym else {"display": "none"}
     oc_style = {"display": "block"} if is_index else {"display": "none"}
     tb_style = {"display": "block"} if is_trades else {"display": "none"}
     lo_style = {"display": "block"} if is_liveoi else {"display": "none"}
     ch_style = {"display": "block"} if is_charts else {"display": "none"}
+    al_style = {"display": "block"} if is_alerts else {"display": "none"}
 
     if is_index:
         color = COLORS[sym]
@@ -3469,7 +3669,7 @@ def toggle_view(sym):
         title = ""
 
     nav_styles = [_nav_chip_style(s, selected=(s == sym)) for s in INDEX_SYMBOLS]
-    return (ov_style, oc_style, tb_style, lo_style, ch_style, title, *nav_styles)
+    return (ov_style, oc_style, tb_style, lo_style, ch_style, al_style, title, *nav_styles)
 
 
 # ── Callback 3: sidebar live prices + status ───────────────────────────────────
