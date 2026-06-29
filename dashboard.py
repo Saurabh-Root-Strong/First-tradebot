@@ -4084,12 +4084,17 @@ def _alerts_from_mirror(date):
 
 @app.callback(
     Output("alerts-content", "children"),
+    Input("setup-tick",   "n_intervals"),
     Input("scout-alerts", "data"),
-    Input("sel-sym", "data"),
-    Input("news-date", "data"),
-    Input("alert-hour", "value"),
+    Input("sel-sym",      "data"),
+    Input("news-date",    "data"),
+    Input("alert-hour",   "value"),
 )
-def _render_alerts(alerts, sel, date, hour):
+def _render_alerts(_tick, alerts, sel, date, hour):
+    # Re-reads the canonical log on the 30s setup-tick (same cadence as the badge), so a
+    # newly fired alert appears at the TOP of the list automatically — the panel tracks
+    # the system-of-record on a timer, NOT the browser's parallel detection (which could
+    # leave the list lagging the badge). Also re-renders on section/date/hour change.
     from dash.exceptions import PreventUpdate
     if sel != "ALERTS":
         raise PreventUpdate
