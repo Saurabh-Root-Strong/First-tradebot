@@ -4032,25 +4032,42 @@ def _alerts_from_mirror(date):
     fired while only the VM was watching, and is archived per-day for evening review.
     Returns [] if the mirror is missing (e.g. a day before this log existed).
 
-    DEDUPED by EVENT, not by exact minute: collapses rows that describe the SAME
-    underlying alert — same (symbol, kind, strike, band_dir) fired within a short
-    window (≤_DEDUP_WIN s) → one row (earliest kept). A single event can be written
-    at slightly different timestamps by different writers (legacy multi-tab browser
-    detection; the 5-min backfill grid time vs the live 30s loop's wall-clock time for
-    a position that spans the backfill/live boundary), so a strict same-minute key
-    leaves ±1-min twins. The window collapse removes those while keeping genuinely
-    separate events (a second break of the same wall 30 min later survives). A held
-    position naturally emits its NEW once, so this only cleans writer-timing skew."""
+    DEDUPED on two levels so the panel shows the TRUE distinct-alert count:
+
+    1) POSITION-AWARE (NEW): a NEW is only real if the prior position on that exact
+       (symbol, strike, side) actually CLOSED (an SL/TARGET row for the symbol). The
+       scout holds ONE position per index until it exits, so a second NEW for a still-
+       open (strike, side) is a re-fire — the old per-tab browser detector and pre-
+       rehydrate restarts both re-emitted open trades as fresh NEWs. Those are dropped;
+       a genuine re-entry (after an SL/TARGET) and a flip to the other side survive.
+    2) EVENT-WINDOW (all kinds): same (symbol, kind, strike, band_dir) within
+       _DEDUP_WIN s = one row (earliest kept) — collapses writer-timing twins (legacy
+       multi-tab; 5-min backfill grid time vs the live 30s wall-clock for a position
+       straddling the boundary). Genuinely separate events (a 2nd break of the same
+       wall 30 min later) survive."""
     from core.mirror_io import read_mirror
     df = read_mirror("scout_alerts", date)
     if df is None or df.empty:
         return []
     _DEDUP_WIN = 240                                 # seconds: same event if within 4 min
-    out, last = [], {}                               # base-key → ts of last kept
+    out, last, open_pos = [], {}, {}                 # base→ts; symbol→current open (strike,side)
     for _, r in df.iterrows():                       # df is ts-ascending → keep earliest
         kind = str(r.get("kind") or "")
         ts = r["ts"]
-        base = (str(r.get("symbol") or ""), kind, r.get("strike"), r.get("band_dir"))
+        sym = str(r.get("symbol") or "")
+        # ── position bookkeeping: the scout holds ONE position per index. A NEW that
+        # repeats the CURRENT open (strike,side) is a re-fire (restart / multi-tab);
+        # any genuinely different NEW (new strike, or a flip to the other side)
+        # REPLACES it and is kept. SL/TARGET frees the slot. ─────────────────────────
+        if kind == "NEW":
+            key = (r.get("strike"), r.get("side"))
+            if open_pos.get(sym) == key:
+                continue                             # still-open position re-emitted → dup
+            open_pos[sym] = key
+        elif kind in ("SL", "TARGET"):
+            open_pos.pop(sym, None)                  # the open position closed → free it
+        # ── timing-twin collapse (writer skew) ───────────────────────────────────────
+        base = (sym, kind, r.get("strike"), r.get("band_dir"))
         prev = last.get(base)
         if prev is not None and (ts - prev).total_seconds() < _DEDUP_WIN:
             continue                                 # same event, just a timing twin
