@@ -3237,16 +3237,206 @@ _TIP_AGREE = ("Independent families agreeing with the call: flow (anchor) + cros
               "(OI-tilt flip) + fut (futures). div shares data with flow so it is "
               "confirmation only and never counted here.")
 _TIP_RANGE = ("60-MIN volatility cone: spot ± ~1 std-dev of expected move over the "
-              "next hour. Price stays inside ~70% of the time (sized that way by "
-              "design). Tells you HOW FAR it can travel, not which way — use for "
-              "stops / targets / position sizing.")
+              "next hour. MEASURED (ledger, n=236): price CLOSES inside ~77% of the "
+              "time, but STAYS inside the whole hour only ~52% (it wicks out ~half "
+              "the time, then closes back in). Destination band, not a fence. HOW "
+              "FAR it can travel, not which way — use for stops / targets / sizing.")
 _TIP_BAND = ("NEXT-TF volatility cone: spot ± ~1 std-dev expected move over the "
              "selected timeframe (the 15m/etc cone, narrower than the 60m range "
-             "above). band ✓ = price stayed inside (~70% case); band ✗ = it broke "
-             "out (the ~30% big move). HOW FAR, not which way.")
+             "above). band ✓ = price closed inside (the ~77% case); band ✗ = it "
+             "broke out (the big-move tail). HOW FAR, not which way.")
 _TIP_TRIG = ("Trade lifecycle: the EXACT minute the gate first fired, the INDEX level "
              "and ATM option premium at that instant, SL/target on the premium, live "
              "P&L, and the manage call (CLOSE / HOLD / BOOK).")
+
+
+def _scout_playbook(r):
+    """Click-to-open scrollable trade playbook for one scout row, generated from THIS
+    row's live numbers. Honest-quant content: the RANGE band is the validated edge
+    (~77% close / ~52% path, measured), the CE/PE arrow is negative-EV context — so the
+    primary plan is range-based, with an explicit walk-through of the band-break case
+    (you bought the arrow, price broke the band against you → thesis dead → exit)."""
+    lo, hi = r.get("range_lo"), r.get("range_hi")
+    spot = r.get("spot")
+    side = r.get("direction")                       # CE / PE / None
+    lc = r.get("lifecycle") or {}
+    strike = lc.get("entry_strike") or r.get("atm")
+    entry_prem = lc.get("entry_prem"); sl_prem = lc.get("sl"); tgt_prem = lc.get("target")
+    thin = r.get("thin")
+    center = round((lo + hi) / 2, 1) if (lo is not None and hi is not None) else spot
+    half = round((hi - lo) / 2, 1) if (lo is not None and hi is not None) else None
+    bull = side == "CE"
+    # the band edge that INVALIDATES a directional bet (CE dies on a lower break, PE on upper)
+    inval_edge = lo if bull else hi
+    fav_edge   = hi if bull else lo
+
+    def line(txt, color="#cbd5e1", bold=False, pad=0, size="0.6rem"):
+        return html.Div(txt, style={**MONO, "fontSize": size, "color": color,
+                                    "fontWeight": "700" if bold else "400",
+                                    "whiteSpace": "pre-wrap", "lineHeight": "1.45",
+                                    "paddingLeft": f"{pad}px", "marginBottom": "2px"})
+
+    def hdr(txt, color="#fbbf24"):
+        return html.Div(txt, style={**MONO, "fontSize": "0.63rem", "color": color,
+                                    "fontWeight": "800", "marginTop": "7px",
+                                    "marginBottom": "3px", "letterSpacing": "0.03em"})
+
+    op = r.get("opening") or {}
+    phase = op.get("phase")
+
+    body = []
+    # ── 0. opening regime (only shown in the open) ───────────────────────────────
+    if phase in ("OPENING", "SETTLING"):
+        body.append(hdr("⓪ OPENING — READ THIS FIRST", "#fbbf24"))
+        gp = op.get("gap_pct"); gt = op.get("gap_type", "open")
+        body.append(line(
+            f"It is the opening window. Today is a {gt}"
+            + (f" ({gp:+.2f}% vs prev close {op.get('prev_close')})." if gp is not None else ".")
+            + (f" Opening range (first 15m) = [{op.get('or_lo')}, {op.get('or_hi')}]."
+               if op.get('or_lo') is not None else "")))
+        if phase == "OPENING":
+            body.append(line(
+                "RULE: NO trade yet. 09:15-09:35 is gap/settle noise — the engine "
+                "SUPPRESSES the arrow here and the range/backtest edge is only validated "
+                "from ~09:45. Let the opening range (OR) form first.", "#fbbf24"))
+        else:
+            body.append(line(
+                "RULE: provisional. Edge validated from ~09:45 — half size, and only "
+                "trade the OR break/fade, not a mid-range guess.", "#60a5fa"))
+        ob = op.get("oi_build")
+        if ob:
+            def _L(x): return f"{x/1e5:+.0f}L" if x else "0"
+            ce_w = ", ".join(str(s) for s, _ in (ob.get("ce_walls") or [])) or "—"
+            pe_f = ", ".join(str(s) for s, _ in (ob.get("pe_floors") or [])) or "—"
+            body.append(line(
+                f"OPENING BOOK (OI vs prev close, first 20m):\n"
+                f"   • CE OI {_L(ob['ce_oich'])}  (building at {ce_w}) ← ceilings/walls\n"
+                f"   • PE OI {_L(ob['pe_oich'])}  (building at {pe_f}) ← floors/supports\n"
+                f"   • Volume CE {ob['ce_vol']/1e5:.0f}L vs PE {ob['pe_vol']/1e5:.0f}L. "
+                f"This is RAW positioning — the scout flow signal reads buy-vs-write; "
+                f"the walls/floors are your near-term S/R levels.", "#cbd5e1"))
+        body.append(line(
+            "HOW TO PLAY THE OPEN (no validated gap edge — geometry only):\n"
+            "   • Wait for the 15-min opening range (OR) to set (09:15-09:30).\n"
+            "   • OR BREAK: a 5-min CLOSE above OR-high → lean long; below OR-low → "
+            "lean short. Stop = the other side of the OR.\n"
+            "   • OR FADE (gap into a level): sharp gap that stalls and re-enters the OR "
+            "→ fade back toward prev close / VWAP. Stop = the gap extreme.\n"
+            "   • Sharp gap = wider stops, smaller size. Range-bound open (tight OR) = "
+            "wait for the break, don't pre-position.", "#94a3b8"))
+    # ── 1. what this is ──────────────────────────────────────────────────────────
+    body.append(hdr("① WHAT THIS ROW IS", "#34d399"))
+    if side:
+        body.append(line(
+            f"The board leans {('UP / CALL' if bull else 'DOWN / PUT')} on {r['label']} "
+            f"(structural flow + corroboration). This LEAN is decision-support ONLY — "
+            f"backtested, buying the naked {side} off the arrow is NEGATIVE-EV "
+            f"(wins ~14-23%, bleeds -2..-5%/trade). Do NOT trade the arrow as a signal."))
+    else:
+        body.append(line(
+            f"NO clean directional setup on {r['label']} right now (families disagree). "
+            f"That's fine — the tradeable product here is the RANGE, not a direction."))
+    if lo is not None:
+        body.append(line(
+            f"The VALIDATED product is the 60-min range cone [{lo}, {hi}] "
+            f"(center ~{center}, ±{half} pts). MEASURED: price CLOSES inside ~77% of the "
+            f"time, but STAYS inside the whole hour only ~52% — it wicks out about half "
+            f"the time then closes back in. Treat it as a ~1σ DESTINATION, not a wall."))
+    else:
+        body.append(line("Range cone still warming up (needs ~12 one-minute bars). "
+                         "No trade until the band prints.", "#94a3b8"))
+
+    # ── 1. the trade I'd actually take ───────────────────────────────────────────
+    if lo is not None:
+        body.append(hdr("② THE TRADE (range-based — the honest edge)"))
+        body.append(line(
+            f"A) RANGE FADE (primary). When price pushes to a band EDGE, it reverts to "
+            f"center ~77% of closes. So:\n"
+            f"   • Near UPPER {hi}: fade DOWN — buy a PE / sell a CE-spread, target "
+            f"center {center}.\n"
+            f"   • Near LOWER {lo}: fade UP — buy a CE / sell a PE-spread, target "
+            f"center {center}.\n"
+            f"   • Mid-band (near {center}): NO trade — no edge in the middle, you just "
+            f"pay theta."))
+        if side:
+            body.append(line(
+                f"B) IF you take the {side} lean anyway (small size only — it's neg-EV): "
+                f"enter only near the {('LOWER' if bull else 'UPPER')} edge "
+                f"({inval_edge}) so the band is WITH you, never chase mid-band. Your hard "
+                f"line in the sand is the OPPOSITE edge ({inval_edge})."))
+
+    # ── 2. stop-loss ─────────────────────────────────────────────────────────────
+    body.append(hdr("③ STOP-LOSS (two stops — whichever hits FIRST)"))
+    body.append(line(
+        "1) INDEX stop = a 5-MINUTE CLOSE beyond the band edge against you. Use a "
+        "5-min CLOSE, NOT a single tick — price wicks past the band ~half the time "
+        "(path 52%) and snaps back; only a confirmed close beyond it is a real break."))
+    if entry_prem and sl_prem:
+        body.append(line(
+            f"2) PREMIUM stop = ₹{sl_prem} on the {strike} {side} "
+            f"(entry ₹{entry_prem}, ~-{round((1-sl_prem/entry_prem)*100)}%). A ~1σ "
+            f"adverse index move ≈ this premium stop, so the two usually fire together."))
+    else:
+        body.append(line(
+            "2) PREMIUM stop = ~30-35% of the option premium you paid (the engine sets "
+            "this on the ATM once you're in a live trade)."))
+
+    # ── 3. target ────────────────────────────────────────────────────────────────
+    if lo is not None:
+        body.append(hdr("④ TARGET"))
+        body.append(line(
+            f"• Range fade: take profit at center {center} (first), runner to the "
+            f"opposite edge.\n"
+            f"• Directional: the band edge in your favor "
+            f"({fav_edge if side else 'the far edge'})"
+            + (f", premium ₹{tgt_prem}." if tgt_prem else ".")
+            + " Book at the edge — past ~1σ the odds flip against you."))
+
+    # ── 4. THE BAND-BREAK SCENARIO (the user's exact question) ───────────────────
+    if side and inval_edge is not None:
+        body.append(hdr("⑤ WHAT IF THE BAND BREAKS AGAINST YOU?", "#f87171"))
+        brk = "LOWER" if bull else "UPPER"
+        body.append(line(
+            f"You bought the {strike} {side} (betting {('UP' if bull else 'DOWN')}), "
+            f"but the index breaks the {brk} band ({inval_edge}) and CLOSES a 5-min "
+            f"candle beyond it. Read it straight:\n"
+            f"   • BOTH halves of the thesis just broke: direction inverted (you wanted "
+            f"{('up' if bull else 'down')}) AND realized vol exceeded the ~1σ cone.\n"
+            f"   • You are now in the ~tail where the move tends to CONTINUE, not "
+            f"revert. Your {side} premium is already at/under the ₹"
+            f"{sl_prem or 'stop'} stop (a 1σ adverse move guts an ATM option fast).\n"
+            f"   • ACTION: EXIT NOW. Yes — stop-loss hits, close the position. Do NOT "
+            f"average down, do NOT 'wait for it to come back'. A confirmed band break is "
+            f"the definition of your thesis being wrong.\n"
+            f"   • The alerts tab fires 🛑 STOP-LOSS and 📊 RANGE BREAK on exactly this — "
+            f"that's your cue to be already out."))
+        body.append(line(
+            f"WICK vs BREAK: a single tick poking below {inval_edge} that snaps back "
+            f"inside the SAME 5-min candle is just noise (the 52% path-breach) — hold. "
+            f"A 5-min CLOSE beyond it is the real break — exit. That distinction is the "
+            f"whole game.", "#94a3b8"))
+
+    # ── 5. reality check ─────────────────────────────────────────────────────────
+    body.append(hdr("⑥ SIZING & REALITY CHECK", "#94a3b8"))
+    body.append(line(
+        "• The arrow is neg-EV → the range fade is the edge, not the direction.\n"
+        "• Coverage is ~77% CLOSE / ~52% PATH on n=236, 10 days (CI 72-82%) — small "
+        "sample, per-day swings 62-100%. Don't size as if 77% is a floor.\n"
+        "• Risk <=1% of capital per trade; the band gives you the geometry, not a "
+        "guarantee." + ("\n• ⚠ THIN index — sparse OI, stale strike prices, every "
+        "number here is less reliable. Halve size or skip." if thin else ""), "#94a3b8"))
+
+    return html.Details([
+        html.Summary("📖 how to trade this  ·  click", style={
+            **MONO, "fontSize": "0.6rem", "color": "#fbbf24", "cursor": "pointer",
+            "fontWeight": "700", "padding": "3px 8px", "background": "#1a1407",
+            "border": "1px solid #7c5e10", "borderRadius": "4px",
+            "display": "inline-block", "listStyle": "none", "userSelect": "none"}),
+        html.Div(body, style={
+            "maxHeight": "300px", "overflowY": "auto", "marginTop": "5px",
+            "padding": "7px 10px", "background": "#060a12",
+            "border": "1px solid #1e293b", "borderRadius": "5px"}),
+    ], style={"marginLeft": "120px", "marginTop": "4px"})
 
 
 def _scout_row(r):
@@ -3336,7 +3526,24 @@ def _scout_row(r):
     why = html.Div(" · ".join(r["reasons"][:3]),
                    style={**MONO, "fontSize": "0.56rem", "color": "#64748b",
                           "paddingLeft": "120px", "lineHeight": "1.3"})
-    kids = [head] + ([trade_blk] if trade_blk else []) + [pred, why]
+    # opening-phase banner (gap type + cool-off / provisional warning)
+    op = r.get("opening")
+    open_blk = None
+    if op and op.get("phase") != "REGULAR" and op.get("note"):
+        oclr = "#fbbf24" if op["phase"] == "OPENING" else "#60a5fa"
+        gp = op.get("gap_pct")
+        seg = (f"  gap {gp:+.2f}%" if gp is not None else "")
+        seg += (f"  ·  OR [{op['or_lo']}, {op['or_hi']}]"
+                if op.get("or_lo") is not None else "")
+        open_blk = html.Div(f"🕒 {op['note']}{seg}",
+                            style={**MONO, "fontSize": "0.6rem", "color": oclr,
+                                   "fontWeight": "700", "paddingLeft": "120px",
+                                   "lineHeight": "1.4", "background": "#15110a"
+                                   if op["phase"] == "OPENING" else "#0a1422",
+                                   "borderRadius": "3px", "padding": "2px 6px",
+                                   "marginLeft": "120px", "marginTop": "2px"})
+    kids = ([head] + ([open_blk] if open_blk else []) + ([trade_blk] if trade_blk else [])
+            + [pred, why, _scout_playbook(r)])
     return html.Div(kids,
                     style={"background": bg, "border": f"1px solid {clr if trade else '#1e293b'}",
                            "borderRadius": "5px", "padding": "5px 10px", "marginBottom": "4px"})

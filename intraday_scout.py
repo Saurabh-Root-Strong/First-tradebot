@@ -72,6 +72,11 @@ def _expiry_kind(sym: str) -> str:
 # Wider stop + further target the longer the hold.
 _SLT = {5: (0.30, 0.50), 15: (0.32, 0.55), 60: (0.35, 0.65)}
 _MKT_OPEN = datetime.time(9, 15)
+_OR_END = datetime.time(9, 30)       # opening-range window = first 15 min (09:15-09:30)
+_OPEN_SETTLE = datetime.time(9, 35)  # NO trade before this — market still cooling off
+_OPEN_VALID = datetime.time(9, 45)   # range/backtest calibration only validated from here
+_GAP_FLAT = 0.30                     # |gap%| below this = flat open
+_GAP_SHARP = 0.75                    # |gap%| at/above this = sharp gap
 _TRIG_MAX_MIN = 120        # cap the contiguous-run trigger walk-back (minutes)
 
 # ── Signal weights (sum to 1.0). The delta-adjusted FLOW carries the most weight:
@@ -235,6 +240,96 @@ def _futures_signal(sym: str, tf_min: int, date, as_of) -> tuple[float, str]:
     if abs(s) < 0.12:
         return 0.0, ""
     return s, ("futures: " + ", ".join(bits)) if bits else "futures lean"
+
+
+def _opening_oi_build(sym: str, date, as_of) -> Optional[dict]:
+    """The OPENING BOOK: net OI change vs prev close + the strikes building OI, over the
+    first 20 min (09:15 → min(now, 09:35)). RAW positioning context only — oich alone
+    can't tell buy from write, so the scout's delta-adjusted FLOW signal does the
+    interpretation; this just shows WHAT accumulated, for transparency at the handoff."""
+    if as_of is None:
+        return None
+    end = as_of
+    settle = as_of.replace(hour=_OPEN_SETTLE.hour, minute=_OPEN_SETTLE.minute,
+                           second=0, microsecond=0)
+    if end > settle:
+        end = settle                                  # freeze the picture at the open
+    try:
+        ch = _read_mirror("chain_snapshots", date, end, sym)
+    except Exception:
+        return None
+    if ch is None or not len(ch) or "oich" not in ch.columns:
+        return None
+    ch = ch[ch["ts"].dt.time >= _MKT_OPEN]
+    if not len(ch):
+        return None
+    last = ch.sort_values("ts").groupby(["strike", "side"]).last().reset_index()
+    ce = last[last["side"] == "CE"]; pe = last[last["side"] == "PE"]
+
+    def _top(df, n=3):
+        return [[int(s), int(o)] for s, o in
+                zip(df.nlargest(n, "oich")["strike"], df.nlargest(n, "oich")["oich"])
+                if o > 0]
+
+    return {
+        "ce_oich": int(ce["oich"].sum()), "pe_oich": int(pe["oich"].sum()),
+        "ce_vol": int(ce["volume"].sum()), "pe_vol": int(pe["volume"].sum()),
+        "ce_walls": _top(ce), "pe_floors": _top(pe),
+    }
+
+
+def _opening_context(sym: str, date, as_of) -> Optional[dict]:
+    """Classify the OPEN (gap vs prev close + opening range) and the session phase.
+    Pure read-only CONTEXT: we have NO validated gap-trading edge (the backtest ledgers
+    start ~09:45), so this DISPLAYS the open type + enforces a cool-off — it never
+    invents a directional opening call. Lookahead-free (ticks <= as_of)."""
+    if as_of is None:
+        return None
+    t = as_of.time()
+    phase = ("OPENING" if t < _OPEN_SETTLE
+             else "SETTLING" if t < _OPEN_VALID else "REGULAR")
+    out = {"phase": phase}
+    try:
+        tk = _read_mirror("ticks", date, as_of, sym)
+    except Exception:
+        tk = None
+    if tk is None or not len(tk):
+        return out
+    last = tk.iloc[-1]
+    prev_close = None
+    try:
+        if "ch" in tk.columns and pd.notna(last["ch"]):
+            prev_close = float(last["ltp"]) - float(last["ch"])   # ch = ltp - prev_close
+    except Exception:
+        prev_close = None
+    day_open = None
+    if "day_open" in tk.columns and pd.notna(last.get("day_open")):
+        day_open = float(last["day_open"])
+    if not day_open:
+        day_open = float(tk.iloc[0]["ltp"])
+    gap_pct = ((day_open / prev_close - 1.0) * 100.0) if (prev_close and day_open) else None
+    # opening range = hi/lo of the first 15 min (09:15-09:30)
+    orw = tk[(tk["ts"].dt.time >= _MKT_OPEN) & (tk["ts"].dt.time <= _OR_END)]
+    or_lo = float(orw["ltp"].min()) if len(orw) else None
+    or_hi = float(orw["ltp"].max()) if len(orw) else None
+    if gap_pct is None:
+        gtype = "OPEN"
+    else:
+        a = abs(gap_pct); d = "UP" if gap_pct > 0 else "DOWN"
+        gtype = ("FLAT OPEN" if a < _GAP_FLAT
+                 else f"SHARP GAP-{d}" if a >= _GAP_SHARP else f"GAP-{d}")
+    out.update({
+        "gap_pct": round(gap_pct, 2) if gap_pct is not None else None,
+        "gap_type": gtype,
+        "prev_close": round(prev_close, 1) if prev_close else None,
+        "day_open": round(day_open, 1) if day_open else None,
+        "or_lo": round(or_lo, 1) if or_lo else None,
+        "or_hi": round(or_hi, 1) if or_hi else None,
+    })
+    # opening book (net OI build + walls) — morning context only, skip later to stay light
+    if t <= datetime.time(10, 30):
+        out["oi_build"] = _opening_oi_build(sym, date, as_of)
+    return out
 
 
 def _spot_at(sym: str, date, t) -> Optional[float]:
@@ -486,6 +581,15 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         direction = ""
         verdict = "NO-TRADE"
 
+    # ── OPENING cool-off: NO trade before the market settles (~09:35). The first 15-20
+    # min gap/settle is unrepresentative (sharp gap-up/down, range-bound ±40-50 pts) AND
+    # the range/backtest calibration is only validated from ~09:45 — a trade off opening
+    # noise is trading an UNVALIDATED regime. Cheap time-check here so the hot lifecycle
+    # walk-back stays fast; the rich gap/OR context is built once in the full path below.
+    in_open = as_of is not None and as_of.time() < _OPEN_SETTLE
+    if in_open and verdict.startswith("TRADE"):
+        verdict, direction = "NO-TRADE", ""
+
     # Fast path for lifecycle probing — skip the expensive forecast/verify/forward.
     if verdict_only:
         return {"sym": sym, "has_data": True, "verdict": verdict,
@@ -508,6 +612,20 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     if tilt[1]:
         reasons.append(tilt[1])
 
+    # ── opening context (gap type / opening range / session phase) ───────────────
+    opening = _opening_context(sym, date, as_of)
+    if opening:
+        ph = opening["phase"]
+        gt = opening.get("gap_type", "")
+        if ph == "OPENING":
+            opening["note"] = (f"OPENING ({gt}) — market still settling, NO trade until "
+                               f"~09:35 (gap/cool-off regime is unvalidated)")
+            opening["suppressed"] = in_open and abs(strength) >= _TRADE_TH
+        elif ph == "SETTLING":
+            opening["note"] = (f"SETTLING ({gt}) — provisional: range/edge only fully "
+                               f"validated from ~09:45. Half size, confirm the opening "
+                               f"range first.")
+
     # ── forward prediction over the selected horizon + replay verify ─────────────
     fwd = _forward(direction, spot, fcst.get("exp_move_pct"), horizon_min)
     verify = _verify(sym, date, as_of, horizon_min, spot,
@@ -515,6 +633,7 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     lifecycle = (_lifecycle(sym, tf_min, date, as_of, direction, horizon_min, strength)
                  if (with_lifecycle and direction) else None)
     return {
+        "opening": opening,
         "sym": sym, "label": label, "has_data": True,
         "tf": tf_min, "horizon": horizon_min, "spot": spot, "atm": atm,
         "expiry": _expiry_kind(sym), "thin": sym in _THIN,
