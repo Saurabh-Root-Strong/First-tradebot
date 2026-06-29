@@ -447,7 +447,16 @@ class IntradayDB:
             if hasattr(ts, "tzinfo") and ts.tzinfo is None:
                 ts = ts.replace(tzinfo=IST)
             con.executemany(
-                """INSERT INTO chain_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                # Name the 12 columns explicitly — the table has a 13th (`expiry`,
+                # NOT NULL DEFAULT 0, added by migration + part of the PK). A bare
+                # VALUES(...12...) against the 13-col table errored on EVERY insert and
+                # was swallowed by the writer's per-record except → chain_snapshots
+                # stayed empty all session. expiry takes its DEFAULT 0 (legacy single
+                # nearest-expiry marker, which is exactly what the capture stores).
+                """INSERT INTO chain_snapshots
+                       (ts, date, symbol, strike, side, ltp, ltpch, oi, oich,
+                        volume, delta, iv)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO NOTHING""",
                 [[ts, today, sym, int(sp), side,
                   round(float(ltp or 0), 2), round(float(ltpch or 0), 2),
