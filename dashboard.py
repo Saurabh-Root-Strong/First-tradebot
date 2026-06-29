@@ -3416,7 +3416,34 @@ def _update_charts_scout(tf, asof, date, sel, _tick):
         return _recon_note(f"Scout unavailable ({type(exc).__name__}: {exc}).")
 
 
-# ── Scout alerts: detect a NEW live TRADE trigger → log it + fire a notification ──
+# ── Scout alerts: detect lifecycle EVENTS (new / SL / target / exit / band) ──────
+def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
+    """Preformatted alert record (head/body/color) from an open-position dict, so the
+    panel renderer AND the JS notification show identical wording (no JS format dup)."""
+    label = pos["label"]; side = pos["dir"]; strike = pos.get("strike")
+    entry = pos.get("entry"); sl = pos.get("sl"); tgt = pos.get("tgt")
+    if kind == "NEW":
+        act = "CALL BUY" if side == "CE" else "PUT BUY"
+        head = f"{act} {strike or ''} {side}"
+        body = f"{label} @ index {pos.get('spot')} · entry ₹{entry}  SL ₹{sl}  T ₹{tgt}"
+        color = "#34d399" if side == "CE" else "#f87171"
+    elif kind == "SL":
+        head = f"🛑 STOP-LOSS HIT · {label}"
+        body = f"{strike or ''} {side} hit SL ₹{sl} (entry ₹{entry}, now ₹{cur})"
+        color = "#ef4444"
+    elif kind == "TARGET":
+        head = f"🎯 TARGET HIT · {label}"
+        body = f"{strike or ''} {side} booked target ₹{tgt} (entry ₹{entry}, now ₹{cur})"
+        color = "#22c55e"
+    else:                                                 # BAND
+        head = f"📊 RANGE BREAK {band_dir} · {label}"
+        body = (f"index {spot} broke the 15m band [{pos.get('bl')}, {pos.get('bh')}]"
+                " — move bigger than expected")
+        color = "#60a5fa"
+    return {"t": now.strftime("%H:%M"), "label": label, "kind": kind,
+            "head": head, "body": body, "color": color, "thin": pos.get("thin", False)}
+
+
 @app.callback(
     Output("scout-seen",       "data"),
     Output("scout-alerts",     "data"),
@@ -3427,45 +3454,73 @@ def _update_charts_scout(tf, asof, date, sel, _tick):
     State("scout-alert-fire", "data"),
 )
 def _detect_scout_alerts(_tick, seen, alerts, fire):
-    """Every 30s during market hours, scan all 4 indices live and append any index
-    whose verdict just FLIPPED into a TRADE to the alert log — REGARDLESS of which
-    section is open, so alerts arrive in the background. Bumps the fire counter →
-    clientside browser-notification + beep. Decision-support only (arrow negative-EV)."""
+    """Every 30s during market hours, scan all 4 indices live and emit lifecycle
+    alerts — REGARDLESS of the open section (background):
+      • NEW    — a TRADE just opened (CALL/PUT buy lean)
+      • SL     — the open trade's premium hit the stop
+      • TARGET — the open trade booked the target
+      • BAND   — index broke the forward range band snapshot at trigger (move > expected)
+    Each index carries an OPEN-POSITION in scout-seen that PERSISTS across gate
+    flicker (the verdict blinks TRADE/NO-TRADE on a forming bar) until it actually
+    exits — so NEW fires once (not on every blink) and SL/TARGET are checked
+    gate-independently via the live premium, so a stop hit during a NO-TRADE blink is
+    still caught. Bumps the fire counter → clientside notification + beep.
+    Decision-support only (arrow negative-EV)."""
     from dash.exceptions import PreventUpdate
     now = datetime.datetime.now(IST)
     if not (datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
         raise PreventUpdate
     import intraday_scout as scout
     seen = dict(seen or {})
-    alerts = list(alerts or [])
-    fire = int(fire or 0)
     today = now.date().isoformat()
     try:
         rows = scout.scan(15, today, now)
     except Exception:
         raise PreventUpdate
-    fired = False
+    events = []
     for r in rows:
         if not r.get("has_data"):
             continue
         sym, v = r["sym"], r["verdict"]
-        prev = seen.get(sym)
-        seen[sym] = v
-        if v.startswith("TRADE") and v != prev:          # verdict just turned into a trade
-            lc = r.get("lifecycle") or {}
-            alerts.insert(0, {
-                "t": now.strftime("%H:%M"), "label": r["label"], "verdict": v,
-                "direction": r.get("direction"),
-                "strike": lc.get("entry_strike") or r.get("atm"),
-                "entry": lc.get("entry_prem"), "sl": lc.get("sl"),
-                "target": lc.get("target"),
-                "spot": lc.get("entry_spot") or r.get("spot"),
-                "thin": bool(r.get("thin")),
-            })
-            fired = True
-    if fired:
-        return seen, alerts[:50], fire + 1
-    return seen, no_update, no_update          # persist verdicts; no re-render churn
+        spot = r.get("spot")
+        lc = r.get("lifecycle") or {}
+        st = dict(seen.get(sym) or {})
+        pos = st.get("open")
+        if pos and pos.get("day") != today:              # stale position from a prior day
+            pos = None
+        # ── manage an OPEN position (gate-independent, survives NO-TRADE blinks) ────
+        if pos:
+            cur = scout._opt_premium(sym, today, now, pos.get("strike"), pos["dir"])
+            closed = False
+            if cur is not None and pos.get("sl") and cur <= pos["sl"]:
+                events.append(_scout_alert_rec(now, pos, "SL", cur=round(cur, 2))); closed = True
+            elif cur is not None and pos.get("tgt") and cur >= pos["tgt"]:
+                events.append(_scout_alert_rec(now, pos, "TARGET", cur=round(cur, 2))); closed = True
+            elif v.startswith("TRADE") and r.get("direction") != pos["dir"]:
+                closed = True                            # flipped to the other side
+            if not closed:
+                if (not pos.get("bb")) and spot and pos.get("bl") and pos.get("bh") \
+                        and (spot > pos["bh"] or spot < pos["bl"]):
+                    events.append(_scout_alert_rec(now, pos, "BAND", spot=spot,
+                                  band_dir=("above" if spot > pos["bh"] else "below")))
+                    pos["bb"] = True
+                st["open"] = pos
+                seen[sym] = st
+                continue
+            st["open"] = None                            # position closed → free to re-open
+        # ── open a NEW position when a trade is live and none is open ───────────────
+        if v.startswith("TRADE"):
+            pos = {"day": today, "dir": r.get("direction"),
+                   "strike": lc.get("entry_strike") or r.get("atm"),
+                   "entry": lc.get("entry_prem"), "sl": lc.get("sl"), "tgt": lc.get("target"),
+                   "bl": r.get("pred_lo"), "bh": r.get("pred_hi"), "bb": False,
+                   "label": r["label"], "thin": bool(r.get("thin")), "spot": spot}
+            events.append(_scout_alert_rec(now, pos, "NEW"))
+            st["open"] = pos
+        seen[sym] = st
+    if events:
+        return seen, (events + list(alerts or []))[:50], int(fire or 0) + 1
+    return seen, no_update, no_update          # persist state; no re-render churn
 
 
 @app.callback(
@@ -3505,18 +3560,11 @@ def _render_alerts(alerts, sel):
             style={"color": "#475569", "fontSize": "0.7rem", "padding": "10px"})])
     rows = []
     for a in alerts:
-        side = a.get("direction")
-        clr = "#34d399" if side == "CE" else "#f87171"
-        act = "CALL BUY" if side == "CE" else "PUT BUY"
         bits = [
             html.Span(f"{a['t']}  ", style={"color": "#fbbf24", "fontWeight": "700"}),
-            html.Span(f"{a['label']}  ", style={"color": "#e2e8f0", "fontWeight": "700",
-                                                "minWidth": "110px", "display": "inline-block"}),
-            html.Span(f"{act} {a.get('strike') or ''} {side}",
-                      style={"color": clr, "fontWeight": "700"}),
-            html.Span(f"  @ index {a.get('spot')}", style={"color": "#93c5fd"}),
-            html.Span(f"   entry ₹{a.get('entry')}  SL ₹{a.get('sl')}  T ₹{a.get('target')}",
-                      style={"color": "#cbd5e1"}),
+            html.Span(a.get("head", ""), style={"color": a.get("color", "#e2e8f0"),
+                                                "fontWeight": "700"}),
+            html.Span("  " + a.get("body", ""), style={"color": "#cbd5e1"}),
         ]
         if a.get("thin"):
             bits.append(html.Span("  ⚠ thin", style={"color": "#f59e0b"}))
@@ -3531,13 +3579,9 @@ app.clientside_callback(
     function(fireN, alerts){
         if(!fireN || !alerts || !alerts.length){ return ''; }
         var a = alerts[0];
-        var side = a.direction;
-        var act = (side === 'CE') ? 'CALL BUY' : 'PUT BUY';
-        var msg = act + ' ' + (a.strike||'') + ' ' + side + ' @ ' + a.spot +
-                  '  entry ' + a.entry + '  SL ' + a.sl + '  T ' + a.target;
         try {
             if ('Notification' in window && Notification.permission === 'granted'){
-                new Notification('\\uD83D\\uDD14 ' + a.label + '  ' + a.t, { body: msg });
+                new Notification(a.head + '  ' + a.t, { body: a.body });
             }
         } catch(e){}
         try {
