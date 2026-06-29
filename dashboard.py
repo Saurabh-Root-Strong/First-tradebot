@@ -3875,21 +3875,88 @@ def _rehydrate_scout_state(state, today):
     return sum(1 for v in state.values() if v.get("open"))
 
 
+def _backfill_scout_alerts(today, upto, write_before=None, step_sec=300):
+    """Reconstruct EVERY missed scout alert for the day by replaying the as_of-safe
+    detector over the already-captured market data (candles/OI/futures/chain mirrors),
+    from 09:15 up to `upto` on a coarse grid. The scout is replay-DETERMINISTIC, so a
+    replay produces exactly the alerts that WOULD have fired — making the alert log
+    COMPLETE and *derivable from the captured data*, independent of when the capturer
+    process actually started (a mid-session feature launch, a crash, or a redeploy no
+    longer leaves a hole in the morning). Writes via the normal idb path
+    (ON CONFLICT DO NOTHING); any same-minute overlap with rows the live loop already
+    wrote collapses in the panel's minute-level dedup. A held position only emits its
+    NEW once (at its true open time) because the rebuilt state persists across the
+    walk, so the afternoon's live rows are not re-created. Returns (n_events, state)
+    so the poller continues live from the reconstructed open-position state.
+
+    `write_before` (the earliest timestamp the live log already holds): rows at/after
+    it are NOT written (the live loop already logged that span) — detection still runs
+    to keep the rebuilt STATE correct up to `now`, but persist is off, so a position
+    that straddles the boundary is not double-listed with two slightly different times.
+    Bounded: ONE pass, 5-min grid (~75 scans/full day, ~2-3 min, GC between steps)."""
+    state: dict = {}
+    d0 = datetime.datetime.fromisoformat(today).date()
+    ts = datetime.datetime.combine(d0, datetime.time(9, 15), IST)
+    cap = datetime.datetime.combine(d0, datetime.time(15, 30), IST)
+    upto = min(upto, cap)
+    step = datetime.timedelta(seconds=step_sec)
+    n = 0
+    while ts <= upto:
+        try:
+            persist = write_before is None or ts < write_before
+            ev = _scout_detect(state, ts, persist=persist)
+            if persist:
+                n += len(ev)
+        except Exception:
+            pass
+        ts += step
+    return n, state
+
+
 def _scout_alert_poller():
     """AUTHORITATIVE scout-alert detector — a server-side background thread (started
     only by the live capturer, not in VIEWER mode). Scans all 4 indices every 30s
     during 09:15-15:30 and writes every NEW/SL/TARGET/BAND to the canonical
     scout_alerts store, WHETHER OR NOT a browser is open. This is the system of
     record; the browser just reads it. Owns _SCOUT_ALERT_STATE so position tracking
-    (and thus SL/TARGET/dedup) is single-sourced. Decision-support only."""
+    (and thus SL/TARGET/dedup) is single-sourced. Decision-support only.
+
+    BOOT RECOVERY — the log is always made whole from 09:15:
+      • if the persisted log already reaches back near the open (a normal pre-open
+        boot), just REHYDRATE the open-position state (instant); else
+      • REPLAY the captured market data to reconstruct every alert that fired before
+        this process existed (mid-day cold start / late feature launch), so the
+        morning is never missing again."""
     import time as _time
+    today = datetime.datetime.now(IST).date().isoformat()
     try:
-        n = _rehydrate_scout_state(
-            _SCOUT_ALERT_STATE, datetime.datetime.now(IST).date().isoformat())
-        print(f"  Scout-alert state rehydrated from today's log "
-              f"({n} open position(s)) — restart-safe, no dup NEW")
+        from core.mirror_io import read_mirror
+        now = datetime.datetime.now(IST)
+        df = read_mirror("scout_alerts", today)
+        existing_min = (df["ts"].min() if (df is not None and not df.empty) else None)
+        # "morning covered" = the log already holds an alert from before 11:00 → the
+        # capturer was clearly running in the morning, so just rehydrate (cheap). A
+        # later/empty earliest means a cold mid-day start → reconstruct the gap. (No
+        # alert can fire before the 09:45 open-gate, and quiet mornings are rare, so
+        # this avoids a needless full-day re-walk on every restart.)
+        have_open = existing_min is not None and existing_min.time() <= datetime.time(11, 0)
+        if (not have_open) and now.time() >= datetime.time(9, 20):
+            t0 = _time.time()
+            # write only the missing span [09:15, existing_min); detection still walks
+            # to `now` to rebuild current state without double-listing live rows.
+            n, st = _backfill_scout_alerts(today, now, write_before=existing_min)
+            _SCOUT_ALERT_STATE.clear()
+            _SCOUT_ALERT_STATE.update(st)
+            opens = sum(1 for v in st.values() if v.get("open"))
+            print(f"  Scout-alert BACKFILL — reconstructed {n} alert(s) from 09:15 "
+                  f"over captured data in {_time.time()-t0:.0f}s ({opens} still open); "
+                  f"morning log now complete")
+        else:
+            k = _rehydrate_scout_state(_SCOUT_ALERT_STATE, today)
+            print(f"  Scout-alert state rehydrated from today's log "
+                  f"({k} open position(s)) — log already covers the open, restart-safe")
     except Exception as e:
-        print(f"  Scout-alert rehydrate skipped: {e}")
+        print(f"  Scout-alert boot recovery skipped: {e}")
     while True:
         try:
             now = datetime.datetime.now(IST)
@@ -3965,26 +4032,31 @@ def _alerts_from_mirror(date):
     fired while only the VM was watching, and is archived per-day for evening review.
     Returns [] if the mirror is missing (e.g. a day before this log existed).
 
-    DEDUPED: collapses rows that are the same event written more than once — same
-    (symbol, kind, strike, minute, band_dir) → one row (earliest kept). The old
-    browser-driven detector could write an event several times (one per open tab, and
-    sub-minute repeats before the open-position flag propagated); the server-side
-    poller is now the single writer, but dedup also cleans those legacy rows so the
-    panel + badge show the TRUE distinct-alert count."""
+    DEDUPED by EVENT, not by exact minute: collapses rows that describe the SAME
+    underlying alert — same (symbol, kind, strike, band_dir) fired within a short
+    window (≤_DEDUP_WIN s) → one row (earliest kept). A single event can be written
+    at slightly different timestamps by different writers (legacy multi-tab browser
+    detection; the 5-min backfill grid time vs the live 30s loop's wall-clock time for
+    a position that spans the backfill/live boundary), so a strict same-minute key
+    leaves ±1-min twins. The window collapse removes those while keeping genuinely
+    separate events (a second break of the same wall 30 min later survives). A held
+    position naturally emits its NEW once, so this only cleans writer-timing skew."""
     from core.mirror_io import read_mirror
     df = read_mirror("scout_alerts", date)
     if df is None or df.empty:
         return []
-    out, seen = [], set()
-    for _, r in df.iterrows():                      # df is ts-ascending → keep earliest
+    _DEDUP_WIN = 240                                 # seconds: same event if within 4 min
+    out, last = [], {}                               # base-key → ts of last kept
+    for _, r in df.iterrows():                       # df is ts-ascending → keep earliest
         kind = str(r.get("kind") or "")
-        t = r["ts"].strftime("%H:%M")
-        key = (str(r.get("symbol") or ""), kind, r.get("strike"), t, r.get("band_dir"))
-        if key in seen:
-            continue
-        seen.add(key)
+        ts = r["ts"]
+        base = (str(r.get("symbol") or ""), kind, r.get("strike"), r.get("band_dir"))
+        prev = last.get(base)
+        if prev is not None and (ts - prev).total_seconds() < _DEDUP_WIN:
+            continue                                 # same event, just a timing twin
+        last[base] = ts
         out.append({
-            "t": t, "d": date, "kind": kind,
+            "t": ts.strftime("%H:%M"), "d": date, "kind": kind,
             "head": r.get("head") or "", "body": r.get("body") or "",
             "color": _ALERT_KIND_COLOR.get(kind, "#e2e8f0"),
             "thin": bool(r.get("thin")),
