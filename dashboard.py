@@ -1559,10 +1559,13 @@ app.layout = dbc.Container([
     # is rendered dynamically inside the Trade Book, and a callback may not use a
     # dynamically-created component as an Input before it exists in the DOM.
     dcc.Store(id="regime-asof", data="now"),
-    # Scout alert state: last verdict per index (to detect a NEW trigger), the alert
-    # log, a fire counter (bumps → clientside notification+beep), and a JS no-op sink.
-    dcc.Store(id="scout-seen",       data={}),
-    dcc.Store(id="scout-alerts",     data=[]),
+    # Scout alert state: last verdict + open/last-resolved trade per index (to detect a
+    # NEW trigger and survive a NO-TRADE blink), the alert log, a fire counter (bumps →
+    # clientside notification+beep), and a JS no-op sink. storage_type="local" so the
+    # trade alert HISTORY survives a tab switch / page reload (was memory → wiped on
+    # every nav); stale prior-day records are purged on the first tick of a new day.
+    dcc.Store(id="scout-seen",       data={}, storage_type="local"),
+    dcc.Store(id="scout-alerts",     data=[], storage_type="local"),
     dcc.Store(id="scout-alert-fire", data=0),
     dcc.Store(id="alert-noop",       data=""),
 
@@ -3241,13 +3244,58 @@ _TIP_RANGE = ("60-MIN volatility cone: spot ± ~1 std-dev of expected move over 
               "time, but STAYS inside the whole hour only ~52% (it wicks out ~half "
               "the time, then closes back in). Destination band, not a fence. HOW "
               "FAR it can travel, not which way — use for stops / targets / sizing.")
-_TIP_BAND = ("NEXT-TF volatility cone: spot ± ~1 std-dev expected move over the "
-             "selected timeframe (the 15m/etc cone, narrower than the 60m range "
-             "above). band ✓ = price closed inside (the ~77% case); band ✗ = it "
-             "broke out (the big-move tail). HOW FAR, not which way.")
+_TIP_BAND = ("FORWARD prediction made RIGHT NOW for the NEXT timeframe — it has not "
+             "happened yet. The arrow (UP/DOWN/RANGE) is the lean; the band is spot ± "
+             "~1 std-dev of expected move over the coming TF (15m/etc cone, narrower "
+             "than the 60m range above). It self-grades once the window elapses: "
+             "⇒ pending → then HIT/MISS on direction and band ✓ (closed inside, ~77%) "
+             "/ band ✗ (broke out, the big-move tail). HOW FAR, not which way.")
 _TIP_TRIG = ("Trade lifecycle: the EXACT minute the gate first fired, the INDEX level "
              "and ATM option premium at that instant, SL/target on the premium, live "
              "P&L, and the manage call (CLOSE / HOLD / BOOK).")
+
+
+def _scout_mem_block(mem, today):
+    """Persistent trade memory for one index, drawn from the live alert brain
+    (scout-seen). Two cases the stateless per-bar scan can't show on its own:
+      • HOLDING — a trade is open but the gate is momentarily NO-TRADE on a forming bar
+        (it would otherwise vanish mid-hold). Keep it on the board.
+      • LAST    — the trade already RESOLVED (SL / target / flip). Instead of the row
+        going silent, show what happened, so a trade you took never just disappears.
+    Live-only overlay; ignored for replay / past days."""
+    if not mem:
+        return None
+    op = mem.get("open")
+    if op and op.get("day") == today:
+        side = op.get("dir"); strike = op.get("strike")
+        seg = (f"📌 HOLDING {strike or ''} {side} since {op.get('trig','?')}"
+               f"  ·  SL ₹{op.get('sl')}  T ₹{op.get('tgt')}"
+               f"  ·  gate flickering NO-TRADE on the forming bar — position still live")
+        if op.get("bb"):
+            seg += "  ·  ⚠ band already broke (move > expected)"
+        return html.Div(seg, style={**MONO, "fontSize": "0.6rem", "color": "#fbbf24",
+                        "fontWeight": "700", "paddingLeft": "120px", "lineHeight": "1.4",
+                        "background": "#15110a", "borderRadius": "3px",
+                        "padding": "2px 6px", "marginLeft": "120px", "marginTop": "2px"})
+    last = mem.get("last")
+    if last and last.get("day") == today:
+        oc = last.get("outcome")
+        face = {"SL": ("🛑", "SL hit", "#ef4444"),
+                "TARGET": ("🎯", "target booked", "#22c55e"),
+                "FLIP": ("↔", "closed / flipped side", "#94a3b8")}.get(
+                    oc, ("•", "closed", "#94a3b8"))
+        emo, word, clr = face
+        side = last.get("dir"); strike = last.get("strike")
+        seg = (f"⟲ last trade: {strike or ''} {side} from {last.get('trig','?')} "
+               f"→ {emo} {word} {last.get('closed_t','')}"
+               f"  (entry ₹{last.get('entry')} → ₹{last.get('cur')})")
+        if last.get("band_broke"):
+            seg += "  ·  band broke"
+        return html.Div(seg, style={**MONO, "fontSize": "0.6rem", "color": clr,
+                        "fontWeight": "700", "paddingLeft": "120px", "lineHeight": "1.4",
+                        "background": "#0a1422", "borderRadius": "3px",
+                        "padding": "2px 6px", "marginLeft": "120px", "marginTop": "2px"})
+    return None
 
 
 def _scout_playbook(r):
@@ -3448,8 +3496,10 @@ def _scout_playbook(r):
     ], style={"marginLeft": "120px", "marginTop": "4px"})
 
 
-def _scout_row(r):
-    """One index row in the scout strip."""
+def _scout_row(r, mem=None, today=None):
+    """One index row in the scout strip. `mem` = this index's persistent trade memory
+    (scout-seen, live-only) so a held trade survives a NO-TRADE blink and a resolved
+    trade shows its outcome instead of vanishing."""
     if not r.get("has_data"):
         return html.Div(f"{r['label']}: {r.get('note','warming up')}",
                         style={**MONO, "fontSize": "0.6rem", "color": "#475569",
@@ -3515,7 +3565,7 @@ def _scout_row(r):
     # forward prediction over the selected horizon + (replay) grade
     pdir = r.get("pred_dir", "RANGE")
     pclr = {"UP": "#34d399", "DOWN": "#f87171"}.get(pdir, "#fbbf24")
-    pred_txt = (f"↪ next {r.get('horizon', r['tf'])}m: {pdir}"
+    pred_txt = (f"↪ predict next {r.get('horizon', r['tf'])}m: {pdir}"
                 + (f" → {r['pred_target']}" if r.get("pred_target") else "")
                 + (f"  band[{r['pred_lo']}, {r['pred_hi']}]" if r.get("pred_lo") else ""))
     pred_kids = [html.Span(pred_txt, title=_TIP_BAND,
@@ -3551,16 +3601,26 @@ def _scout_row(r):
                                    if (op.get("warming") or op.get("phase") == "OPENING") else "#0a1422",
                                    "borderRadius": "3px", "padding": "2px 6px",
                                    "marginLeft": "120px", "marginTop": "2px"})
-    kids = ([head] + ([open_blk] if open_blk else []) + ([trade_blk] if trade_blk else [])
+    # Trade memory: only when the live scan ISN'T already showing a current trade for
+    # this row (no lifecycle) — i.e. the gate has gone NO-TRADE but a position is still
+    # open (blink) or recently resolved. Avoids double-rendering the active trade.
+    mem_blk = _scout_mem_block(mem, today) if not lc else None
+    kids = ([head] + ([open_blk] if open_blk else [])
+            + ([trade_blk] if trade_blk else []) + ([mem_blk] if mem_blk else [])
             + [pred, why, _scout_playbook(r)])
     return html.Div(kids,
                     style={"background": bg, "border": f"1px solid {clr if trade else '#1e293b'}",
                            "borderRadius": "5px", "padding": "5px 10px", "marginBottom": "4px"})
 
 
-def _charts_scout_panel(tf_min, date, as_of_dt, live=False):
+def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None):
     import intraday_scout as scout
     rows = scout.scan(int(tf_min or 15), date, as_of_dt)
+    # Overlay the live trade brain ONLY for the live 15m view (the alert detector that
+    # fills scout-seen scans at 15m). On replay / a different TF the per-bar scan is the
+    # honest source, so no overlay.
+    seen = seen if (live and int(tf_min or 15) == 15) else {}
+    today = datetime.datetime.now(IST).date().isoformat()
     when = ("LIVE" if live else
             f"replay @ {as_of_dt:%H:%M}" if as_of_dt else f"{date} full day")
     n_trade = sum(1 for r in rows if r.get("has_data") and r["verdict"].startswith("TRADE"))
@@ -3593,9 +3653,11 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False):
     ], style={"fontSize": "0.54rem", "marginTop": "5px", "lineHeight": "1.35",
               "background": "#1a0c0c", "border": "1px solid #7f1d1d",
               "borderRadius": "4px", "padding": "5px 8px"})
-    return html.Div([title] + [_scout_row(r) for r in rows] + [note],
-                    style={"background": "#070d18", "border": "1px solid #1e293b",
-                           "borderRadius": "6px", "padding": "8px 12px"})
+    return html.Div(
+        [title] + [_scout_row(r, mem=(seen or {}).get(r.get("sym")), today=today)
+                   for r in rows] + [note],
+        style={"background": "#070d18", "border": "1px solid #1e293b",
+               "borderRadius": "6px", "padding": "8px 12px"})
 
 
 @app.callback(
@@ -3605,8 +3667,9 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False):
     Input("news-date",   "data"),
     Input("sel-sym",     "data"),
     Input("setup-tick",  "n_intervals"),
+    State("scout-seen",  "data"),
 )
-def _update_charts_scout(tf, asof, date, sel, _tick):
+def _update_charts_scout(tf, asof, date, sel, _tick, seen):
     """Multi-index TRADE/NO-TRADE scan. LIVE (no Replay time, today): as_of=now so the
     trade lifecycle (trigger/entry/SL/target/manage/P&L) renders, and the 30s tick
     refreshes the board so a NEW trigger appears on its own. An explicit Replay time
@@ -3627,7 +3690,7 @@ def _update_charts_scout(tf, asof, date, sel, _tick):
     else:                                              # LIVE now
         day, as_of_dt, live = today, datetime.datetime.now(IST), True
     try:
-        return _charts_scout_panel(tf, day, as_of_dt, live=live)
+        return _charts_scout_panel(tf, day, as_of_dt, live=live, seen=seen)
     except Exception as exc:
         return _recon_note(f"Scout unavailable ({type(exc).__name__}: {exc}).")
 
@@ -3656,7 +3719,8 @@ def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
         body = (f"index {spot} broke the 15m band [{pos.get('bl')}, {pos.get('bh')}]"
                 " — move bigger than expected")
         color = "#60a5fa"
-    return {"t": now.strftime("%H:%M"), "label": label, "kind": kind,
+    return {"t": now.strftime("%H:%M"), "d": now.date().isoformat(),
+            "label": label, "kind": kind, "strike": strike, "side": side,
             "head": head, "body": body, "color": color, "thin": pos.get("thin", False)}
 
 
@@ -3707,13 +3771,15 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
         # ── manage an OPEN position (gate-independent, survives NO-TRADE blinks) ────
         if pos:
             cur = scout._opt_premium(sym, today, now, pos.get("strike"), pos["dir"])
-            closed = False
+            closed = outcome = None
             if cur is not None and pos.get("sl") and cur <= pos["sl"]:
-                events.append(_scout_alert_rec(now, pos, "SL", cur=round(cur, 2))); closed = True
+                events.append(_scout_alert_rec(now, pos, "SL", cur=round(cur, 2)))
+                closed, outcome = True, "SL"
             elif cur is not None and pos.get("tgt") and cur >= pos["tgt"]:
-                events.append(_scout_alert_rec(now, pos, "TARGET", cur=round(cur, 2))); closed = True
+                events.append(_scout_alert_rec(now, pos, "TARGET", cur=round(cur, 2)))
+                closed, outcome = True, "TARGET"
             elif v.startswith("TRADE") and r.get("direction") != pos["dir"]:
-                closed = True                            # flipped to the other side
+                closed, outcome = True, "FLIP"           # flipped to the other side
             if not closed:
                 if (not pos.get("bb")) and spot and pos.get("bl") and pos.get("bh") \
                         and (spot > pos["bh"] or spot < pos["bl"]):
@@ -3723,19 +3789,34 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
                 st["open"] = pos
                 seen[sym] = st
                 continue
-            st["open"] = None                            # position closed → free to re-open
+            # position closed → record the RESOLVED episode so the charts board can
+            # still show what happened (instead of the trade silently vanishing), then
+            # free the slot to re-open.
+            st["last"] = {"day": today, "dir": pos["dir"], "strike": pos.get("strike"),
+                          "entry": pos.get("entry"), "sl": pos.get("sl"),
+                          "tgt": pos.get("tgt"), "trig": pos.get("trig"),
+                          "band_broke": bool(pos.get("bb")),
+                          "outcome": outcome, "cur": round(cur, 2) if cur is not None else None,
+                          "closed_t": now.strftime("%H:%M"), "label": pos["label"]}
+            st["open"] = None
         # ── open a NEW position when a trade is live and none is open ───────────────
         if v.startswith("TRADE"):
             pos = {"day": today, "dir": r.get("direction"),
                    "strike": lc.get("entry_strike") or r.get("atm"),
                    "entry": lc.get("entry_prem"), "sl": lc.get("sl"), "tgt": lc.get("target"),
                    "bl": r.get("pred_lo"), "bh": r.get("pred_hi"), "bb": False,
+                   "trig": now.strftime("%H:%M"),
                    "label": r["label"], "thin": bool(r.get("thin")), "spot": spot}
             events.append(_scout_alert_rec(now, pos, "NEW"))
             st["open"] = pos
         seen[sym] = st
+    # purge any prior-day alerts on the first tick of a new session (local store persists
+    # across days) so the panel only ever shows TODAY's trade history.
+    log = [a for a in (alerts or []) if a.get("d") == today]
     if events:
-        return seen, (events + list(alerts or []))[:50], int(fire or 0) + 1
+        return seen, (events + log)[:50], int(fire or 0) + 1
+    if log != list(alerts or []):                # purged stale rows → write back
+        return seen, log, no_update
     return seen, no_update, no_update          # persist state; no re-render churn
 
 
@@ -3763,6 +3844,8 @@ def _render_alerts(alerts, sel):
     from dash.exceptions import PreventUpdate
     if sel != "ALERTS":
         raise PreventUpdate
+    today = datetime.datetime.now(IST).date().isoformat()
+    alerts = [a for a in (alerts or []) if a.get("d", today) == today]
     note = html.Div([
         html.Span("⛔ Decision-support only. ", style={"color": "#f87171", "fontWeight": "700"}),
         html.Span("The CE/PE arrow is measured negative-EV — these are structural "
