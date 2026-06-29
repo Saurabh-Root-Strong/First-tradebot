@@ -1420,7 +1420,17 @@ app.layout = dbc.Container([
                 dbc.Row([
                     dbc.Col(html.Span("🔔 TRADE ALERTS", style={
                         "color": "#fbbf24", "fontWeight": "700", "fontSize": "0.9rem",
-                        "letterSpacing": "0.06em", "paddingTop": "6px"}), md=4),
+                        "letterSpacing": "0.06em", "paddingTop": "6px"}), md=3),
+                    dbc.Col([
+                        html.Span("hour ", style={"fontSize": "0.6rem", "color": "#64748b",
+                                                  "fontWeight": "700"}),
+                        dcc.Dropdown(
+                            id="alert-hour", clearable=False, value="all",
+                            options=[{"label": "all day", "value": "all"}] +
+                                    [{"label": f"{h:02d}:00", "value": h} for h in range(9, 16)],
+                            style={"width": "110px", "display": "inline-block",
+                                   "fontSize": "0.62rem", "verticalAlign": "middle"}),
+                    ], md=3, style={"paddingTop": "4px"}),
                     dbc.Col([
                         html.Button("Enable browser notifications", id="alert-perm-btn",
                                     n_clicks=0, style={
@@ -1430,7 +1440,7 @@ app.layout = dbc.Container([
                                         "padding": "4px 10px", "cursor": "pointer"}),
                         html.Span(id="alert-perm-status", style={
                             "fontSize": "0.56rem", "color": "#64748b", "marginLeft": "8px"}),
-                    ], md=8, style={"textAlign": "right", "paddingTop": "4px"}),
+                    ], md=6, style={"textAlign": "right", "paddingTop": "4px"}),
                 ], className="mb-2 align-items-center"),
                 html.Div(id="alerts-content"),
             ]),
@@ -3886,8 +3896,9 @@ def _alerts_from_mirror(date):
     Input("scout-alerts", "data"),
     Input("sel-sym", "data"),
     Input("news-date", "data"),
+    Input("alert-hour", "value"),
 )
-def _render_alerts(alerts, sel, date):
+def _render_alerts(alerts, sel, date, hour):
     from dash.exceptions import PreventUpdate
     if sel != "ALERTS":
         raise PreventUpdate
@@ -3914,9 +3925,22 @@ def _render_alerts(alerts, sel, date):
         return html.Div([note, html.Div(
             msg, style={"color": "#475569", "fontSize": "0.7rem", "padding": "10px"})])
 
-    # ── tally header: how many SL / TARGET / BAND / NEW fired this day ──────────────
+    # ── hour filter: show only the selected trading hour's alerts (tally over it) ────
+    def _hr(a):
+        try:
+            return int(str(a.get("t", ""))[:2])
+        except ValueError:
+            return -1
+    if hour not in (None, "all"):
+        shown = [a for a in recs if _hr(a) == int(hour)]
+        scope = f"{int(hour):02d}:00–{int(hour):02d}:59"
+    else:
+        shown = recs
+        scope = "all day"
+
+    # ── tally header: how many SL / TARGET / BAND / NEW in the shown scope ───────────
     tally = {}
-    for a in recs:
+    for a in shown:
         tally[a.get("kind", "")] = tally.get(a.get("kind", ""), 0) + 1
     chips = []
     for kind, glyph in (("NEW", "▶ opened"), ("TARGET", "🎯 target"),
@@ -3927,12 +3951,17 @@ def _render_alerts(alerts, sel, date):
             style={"color": _ALERT_KIND_COLOR.get(kind, "#94a3b8") if n else "#475569",
                    "fontWeight": "700", "marginRight": "12px"}))
     summary = html.Div(
-        [html.Span(f"{date}  ", style={"color": "#64748b", "fontWeight": "700"})] + chips,
+        [html.Span(f"{date} · {scope}  ", style={"color": "#64748b", "fontWeight": "700"})] + chips,
         style={**MONO, "fontSize": "0.62rem", "marginBottom": "8px", "padding": "5px 8px",
                "background": "#0b1220", "border": "1px solid #1e293b", "borderRadius": "4px"})
 
+    if not shown:
+        return html.Div([note, summary, html.Div(
+            f"No alerts in {scope}.",
+            style={"color": "#475569", "fontSize": "0.7rem", "padding": "10px"})])
+
     rows = []
-    for a in recs:
+    for a in shown:
         bits = [
             html.Span(f"{a['t']}  ", style={"color": "#fbbf24", "fontWeight": "700"}),
             html.Span(a.get("head", ""), style={"color": a.get("color", "#e2e8f0"),
