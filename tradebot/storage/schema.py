@@ -162,6 +162,36 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
     expiry  BIGINT NOT NULL DEFAULT 0,   -- option expiry epoch (0 = legacy single-expiry)
     PRIMARY KEY (ts, symbol, strike, side, expiry)
 );
+
+-- ── Scout trade-alert log ──────────────────────────────────────────────────────
+-- Canonical server-side record of every lifecycle alert the scout fires:
+--   NEW    a trade lean opened (CALL/PUT buy)
+--   SL     the open trade's premium hit the stop
+--   TARGET the open trade booked the target
+--   BAND   index broke the forward range band at trigger (move > expected)
+-- The dashboard's localStorage alert list is a per-browser, capped convenience copy;
+-- THIS is the authoritative, archived, multi-device evening-review record (one row
+-- per fired event). Survives a browser clear and is captured even when the only
+-- viewer is the VM. Decision-support only (the CE/PE arrow is measured negative-EV).
+CREATE TABLE IF NOT EXISTS scout_alerts (
+    ts        TIMESTAMPTZ NOT NULL,
+    date      DATE        NOT NULL,
+    symbol    VARCHAR     NOT NULL,
+    kind      VARCHAR     NOT NULL,   -- NEW | SL | TARGET | BAND
+    label     VARCHAR,                -- display name e.g. "NIFTY 50"
+    side      VARCHAR,                -- CE | PE
+    strike    INTEGER,
+    entry     DOUBLE,                 -- entry premium (NEW)
+    sl        DOUBLE,
+    tgt       DOUBLE,
+    cur       DOUBLE,                 -- premium at the event (SL/TARGET)
+    spot      DOUBLE,                 -- index level at the event
+    band_dir  VARCHAR,                -- above | below (BAND)
+    head      VARCHAR,                -- preformatted headline (matches the UI)
+    body      VARCHAR,                -- preformatted detail line
+    thin      BOOLEAN     DEFAULT FALSE,
+    PRIMARY KEY (ts, symbol, kind)
+);
 """
 
 # The six core capture tables, in canonical order (chain_snapshots is per-strike

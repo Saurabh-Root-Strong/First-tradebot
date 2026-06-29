@@ -47,7 +47,7 @@ _LIVE_DIR = _DB_DIR / "live"   # Parquet snapshots for concurrent reads during l
 _PARQUET_TABLES = (
     "ticks", "candles", "oi_snapshots",
     "futures_quotes", "signals", "trade_setups",
-    "chain_snapshots",
+    "chain_snapshots", "scout_alerts",
 )
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -151,6 +151,17 @@ class IntradayDB:
         if rows:
             self._push(("chain", sym, ts, rows))
 
+    def write_scout_alert(self, sym: str, ts, alert: dict) -> None:
+        """Persist ONE fired scout lifecycle alert (NEW/SL/TARGET/BAND) to the
+        canonical per-day store + parquet mirror.
+
+        This is the authoritative, archived, multi-device evening-review log — the
+        dashboard's localStorage alert list is only a per-browser convenience copy.
+        Non-blocking; drops silently if the queue is full.
+        Decision-support only (the CE/PE arrow is measured negative-EV)."""
+        if alert:
+            self._push(("scout_alert", sym, ts, alert))
+
     def write_setup(
         self,
         sym: str, tf: str, signal: str,
@@ -218,7 +229,7 @@ class IntradayDB:
     def session_stats(self, date: datetime.date | None = None) -> dict[str, int]:
         target = date or datetime.datetime.now(tz=IST).date()
         counts: dict[str, int] = {}
-        for tbl in ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals", "trade_setups", "chain_snapshots"):
+        for tbl in ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals", "trade_setups", "chain_snapshots", "scout_alerts"):
             df = self.query(f"SELECT COUNT(*) AS n FROM {tbl}", target)
             counts[tbl] = int(df.iloc[0]["n"]) if not df.empty else 0
         return counts
@@ -539,6 +550,32 @@ class IntradayDB:
                  str(phase),
                  round(float(spot   or 0), 2),
                  round(float(atm_iv or 0), 3)],
+            )
+
+        elif kind == "scout_alert":
+            _, sym, ts, a = rec
+            if hasattr(ts, "tzinfo") and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=IST)
+
+            def _f(x):
+                try:
+                    return round(float(x), 2) if x is not None else None
+                except (TypeError, ValueError):
+                    return None
+
+            con.execute(
+                """INSERT INTO scout_alerts
+                       (ts, date, symbol, kind, label, side, strike,
+                        entry, sl, tgt, cur, spot, band_dir, head, body, thin)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT DO NOTHING""",
+                [ts, today, sym, str(a.get("kind") or ""),
+                 a.get("label"), a.get("side"),
+                 (int(a["strike"]) if a.get("strike") is not None else None),
+                 _f(a.get("entry")), _f(a.get("sl")), _f(a.get("tgt")),
+                 _f(a.get("cur")), _f(a.get("spot")),
+                 a.get("band_dir"), a.get("head"), a.get("body"),
+                 bool(a.get("thin"))],
             )
 
 

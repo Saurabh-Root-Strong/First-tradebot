@@ -3721,7 +3721,11 @@ def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
         color = "#60a5fa"
     return {"t": now.strftime("%H:%M"), "d": now.date().isoformat(),
             "label": label, "kind": kind, "strike": strike, "side": side,
-            "head": head, "body": body, "color": color, "thin": pos.get("thin", False)}
+            "head": head, "body": body, "color": color, "thin": pos.get("thin", False),
+            # raw fields for the canonical server-side log (intraday_db.scout_alerts)
+            "entry": entry, "sl": sl, "tgt": tgt, "cur": cur,
+            "spot": spot if spot is not None else pos.get("spot"),
+            "band_dir": band_dir}
 
 
 @app.callback(
@@ -3751,6 +3755,21 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
     if not (datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
         raise PreventUpdate
     import intraday_scout as scout
+    import os as _os
+    from intraday_db import idb
+    # Persist alerts canonically ONLY when this process is the live capturer. In
+    # VIEWER mode (DASH_VIEWER=1) the dashboard reads VM-synced mirrors and must not
+    # write — a write would trigger _export_parquet and CLOBBER the synced mirrors.
+    _persist = _os.environ.get("DASH_VIEWER") != "1"
+
+    def _emit(sym, ev):
+        events.append(ev)
+        if _persist:
+            try:
+                idb.write_scout_alert(sym, now, ev)
+            except Exception:
+                pass
+
     seen = dict(seen or {})
     today = now.date().isoformat()
     try:
@@ -3773,17 +3792,17 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
             cur = scout._opt_premium(sym, today, now, pos.get("strike"), pos["dir"])
             closed = outcome = None
             if cur is not None and pos.get("sl") and cur <= pos["sl"]:
-                events.append(_scout_alert_rec(now, pos, "SL", cur=round(cur, 2)))
+                _emit(sym, _scout_alert_rec(now, pos, "SL", cur=round(cur, 2)))
                 closed, outcome = True, "SL"
             elif cur is not None and pos.get("tgt") and cur >= pos["tgt"]:
-                events.append(_scout_alert_rec(now, pos, "TARGET", cur=round(cur, 2)))
+                _emit(sym, _scout_alert_rec(now, pos, "TARGET", cur=round(cur, 2)))
                 closed, outcome = True, "TARGET"
             elif v.startswith("TRADE") and r.get("direction") != pos["dir"]:
                 closed, outcome = True, "FLIP"           # flipped to the other side
             if not closed:
                 if (not pos.get("bb")) and spot and pos.get("bl") and pos.get("bh") \
                         and (spot > pos["bh"] or spot < pos["bl"]):
-                    events.append(_scout_alert_rec(now, pos, "BAND", spot=spot,
+                    _emit(sym, _scout_alert_rec(now, pos, "BAND", spot=spot,
                                   band_dir=("above" if spot > pos["bh"] else "below")))
                     pos["bb"] = True
                 st["open"] = pos
@@ -3807,7 +3826,7 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
                    "bl": r.get("pred_lo"), "bh": r.get("pred_hi"), "bb": False,
                    "trig": now.strftime("%H:%M"),
                    "label": r["label"], "thin": bool(r.get("thin")), "spot": spot}
-            events.append(_scout_alert_rec(now, pos, "NEW"))
+            _emit(sym, _scout_alert_rec(now, pos, "NEW"))
             st["open"] = pos
         seen[sym] = st
     # purge any prior-day alerts on the first tick of a new session (local store persists
@@ -3835,17 +3854,52 @@ def _alert_badge(alerts):
     return str(n), {**base, "display": "inline-block"}
 
 
+_ALERT_KIND_COLOR = {"SL": "#ef4444", "TARGET": "#22c55e",
+                     "BAND": "#60a5fa", "NEW": "#34d399"}
+
+
+def _alerts_from_mirror(date):
+    """Read the canonical server-side alert log (intraday_db.scout_alerts mirror) for
+    a day → list of UI alert recs (newest first). This is the authoritative record:
+    survives a browser cache-clear, is the SAME on every device, captures alerts that
+    fired while only the VM was watching, and is archived per-day for evening review.
+    Returns [] if the mirror is missing (e.g. a day before this log existed)."""
+    from core.mirror_io import read_mirror
+    df = read_mirror("scout_alerts", date)
+    if df is None or df.empty:
+        return []
+    out = []
+    for _, r in df.iterrows():
+        kind = str(r.get("kind") or "")
+        out.append({
+            "t": r["ts"].strftime("%H:%M"), "d": date, "kind": kind,
+            "head": r.get("head") or "", "body": r.get("body") or "",
+            "color": _ALERT_KIND_COLOR.get(kind, "#e2e8f0"),
+            "thin": bool(r.get("thin")),
+        })
+    out.reverse()   # newest first (mirror is ts-ascending)
+    return out
+
+
 @app.callback(
     Output("alerts-content", "children"),
     Input("scout-alerts", "data"),
     Input("sel-sym", "data"),
+    Input("news-date", "data"),
 )
-def _render_alerts(alerts, sel):
+def _render_alerts(alerts, sel, date):
     from dash.exceptions import PreventUpdate
     if sel != "ALERTS":
         raise PreventUpdate
     today = datetime.datetime.now(IST).date().isoformat()
-    alerts = [a for a in (alerts or []) if a.get("d", today) == today]
+    date = date or today
+    # Source of truth = the canonical server-side log (archived, device-independent).
+    # Fall back to the per-browser localStorage list only for TODAY when the mirror is
+    # not yet written (very start of session / pure replay box).
+    recs = _alerts_from_mirror(date)
+    if not recs and date == today:
+        recs = [a for a in (alerts or []) if a.get("d", today) == today]
+
     note = html.Div([
         html.Span("⛔ Decision-support only. ", style={"color": "#f87171", "fontWeight": "700"}),
         html.Span("The CE/PE arrow is measured negative-EV — these are structural "
@@ -3853,12 +3907,32 @@ def _render_alerts(alerts, sel):
                   style={"color": "#94a3b8"}),
     ], style={"fontSize": "0.56rem", "marginBottom": "8px", "background": "#1a0c0c",
               "border": "1px solid #7f1d1d", "borderRadius": "4px", "padding": "5px 8px"})
-    if not alerts:
+
+    if not recs:
+        msg = ("No triggers yet today — the board is scanned every 30s during market hours."
+               if date == today else f"No scout alerts logged on {date}.")
         return html.Div([note, html.Div(
-            "No triggers yet today — the board is scanned every 30s during market hours.",
-            style={"color": "#475569", "fontSize": "0.7rem", "padding": "10px"})])
+            msg, style={"color": "#475569", "fontSize": "0.7rem", "padding": "10px"})])
+
+    # ── tally header: how many SL / TARGET / BAND / NEW fired this day ──────────────
+    tally = {}
+    for a in recs:
+        tally[a.get("kind", "")] = tally.get(a.get("kind", ""), 0) + 1
+    chips = []
+    for kind, glyph in (("NEW", "▶ opened"), ("TARGET", "🎯 target"),
+                        ("SL", "🛑 stop"), ("BAND", "📊 band")):
+        n = tally.get(kind, 0)
+        chips.append(html.Span(
+            f"{glyph}: {n}",
+            style={"color": _ALERT_KIND_COLOR.get(kind, "#94a3b8") if n else "#475569",
+                   "fontWeight": "700", "marginRight": "12px"}))
+    summary = html.Div(
+        [html.Span(f"{date}  ", style={"color": "#64748b", "fontWeight": "700"})] + chips,
+        style={**MONO, "fontSize": "0.62rem", "marginBottom": "8px", "padding": "5px 8px",
+               "background": "#0b1220", "border": "1px solid #1e293b", "borderRadius": "4px"})
+
     rows = []
-    for a in alerts:
+    for a in recs:
         bits = [
             html.Span(f"{a['t']}  ", style={"color": "#fbbf24", "fontWeight": "700"}),
             html.Span(a.get("head", ""), style={"color": a.get("color", "#e2e8f0"),
@@ -3869,7 +3943,7 @@ def _render_alerts(alerts, sel):
             bits.append(html.Span("  ⚠ thin", style={"color": "#f59e0b"}))
         rows.append(html.Div(bits, style={**MONO, "fontSize": "0.66rem", "padding": "5px 8px",
                                           "borderBottom": "1px solid #1e293b"}))
-    return html.Div([note] + rows)
+    return html.Div([note, summary] + rows)
 
 
 # Clientside: on a new alert, browser notification + a short beep.
