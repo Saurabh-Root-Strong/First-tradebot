@@ -86,6 +86,7 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
     atm_ppe: dict = {}
     atm_dce: dict = {}
     atm_dpe: dict = {}
+    atm_k: dict = {}
     if common.size:
         # Only timestamps present on BOTH legs — a partial snapshot (CE without PE,
         # the known L2 capture gap) must skip, not KeyError and blank the whole chart.
@@ -99,6 +100,7 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
                 straddle[ts] = float(cval) + float(pval)
                 atm_pce[ts] = float(cval)        # per-leg ATM premium AT strike k —
                 atm_ppe[ts] = float(pval)        # same strike as the delta below
+                atm_k[ts] = float(k)             # the rolling ATM strike (roll-aware resid)
             if ce_d is not None and k in ce_d.columns and ts in ce_d.index:
                 dv = ce_d.at[ts, k]
                 if pd.notna(dv):
@@ -112,6 +114,7 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
     atm_ppe_s = pd.Series(atm_ppe, dtype=float).sort_index()
     atm_dce_s = pd.Series(atm_dce, dtype=float).sort_index()
     atm_dpe_s = pd.Series(atm_dpe, dtype=float).sort_index()
+    atm_k_s   = pd.Series(atm_k, dtype=float).sort_index()
 
     # Cumulative day option volume (summed across strikes) — per-bar later via diff.
     cum_vol = chain.groupby("ts")["volume"].sum().sort_index()
@@ -150,6 +153,7 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
                      else prem_pe.reindex(idx, method="ffill") if prem_pe is not None else np.nan)
     df["dlt_ce"]  = atm_dce_s.reindex(idx, method="ffill") if len(atm_dce_s) else np.nan
     df["dlt_pe"]  = atm_dpe_s.reindex(idx, method="ffill") if len(atm_dpe_s) else np.nan
+    df["atm_k"]   = atm_k_s.reindex(idx, method="ffill") if len(atm_k_s) else np.nan
 
     # Resample to tf-minute bars: point-in-time (last) for level series; volume is the
     # in-bar increment of the cumulative total.
@@ -165,6 +169,7 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
         "prem_pe": rs["prem_pe"].last(),
         "dlt_ce":  rs["dlt_ce"].last(),
         "dlt_pe":  rs["dlt_pe"].last(),
+        "atm_k":   rs["atm_k"].last(),
     }).dropna(how="all")
     bar = bar[bar[["premium", "cum_vol"]].notna().any(axis=1)]
     if not len(bar):
@@ -212,8 +217,50 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
     # since atm_call_iv == atm_put_iv in the feed.)
     d_oi_ce, d_oi_pe = bar["oi_ce"].diff(), bar["oi_pe"].diff()
     d_spot = bar["spot"].diff()
-    res_ce = bar["prem_ce"].diff() - bar["dlt_ce"].fillna(0.0) * d_spot
-    res_pe = bar["prem_pe"].diff() - bar["dlt_pe"].fillna(0.0) * d_spot
+
+    # ── ROLL-AWARE delta-adjusted residual (fixes a systematic LONG bias) ─────────
+    # The ATM strike k ROLLS with spot (k = nearest strike to spot, recomputed every
+    # snapshot), so bar["prem_ce"].diff() compares DIFFERENT strikes on a trending bar.
+    # On a down day the ATM rolls DOWN: the ATM-call series jumps UP and the ATM-put DOWN
+    # purely from the strike change → res_ce reads positive → calls mislabeled BUY/COVER
+    # (bullish). That faked a 95%-CALL scout across 8 days (2026-06-29: calls "bought" on
+    # 33/49 down bars while the market fell and IV doubled). FIX: hold the PRIOR bar's ATM
+    # strike FIXED across the bar pair and measure THAT option's actual move (what a holder
+    # experienced), delta-adjusted with that strike's delta — no roll artifact.
+    bar_k = bar["atm_k"]
+    idxb = bar.index
+
+    def _leg_at(piv, ts, k):
+        if piv is None or k != k or k not in piv.columns:
+            return np.nan
+        v = piv[k].asof(ts)
+        return float(v) if pd.notna(v) else np.nan
+
+    dprem_ce = pd.Series(np.nan, index=idxb)
+    dprem_pe = pd.Series(np.nan, index=idxb)
+    dlt_ce_k = pd.Series(np.nan, index=idxb)
+    dlt_pe_k = pd.Series(np.nan, index=idxb)
+    for i in range(1, len(idxb)):
+        kk = bar_k.iloc[i - 1]                     # hold the PRIOR bar's ATM strike fixed
+        t0, t1 = idxb[i - 1], idxb[i]
+        dprem_ce.iloc[i] = _leg_at(ce, t1, kk) - _leg_at(ce, t0, kk)
+        dprem_pe.iloc[i] = _leg_at(pe, t1, kk) - _leg_at(pe, t0, kk)
+        dlt_ce_k.iloc[i] = _leg_at(ce_d, t0, kk)
+        dlt_pe_k.iloc[i] = _leg_at(pe_d, t0, kk)
+    # fall back to the (rolling) ATM diff only where the fixed-strike read is unavailable
+    res_ce = dprem_ce.fillna(bar["prem_ce"].diff()) - dlt_ce_k.fillna(bar["dlt_ce"]).fillna(0.0) * d_spot
+    res_pe = dprem_pe.fillna(bar["prem_pe"].diff()) - dlt_pe_k.fillna(bar["dlt_pe"]).fillna(0.0) * d_spot
+
+    # ── VEGA / IV common-mode strip ──────────────────────────────────────────────
+    # Even at a fixed strike a down-day IV spike (vega>0) lifts BOTH legs; the feed's ATM
+    # IV is one market-wide value and ATM call & put have ~equal vega, so that push is
+    # COMMON-MODE to res_ce/res_pe. A genuine DIRECTIONAL flow moves the legs OPPOSITELY;
+    # a vol expansion moves them TOGETHER. Subtract the per-bar common mean → keep the
+    # directional (differential) demand, drop the vega artifact (no captured vega needed).
+    # Per-strike build_strike_series is single-leg so this applies only to the aggregate.
+    _common = (res_ce + res_pe) / 2.0
+    res_ce = res_ce - _common
+    res_pe = res_pe - _common
     eps_ce = max(1.0, 0.10 * float(d_oi_ce.abs().median() or 0))
     eps_pe = max(1.0, 0.10 * float(d_oi_pe.abs().median() or 0))
 

@@ -239,13 +239,19 @@ def _futures_signal(sym: str, tf_min: int, date, as_of) -> tuple[float, str]:
     if not f.get("has_data"):
         return 0.0, ""
     s, bits = 0.0, []
-    # 1) basis sign: contango (fut>spot) bullish, backwardation bearish
-    basis = _last(f.get("basis") or [], 1)
-    if basis:
-        b = basis[-1]
-        if abs(b) > 1.0:
+    # 1) basis vs its OWN session norm — NOT the raw sign. Index futures sit in structural
+    # contango (cost-of-carry), so basis>0 is the resting state, not a bull signal; using
+    # the sign made fut vote bullish 76% of the time (audit_signals) and the term tested
+    # ANTI-predictive. Only basis RICH/CHEAP vs the day's mean is directional (longs paying
+    # up = rising premium = bullish). De-meaned + a 0.5σ deadband kills the structural lean.
+    basis_all = [v for v in (f.get("basis") or []) if v is not None]
+    if len(basis_all) >= 3:
+        bmean = sum(basis_all) / len(basis_all)
+        bstd = (sum((x - bmean) ** 2 for x in basis_all) / len(basis_all)) ** 0.5
+        b = basis_all[-1] - bmean
+        if bstd > 0 and abs(b) > 0.5 * bstd:
             s += 0.35 if b > 0 else -0.35
-            bits.append(f"basis {b:+.0f} ({'contango' if b > 0 else 'backwardation'})")
+            bits.append(f"basis {basis_all[-1]:+.0f} ({'rich' if b > 0 else 'cheap'} vs day)")
     # 2) futures own move over recent bars
     near = _last(f.get("near") or f.get("close") or [], _RECENT + 1)
     if len(near) > 1 and near[-1] != near[0]:
