@@ -107,6 +107,13 @@ _TRADE_TH = 0.22           # min |strength| to consider a trade
 # after that CI clears — never wire structure to the live arrow blind.
 _STRUCT_VETO = False
 
+# TREND VETO: don't fight the day trend — veto a CE in a confirmed DOWN day / a PE in a
+# confirmed UP day (price_structure.regime + trend_veto). The 2026-06-29 SL audit said
+# the arrow's killer is WRONG DIRECTION (32/34 CE on a down day), not S/R. Same rule:
+# computed + displayed + harvested ALWAYS, acts on the verdict only when True. DEFAULT
+# OFF until backtest_scout's trend-veto grade clears OOS.
+_TREND_VETO = False
+
 
 def _last(seq, n: int = 1):
     """Last n non-None values of a list, oldest→newest. [] if none."""
@@ -647,6 +654,11 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     struct_veto, struct_veto_reason = ps.veto(struct, direction)
     if _STRUCT_VETO and struct_veto and verdict.startswith("TRADE"):
         verdict, direction = "NO-TRADE", ""
+    # day-trend regime — the orthogonal "don't fight the trend" family (SL audit fix)
+    regime = ps.regime(ser)
+    trend_veto, trend_veto_reason = ps.trend_veto(regime, direction)
+    if _TREND_VETO and trend_veto and verdict.startswith("TRADE"):
+        verdict, direction = "NO-TRADE", ""
 
     reasons = []
     for k in ("flow", "div", "cross", "fut"):
@@ -661,8 +673,12 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     s_sum = ps.summary(struct)
     if s_sum:
         reasons.append(s_sum)
+    if regime.get("trend") and regime["trend"] != "NEUTRAL":
+        reasons.append(f"day trend {regime['trend']} ({regime.get('day_pct')}% vs open)")
     if struct_veto_reason:
         reasons.append(struct_veto_reason + ("" if _STRUCT_VETO else " (measured, not enforced)"))
+    if trend_veto_reason:
+        reasons.append(trend_veto_reason + ("" if _TREND_VETO else " (measured, not enforced)"))
 
     # ── opening context (gap type / opening range / session phase) ───────────────
     opening = _opening_context(sym, date, as_of)
@@ -704,6 +720,7 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         "lifecycle": lifecycle,
         "reasons": reasons,
         "struct": struct, "struct_veto": bool(struct_veto),
+        "regime": regime, "trend_veto": bool(trend_veto),
         "parts": {k: round(parts[k][0], 3) for k in _W},
         "range_lo": fcst.get("lo"), "range_hi": fcst.get("hi"),
         "range_pct": fcst.get("exp_move_pct"),

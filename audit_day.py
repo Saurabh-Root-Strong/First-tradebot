@@ -104,13 +104,15 @@ def episodes(sym, tf):
                 atm = full.get("atm")
                 entry = scout._opt_premium(sym, DATE, t, atm, d) if atm else None
                 st = full.get("struct") or {}
+                rg = full.get("regime") or {}
                 veto, vr = ps.veto(st, d)
                 ep = {"t": t.strftime("%H:%M"), "dir": d, "strike": atm,
                       "entry": round(entry, 2) if entry else None, "spot": spot,
                       "str": full.get("strength"), "agree": full.get("agree"),
                       "veto": veto, "brk": st.get("breakout"),
                       "coil": st.get("consolidating"),
-                      "dres": st.get("dist_res_atr"), "dsup": st.get("dist_sup_atr")}
+                      "dres": st.get("dist_res_atr"), "dsup": st.get("dist_sup_atr"),
+                      "trend": rg.get("trend"), "tveto": bool(full.get("trend_veto"))}
                 if entry and atm:
                     ep.update(_resolve(sym, tf, t, d, atm, entry))
                 else:
@@ -134,9 +136,8 @@ def run():
                 e["sym"] = LABELS.get(sym, sym); e["tf"] = tf
                 tf_rows.append(e); grand.append(e)
                 tag = "🛑" if e["outcome"] == "SL" else ("🎯" if e["outcome"] == "TARGET" else "·")
-                struct = (f"brk={e['brk']} coil={e['coil']} "
-                          f"dRes={e['dres']} dSup={e['dsup']}"
-                          + ("  VETO" if e["veto"] else ""))
+                struct = (f"trend={e['trend']}" + ("⛔" if e["tveto"] else "")
+                          + f" brk={e['brk']} coil={e['coil']}")
                 print(f"  {tag} {e['sym']:13s} {e['t']} {e['dir']} {e['strike']} "
                       f"@{e['entry']}  str{e['str']:+.2f} ag{e['agree']}  "
                       f"-> {e['outcome']:9s} net {e['net_pct']}%  held {e['held_min']}m  | {struct}")
@@ -177,9 +178,24 @@ def run():
               f"{int((g.outcome=='TARGET').sum())} target, "
               f"mean net {net.mean():+.1f}%, total {net.sum():+.1f}%")
         if len(sl):
-            print(f"  SL diagnosis: {int(sl.veto.sum())}/{len(sl)} of SLs were fired into "
-                  f"resistance/coil (struct-veto would've flagged); "
-                  f"{int((sl.brk.notna()).sum())} had a breakout reading")
+            print(f"  SL diagnosis: {int(sl.veto.sum())}/{len(sl)} fired into resistance/coil "
+                  f"(struct-veto); {int(sl.tveto.sum())}/{len(sl)} fired AGAINST the day "
+                  f"trend (trend-veto)")
+        # ── counterfactual: what if we'd applied each veto? ──────────────────────
+        print("\n  COUNTERFACTUAL — net P&L if a veto had SKIPPED those trades:")
+        base = g["net_pct"].dropna()
+        for name, mask in [("struct-veto", ~g.veto.fillna(False)),
+                           ("trend-veto", ~g.tveto.fillna(False))]:
+            kept = g[mask]["net_pct"].dropna()
+            skipped = len(g) - int(mask.sum())
+            print(f"    {name:11s} keeps {len(kept):2d}/{len(g)} trades (skips {skipped})  "
+                  f"-> mean net {kept.mean():+.1f}%  total {kept.sum():+.1f}%  "
+                  f"(vs base mean {base.mean():+.1f}% total {base.sum():+.1f}%)")
+        # trend-aligned vs trend-against split (the core thesis)
+        aligned = g[~g.tveto.fillna(False)]["net_pct"].dropna()
+        against = g[g.tveto.fillna(False)]["net_pct"].dropna()
+        print(f"\n  THESIS: trend-ALIGNED trades mean {aligned.mean():+.1f}% (n={len(aligned)})  "
+              f"vs trend-AGAINST mean {against.mean():+.1f}% (n={len(against)})")
 
 
 if __name__ == "__main__":

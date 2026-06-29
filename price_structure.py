@@ -145,6 +145,59 @@ def analyze(ser: dict) -> Optional[dict]:
     }
 
 
+def _ema(vals: list[float], span: int) -> list[float]:
+    """Simple EMA over vals (oldest→newest). [] if empty."""
+    if not vals:
+        return []
+    a = 2.0 / (span + 1.0)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(a * v + (1 - a) * out[-1])
+    return out
+
+
+def regime(ser: dict, span: int = 5, slope_bars: int = 3) -> dict:
+    """Intraday DAY TREND off the index bars — the orthogonal family the SL audit
+    (2026-06-29: 32/34 trades were CE on a DOWN day) said was missing. Two agreeing
+    votes, robust to a single noisy bar:
+      • LEVEL  : last close vs the day reference (first bar's open ≈ day open)
+      • SLOPE  : sign of a short EMA's recent slope (momentum)
+    UP only if BOTH agree up, DOWN only if both agree down, else NEUTRAL (chop/turn).
+    Lookahead-free — uses only the bars build_series gave for ts<=as_of."""
+    closes = _clean(ser.get("close"))
+    opens = _clean(ser.get("open"))
+    if len(closes) < slope_bars + 2:
+        return {"trend": "NEUTRAL", "ref": None, "ema_slope": None, "votes": 0}
+    price = closes[-1]
+    ref = opens[0] if opens else closes[0]
+    ema = _ema(closes, span)
+    j = max(0, len(ema) - 1 - slope_bars)
+    slope = ema[-1] - ema[j]
+    v_level = 1 if price > ref else -1 if price < ref else 0
+    v_slope = 1 if slope > 0 else -1 if slope < 0 else 0
+    votes = v_level + v_slope
+    trend = "UP" if votes >= 2 else "DOWN" if votes <= -2 else "NEUTRAL"
+    return {"trend": trend, "ref": round(ref, 2), "price": round(price, 2),
+            "ema_slope": round(slope, 2), "votes": votes,
+            "day_pct": round((price / ref - 1.0) * 100.0, 2) if ref else None}
+
+
+def trend_veto(reg: Optional[dict], direction: str) -> tuple[bool, str]:
+    """Don't fight the day trend: veto a CE (long) in a confirmed DOWN day, a PE
+    (short) in a confirmed UP day. NEUTRAL never vetoes (let the other gates rule).
+    Pure read — caller decides whether to ACT (intraday_scout._TREND_VETO)."""
+    if not reg or direction not in ("CE", "PE"):
+        return False, ""
+    t = reg.get("trend")
+    if direction == "CE" and t == "DOWN":
+        return True, (f"VETO long: day trend DOWN ({reg.get('day_pct')}% vs open, "
+                      f"EMA slope {reg.get('ema_slope')}) — buying calls into a falling tape")
+    if direction == "PE" and t == "UP":
+        return True, (f"VETO short: day trend UP ({reg.get('day_pct')}% vs open, "
+                      f"EMA slope {reg.get('ema_slope')}) — buying puts into a rising tape")
+    return False, ""
+
+
 def veto(struct: Optional[dict], direction: str) -> tuple[bool, str]:
     """Should the scout's arrow be vetoed by structure? direction = 'CE' (long) | 'PE'
     (short). Returns (veto?, reason). A breakout in the arrow's direction is CONFLUENCE

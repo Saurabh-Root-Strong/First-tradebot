@@ -106,6 +106,10 @@ def harvest(days: list[str], tf: int) -> pd.DataFrame:
                 rec["struct_veto"] = int(bool(r.get("struct_veto")))
                 rec["breakout"] = st.get("breakout") or ""
                 rec["consolidating"] = int(bool(st.get("consolidating")))
+                # day-trend veto (don't fight the trend) — measured, not enforced live
+                rg = r.get("regime") or {}
+                rec["trend_veto"] = int(bool(r.get("trend_veto")))
+                rec["trend"] = rg.get("trend") or ""
                 # range coverage at the scaled (horizon=tf) band
                 s_h = _spot_at(ticks, t + datetime.timedelta(minutes=tf))
                 lo, hi = r.get("pred_lo"), r.get("pred_hi")
@@ -232,6 +236,31 @@ def evaluate(df: pd.DataFrame, reps: int, rng, tf: int) -> None:
             tag = "VETO HELPS" if (nv and mv < mk) else ("no help" if nv else "no vetoes")
             print(f"     {H:>2}m  kept {mk:+5.1f}% (n={nk}) {kept_ci}   "
                   f"vetoed {mv:+5.1f}% (n={nv})   {tag}")
+
+    # 3d) TREND VETO — does NOT fighting the day trend cut the bleed? (the SL-audit fix)
+    if "trend_veto" in df.columns and "opt_net15" in df.columns:
+        print("\n  3d) TREND VETO effect on option P&L (kept vs trend-vetoed trades)")
+        for H in HORIZONS:
+            col = f"opt_net{H}"
+            if col not in df.columns:
+                continue
+            sub = df[df.is_trade == 1].dropna(subset=[col])
+            if len(sub) < 6 or sub.date.nunique() < 2:
+                print(f"     {H:>2}m  n={len(sub)} too few"); continue
+            kept = sub[sub.trend_veto == 0]
+            veto = sub[sub.trend_veto == 1]
+            mk = float(kept[col].mean()) if len(kept) else float("nan")
+            mv = float(veto[col].mean()) if len(veto) else float("nan")
+            if len(kept) >= 5 and kept.date.nunique() >= 2:
+                ck, lk, hk = _boot_ci(lambda a: a.mean(), kept[col].to_numpy(float),
+                                      reps=reps, rng=rng, groups=kept["date"].to_numpy())
+                kept_ci = f"[{lk:+.1f},{hk:+.1f}]" + ("  EDGE" if lk > 0 else "")
+            else:
+                kept_ci = ""
+            tag = ("VETO HELPS" if (len(veto) and mv < mk) else
+                   ("no help" if len(veto) else "no vetoes"))
+            print(f"     {H:>2}m  kept {mk:+5.1f}% (n={len(kept)}) {kept_ci}   "
+                  f"vetoed {mv:+5.1f}% (n={len(veto)})   {tag}")
 
     # 4) RANGE band coverage at the scaled horizon
     cib = df.dropna(subset=["close_in_band"])
