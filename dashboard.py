@@ -3889,10 +3889,17 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
 @app.callback(
     Output("alert-badge", "children"),
     Output("alert-badge", "style"),
+    Input("setup-tick",   "n_intervals"),
     Input("scout-alerts", "data"),
 )
-def _alert_badge(alerts):
-    n = len(alerts or [])
+def _alert_badge(_n, alerts):
+    # Count the CANONICAL deduped log for today — the SAME source the panel shows, so
+    # the badge and the list always agree (the browser localStorage list was dup-
+    # inflated). Fall back to the browser list only very early before the mirror exists.
+    today = datetime.datetime.now(IST).date().isoformat()
+    n = len(_alerts_from_mirror(today))
+    if not n:
+        n = len([a for a in (alerts or []) if a.get("d", today) == today])
     base = {"fontSize": "0.55rem", "fontWeight": "800", "color": "#0a0f1a",
             "background": "#fbbf24", "borderRadius": "9px", "padding": "0 6px",
             "minWidth": "16px", "textAlign": "center"}
@@ -3910,16 +3917,28 @@ def _alerts_from_mirror(date):
     a day → list of UI alert recs (newest first). This is the authoritative record:
     survives a browser cache-clear, is the SAME on every device, captures alerts that
     fired while only the VM was watching, and is archived per-day for evening review.
-    Returns [] if the mirror is missing (e.g. a day before this log existed)."""
+    Returns [] if the mirror is missing (e.g. a day before this log existed).
+
+    DEDUPED: collapses rows that are the same event written more than once — same
+    (symbol, kind, strike, minute, band_dir) → one row (earliest kept). The old
+    browser-driven detector could write an event several times (one per open tab, and
+    sub-minute repeats before the open-position flag propagated); the server-side
+    poller is now the single writer, but dedup also cleans those legacy rows so the
+    panel + badge show the TRUE distinct-alert count."""
     from core.mirror_io import read_mirror
     df = read_mirror("scout_alerts", date)
     if df is None or df.empty:
         return []
-    out = []
-    for _, r in df.iterrows():
+    out, seen = [], set()
+    for _, r in df.iterrows():                      # df is ts-ascending → keep earliest
         kind = str(r.get("kind") or "")
+        t = r["ts"].strftime("%H:%M")
+        key = (str(r.get("symbol") or ""), kind, r.get("strike"), t, r.get("band_dir"))
+        if key in seen:
+            continue
+        seen.add(key)
         out.append({
-            "t": r["ts"].strftime("%H:%M"), "d": date, "kind": kind,
+            "t": t, "d": date, "kind": kind,
             "head": r.get("head") or "", "body": r.get("body") or "",
             "color": _ALERT_KIND_COLOR.get(kind, "#e2e8f0"),
             "thin": bool(r.get("thin")),
