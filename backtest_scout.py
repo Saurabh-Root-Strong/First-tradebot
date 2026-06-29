@@ -100,6 +100,12 @@ def harvest(days: list[str], tf: int) -> pd.DataFrame:
                     "pred_lo": r.get("pred_lo"), "pred_hi": r.get("pred_hi"),
                     "is_trade": is_trade,
                 }
+                # price-structure veto (measured, not enforced live) — does skipping
+                # arrows fired into S/R or no-breakout coils cut the option bleed?
+                st = r.get("struct") or {}
+                rec["struct_veto"] = int(bool(r.get("struct_veto")))
+                rec["breakout"] = st.get("breakout") or ""
+                rec["consolidating"] = int(bool(st.get("consolidating")))
                 # range coverage at the scaled (horizon=tf) band
                 s_h = _spot_at(ticks, t + datetime.timedelta(minutes=tf))
                 lo, hi = r.get("pred_lo"), r.get("pred_hi")
@@ -198,6 +204,34 @@ def evaluate(df: pd.DataFrame, reps: int, rng, tf: int) -> None:
                   f"   mean net {mn:+5.1f}% [{lm:+5.1f},{hm:+5.1f}] {ev}  (n={len(sub)})")
     else:
         print("     no option premiums captured on these days")
+
+    # 3c) PRICE-STRUCTURE VETO — does skipping the vetoed arrows cut the bleed?
+    # Compares the option-P&L of trades the structure KEEPS (struct_veto=0) vs the ones
+    # it VETOES (into S/R, or a no-breakout coil). The veto earns its place only if the
+    # vetoed bucket bleeds MORE than the kept bucket — i.e. it removes losers.
+    if "struct_veto" in df.columns and "opt_net15" in df.columns:
+        print("\n  3c) STRUCTURE VETO effect on option P&L (kept vs vetoed trades)")
+        for H in HORIZONS:
+            col = f"opt_net{H}"
+            if col not in df.columns:
+                continue
+            sub = df[df.is_trade == 1].dropna(subset=[col])
+            if len(sub) < 6 or sub.date.nunique() < 2:
+                print(f"     {H:>2}m  n={len(sub)} too few"); continue
+            kept = sub[sub.struct_veto == 0]
+            veto = sub[sub.struct_veto == 1]
+            def _m(s):
+                return (float(s[col].mean()), len(s)) if len(s) else (float("nan"), 0)
+            mk, nk = _m(kept); mv, nv = _m(veto)
+            if nk >= 5 and kept.date.nunique() >= 2:
+                ck, lk, hk = _boot_ci(lambda a: a.mean(), kept[col].to_numpy(float),
+                                      reps=reps, rng=rng, groups=kept["date"].to_numpy())
+                kept_ci = f"[{lk:+.1f},{hk:+.1f}]"
+            else:
+                kept_ci = ""
+            tag = "VETO HELPS" if (nv and mv < mk) else ("no help" if nv else "no vetoes")
+            print(f"     {H:>2}m  kept {mk:+5.1f}% (n={nk}) {kept_ci}   "
+                  f"vetoed {mv:+5.1f}% (n={nv})   {tag}")
 
     # 4) RANGE band coverage at the scaled horizon
     cib = df.dropna(subset=["close_in_band"])

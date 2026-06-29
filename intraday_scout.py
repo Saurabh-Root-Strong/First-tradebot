@@ -54,6 +54,7 @@ from core.constants import INDEX_SYMBOLS, STRIKE_STEP, LABELS, IST, NIFTY, FINNI
 from core.mirror_io import read_mirror as _read_mirror
 import footprint_chart as fc
 import hour_forecast as hf
+import price_structure as ps
 
 # Structurally THIN F&O index — sparse OI (audit: ~50% strikes no OI), tiny futures
 # OI (~29k vs NIFTY ~7.4M), stale LTPs on illiquid strikes. Every signal + the
@@ -98,6 +99,13 @@ _TILT_DB = 0.05            # |g| below this = balanced book, no tilt call
 _TRADE_TH = 0.22           # min |strength| to consider a trade
 # gate (see scan_index): anchor flow must agree + >=1 INDEPENDENT family (cross/fut);
 # div is the same family as flow so it never counts as independent corroboration.
+
+# PRICE-STRUCTURE VETO: when True, a structure veto (arrow into resistance/support, or
+# a no-breakout coil — see price_structure.veto) turns a TRADE into NO-TRADE. DEFAULT
+# OFF: the struct read is computed + DISPLAYED + harvested on every scan so backtest_scout
+# can MEASURE whether the veto cuts the option-P&L bleed OUT of sample. Flip to True only
+# after that CI clears — never wire structure to the live arrow blind.
+_STRUCT_VETO = False
 
 
 def _last(seq, n: int = 1):
@@ -631,6 +639,15 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     except Exception:
         fcst = {}
 
+    # ── price-structure (S/R, coil, breakout) — the orthogonal VETO family ───────
+    # The OI arrow has no sense of WHERE price sits; this reads it off the same bars.
+    # Computed + displayed + harvested ALWAYS; only ACTS on the verdict when _STRUCT_VETO
+    # is on (default off — backtest_scout must first show the veto cuts the bleed OOS).
+    struct = ps.analyze(ser)
+    struct_veto, struct_veto_reason = ps.veto(struct, direction)
+    if _STRUCT_VETO and struct_veto and verdict.startswith("TRADE"):
+        verdict, direction = "NO-TRADE", ""
+
     reasons = []
     for k in ("flow", "div", "cross", "fut"):
         if not parts[k][1]:
@@ -641,6 +658,11 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         reasons.append(txt)
     if tilt[1]:
         reasons.append(tilt[1])
+    s_sum = ps.summary(struct)
+    if s_sum:
+        reasons.append(s_sum)
+    if struct_veto_reason:
+        reasons.append(struct_veto_reason + ("" if _STRUCT_VETO else " (measured, not enforced)"))
 
     # ── opening context (gap type / opening range / session phase) ───────────────
     opening = _opening_context(sym, date, as_of)
@@ -681,6 +703,7 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         "instrument": (f"{atm} {direction}" if direction and atm else ""),
         "lifecycle": lifecycle,
         "reasons": reasons,
+        "struct": struct, "struct_veto": bool(struct_veto),
         "parts": {k: round(parts[k][0], 3) for k in _W},
         "range_lo": fcst.get("lo"), "range_hi": fcst.get("hi"),
         "range_pct": fcst.get("exp_move_pct"),
