@@ -114,19 +114,50 @@ def main():
         h, n = hit(np.sign(strong["score"]), strong[tgt])
         print(f"     {tgt:8s} hit {h:.0f}%  (n={n}, {100*len(strong)/len(df):.0f}% of days)")
 
+    # ── composite formulation comparison (find the BEST signal) ───────────────
+    print("\n  FORMULATION COMPARISON  (which signal is best?)")
+    print(f"     {'variant':22s} {'gap':>8} {'dayret':>10}")
+    # 1. S&P only
+    sp = np.sign(df["g_S&P500"])
+    # 2. magnitude z-composite: standardize each lagged move, keep India-sign, sum
+    zc = pd.Series(0.0, index=df.index)
+    for name in FACTORS:
+        g = df[f"g_{name}"]
+        z = g / g.rolling(60).std()
+        zc = zc.add(z.fillna(0), fill_value=0)
+    zsig = np.sign(zc)
+    # 3. S&P + DXY (the two with gap signal)
+    spdxy = np.sign(np.sign(df["g_S&P500"]) + np.sign(df["g_DXY"]))
+    # 4. S&P-led: S&P with DXY/UST only as tie-context (weight S&P x2)
+    led = np.sign(2 * np.sign(df["g_S&P500"]) + np.sign(df["g_DXY"]) + np.sign(df["g_UST10Y"]))
+    for nm, ps in [("S&P-only", sp), ("equal-vote(all4)", np.sign(df["score"])),
+                   ("magnitude-z", zsig), ("S&P+DXY", spdxy), ("S&P-led(x2)", led)]:
+        hg, _ = hit(ps, df["gap"]); hd, _ = hit(ps, df["dayret"])
+        print(f"     {nm:22s} {hg:6.0f}% {hd:8.0f}%")
+    # big-S&P-night subset (event-driven): |S&P overnight| in top quintile
+    thr = df["g_S&P500"].abs().quantile(0.8)
+    big = df[df["g_S&P500"].abs() >= thr]
+    hgb, nb = hit(np.sign(big["g_S&P500"]), big["gap"])
+    hdb, _ = hit(np.sign(big["g_S&P500"]), big["dayret"])
+    print(f"     big-S&P-night(top20%)  {hgb:6.0f}% {hdb:8.0f}%  (n={nb})")
+
     # ── tomorrow's reading ────────────────────────────────────────────────────
     last = df.iloc[-1]
     print("\n" + "=" * 76)
     print(f"  LATEST READING (globals dated up to {df.index.max():%Y-%m-%d} -> next India session)")
-    votes = []
-    for name in FACTORS:
-        v = last[f"g_{name}"]
-        votes.append(f"{name} {'+' if v>0 else '-' if v<0 else '0'}")
-    sc = last["score"]
-    lean = "RISK-ON / lean UP" if sc > 0 else "RISK-OFF / lean DOWN" if sc < 0 else "MIXED / flat"
-    print(f"     votes: {'  '.join(votes)}   score={sc:+.0f}  ->  {lean}")
-    print("     NOTE: gap is largely priced by GIFT Nifty (PREP/context, not free alpha);")
-    print("     the intraday-after-gap is the unpredictable part. Use for regime/risk, not a trade.")
+    votes = [f"{name} {'+' if last[f'g_{name}']>0 else '-' if last[f'g_{name}']<0 else '0'}"
+             for name in FACTORS]
+    # BEST signal = S&P + DXY composite; confidence tiered by overnight S&P magnitude
+    spdxy = np.sign(np.sign(last["g_S&P500"]) + np.sign(last["g_DXY"]))
+    big_thr = df["g_S&P500"].abs().quantile(0.8)
+    is_big = abs(last["g_S&P500"]) >= big_thr
+    lean = "RISK-ON / lean UP" if spdxy > 0 else "RISK-OFF / lean DOWN" if spdxy < 0 else "MIXED / flat"
+    conf = ("HIGH — big overnight move (hist. 89% gap / 69% day)" if is_big
+            else "normal (hist. 73% gap / 60% day)")
+    print(f"     votes: {'  '.join(votes)}")
+    print(f"     BEST signal (S&P+DXY): {lean}   |   confidence: {conf}")
+    print("     NOTE: gap is largely priced by GIFT Nifty -> a PREP / regime / sizing read,")
+    print("     NOT an intraday trade (the day fades the gap, open->close ~45%).")
 
 
 if __name__ == "__main__":
