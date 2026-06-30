@@ -35,6 +35,12 @@ LABEL_TO_SYM.update({"NIFTY": NIFTY, "BANKNIFTY": BANKNIFTY, "FINNIFTY": FINNIFT
 # option strike step per index (the exchange's actual strike interval)
 STRIKE_STEP = {NIFTY: 50, BANKNIFTY: 100, FINNIFTY: 50, MIDCPNIFTY: 25}
 
+# F&O lot size per index — the share-multiplier for every ₹ risk/P&L number the
+# cockpit shows. NSE REVISES these periodically; verify on each revision. Current
+# values per NSE revision effective 2026-01-01 (verified vs NSE 2026-06-30).
+# Single source of truth — do not re-hardcode.
+LOT_SIZES = {NIFTY: 65, BANKNIFTY: 30, FINNIFTY: 60, MIDCPNIFTY: 120}
+
 # "Major" round-number step where real OI / premium / smart-money activity concentrates
 # — used for the chart strike picker so it ladders by round hundreds (NIFTY 23500/600/700…)
 # instead of the minor 50-pt hedging strikes in between.

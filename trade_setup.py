@@ -46,7 +46,7 @@ try:
 except Exception:
     _NEWS_AVAILABLE = False
 
-from core.constants import IST   # single source of truth  # noqa: E402
+from core.constants import IST, LOT_SIZES   # single source of truth  # noqa: E402
 
 
 # ── DB helper (non-blocking; lazy-import avoids circular deps) ────────────────
@@ -86,12 +86,9 @@ TF_PROFILES = {
               "expiry_rank": "M", "delta_high": 0.42, "delta_mid": 0.30, "delta_low": 0.22},
 }
 
-LOT_SIZES = {
-    "NSE:NIFTY50-INDEX":    75,
-    "NSE:NIFTYBANK-INDEX":  15,
-    "NSE:FINNIFTY-INDEX":   40,
-    "NSE:MIDCPNIFTY-INDEX": 50,
-}
+# LOT_SIZES now sourced from core.constants (single source of truth) — the buried
+# table here had gone stale (BANKNIFTY 15→35, FINNIFTY 40→65, MIDCPNIFTY 50→140),
+# making every ₹ risk number wrong for 3 of 4 indices.
 
 # ── Layer 2: OI Flow Analysis ─────────────────────────────────────────────────
 def _oi_flow(strike_map: dict, spot: float, tech_score: float) -> tuple[float, list]:
