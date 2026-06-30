@@ -1655,8 +1655,12 @@ app.layout = dbc.Container([
 
     # State stores
     dcc.Location(id="url", refresh=False),
-    dcc.Store(id="sel-sym",    data=None),
-    dcc.Store(id="sel-expiry", data=""),
+    # session-persisted so a page reload (e.g. hard-refresh while on /charts)
+    # keeps the open section — otherwise sel-sym resets to None and every
+    # section-gated callback (charts-graph, charts-scout, live-oi …) PreventUpdate's
+    # forever, leaving a permanent loading spinner.
+    dcc.Store(id="sel-sym",    data=None, storage_type="session"),
+    dcc.Store(id="sel-expiry", data="",   storage_type="session"),
     # Regime Radar checkpoint lives in a static Store: the dropdown that sets it
     # is rendered dynamically inside the Trade Book, and a callback may not use a
     # dynamically-created component as an Input before it exists in the DOM.
