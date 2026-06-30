@@ -55,6 +55,7 @@ from core.mirror_io import read_mirror as _read_mirror
 import footprint_chart as fc
 import hour_forecast as hf
 import price_structure as ps
+import regime_classifier as rc
 
 # Structurally THIN F&O index — sparse OI (audit: ~50% strikes no OI), tiny futures
 # OI (~29k vs NIFTY ~7.4M), stale LTPs on illiquid strikes. Every signal + the
@@ -113,6 +114,21 @@ _STRUCT_VETO = False
 # computed + displayed + harvested ALWAYS, acts on the verdict only when True. DEFAULT
 # OFF until backtest_scout's trend-veto grade clears OOS.
 _TREND_VETO = False
+
+# MOOD VETO: the missing third mood. price_structure.regime votes UP/DOWN/NEUTRAL and
+# trend_veto only fights a CONFIRMED trend — it lets the CHOP through as "NEUTRAL". But
+# backtest_regime.py (2026-06-30) showed CONSOLIDATION = ~58% of engine entries and the
+# loss sink in EVERY config (worst win%/exp/drawdown) = the "both-side SL hunting" the
+# user named. regime_classifier (Kaufman efficiency ratio + ATR-drift) labels that chop
+# explicitly and vetoes trading INTO it. Computed + displayed ALWAYS; acts only when True.
+# DEFAULT OFF until backtest_scout grades it on the actual option premium OOS — the
+# underlying-engine proof is necessary, not sufficient (option pays theta + 3% RT on top).
+_MOOD_VETO = False
+# Efficiency window for the LIVE mood read. Must be small enough to be WARM intraday:
+# ER needs win+2 closed bars, so 10 → warm ~11:45 on 15m / ~10:05 on 5m (vs ER14 = only
+# warm afternoon). backtest_regime confirms the chop=loss-sink ordering holds at this
+# window. Mood reads CHOP (no veto, since direction-gated) until warm — fail-safe.
+_MOOD_WIN = 10
 
 
 def _last(seq, n: int = 1):
@@ -683,6 +699,11 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     trend_veto, trend_veto_reason = ps.trend_veto(regime, direction)
     if _TREND_VETO and trend_veto and verdict.startswith("TRADE"):
         verdict, direction = "NO-TRADE", ""
+    # mood — the third mood (CONSOLIDATION) the day-trend read lets through (backtest_regime)
+    mood = rc.classify_from_bars(ser, n=_MOOD_WIN)
+    mood_veto, mood_veto_reason = rc.veto(mood, direction)
+    if _MOOD_VETO and mood_veto and verdict.startswith("TRADE"):
+        verdict, direction = "NO-TRADE", ""
 
     reasons = []
     for k in ("flow", "div", "cross", "fut"):
@@ -703,6 +724,10 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         reasons.append(struct_veto_reason + ("" if _STRUCT_VETO else " (measured, not enforced)"))
     if trend_veto_reason:
         reasons.append(trend_veto_reason + ("" if _TREND_VETO else " (measured, not enforced)"))
+    reasons.append(f"mood: {mood.short}"
+                   + (f" (efficiency {mood.er:.2f})" if mood.er == mood.er else ""))
+    if mood_veto_reason:
+        reasons.append(mood_veto_reason + ("" if _MOOD_VETO else " (measured, not enforced)"))
 
     # ── opening context (gap type / opening range / session phase) ───────────────
     opening = _opening_context(sym, date, as_of)
@@ -745,6 +770,8 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         "reasons": reasons,
         "struct": struct, "struct_veto": bool(struct_veto),
         "regime": regime, "trend_veto": bool(trend_veto),
+        "mood": mood.short, "mood_full": mood.mood, "mood_er": mood.er,
+        "mood_veto": bool(mood_veto),
         "parts": {k: round(parts[k][0], 3) for k in _W},
         "range_lo": fcst.get("lo"), "range_hi": fcst.get("hi"),
         "range_pct": fcst.get("exp_move_pct"),

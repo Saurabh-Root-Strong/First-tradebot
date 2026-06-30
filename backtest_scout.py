@@ -110,6 +110,12 @@ def harvest(days: list[str], tf: int) -> pd.DataFrame:
                 rg = r.get("regime") or {}
                 rec["trend_veto"] = int(bool(r.get("trend_veto")))
                 rec["trend"] = rg.get("trend") or ""
+                # MOOD veto (the third mood: CONSOLIDATION chop) — measured, not enforced.
+                # mood_er nan = not yet warm; excluded from the grade so early-session
+                # under-warm rows don't masquerade as real chop.
+                rec["mood_veto"] = int(bool(r.get("mood_veto")))
+                rec["mood"] = r.get("mood_full") or ""
+                rec["mood_er"] = r.get("mood_er")
                 # range coverage at the scaled (horizon=tf) band
                 s_h = _spot_at(ticks, t + datetime.timedelta(minutes=tf))
                 lo, hi = r.get("pred_lo"), r.get("pred_hi")
@@ -261,6 +267,46 @@ def evaluate(df: pd.DataFrame, reps: int, rng, tf: int) -> None:
                    ("no help" if len(veto) else "no vetoes"))
             print(f"     {H:>2}m  kept {mk:+5.1f}% (n={len(kept)}) {kept_ci}   "
                   f"vetoed {mv:+5.1f}% (n={len(veto)})   {tag}")
+
+    # 3e) MOOD VETO — does skipping CONSOLIDATION (chop) arrows cut the option bleed?
+    # The decisive option-level test of the user's "consolidation = SL hunting" thesis.
+    # Only WARM rows (mood_er finite) count — under-warm early rows are not real chop.
+    if "mood_veto" in df.columns and "opt_net15" in df.columns:
+        print("\n  3e) MOOD VETO effect on option P&L  (trend-KEPT vs chop-VETOED, warm rows)")
+        warm = df[(df.is_trade == 1) & df["mood_er"].notna()]
+        for H in HORIZONS:
+            col = f"opt_net{H}"
+            if col not in df.columns:
+                continue
+            sub = warm.dropna(subset=[col])
+            if len(sub) < 6 or sub.date.nunique() < 2:
+                print(f"     {H:>2}m  n={len(sub)} too few warm rows"); continue
+            kept = sub[sub.mood_veto == 0]      # trend moods (the ones we'd keep)
+            veto = sub[sub.mood_veto == 1]      # CONSOLIDATION (the ones we'd skip)
+            mk = float(kept[col].mean()) if len(kept) else float("nan")
+            mv = float(veto[col].mean()) if len(veto) else float("nan")
+            if len(kept) >= 5 and kept.date.nunique() >= 2:
+                ck, lk, hk = _boot_ci(lambda a: a.mean(), kept[col].to_numpy(float),
+                                      reps=reps, rng=rng, groups=kept["date"].to_numpy())
+                kept_ci = f"[{lk:+.1f},{hk:+.1f}]" + ("  EDGE" if lk > 0 else "")
+            else:
+                kept_ci = ""
+            tag = ("VETO HELPS" if (len(veto) and mv < mk) else
+                   ("no help" if len(veto) else "no chop arrows"))
+            print(f"     {H:>2}m  kept {mk:+5.1f}% (n={len(kept)}) {kept_ci}   "
+                  f"vetoed {mv:+5.1f}% (n={len(veto)})   {tag}")
+        # per-mood mean option net at 15m — the full three-mood picture
+        col = "opt_net15"
+        if col in warm.columns:
+            ww = warm.dropna(subset=[col])
+            if len(ww):
+                print("     per-mood (15m option net):", end=" ")
+                for m in ("BIG_TREND_UP", "BIG_TREND_DOWN", "SMALL_TREND_UP",
+                          "SMALL_TREND_DOWN", "CONSOLIDATION"):
+                    s = ww[ww["mood"] == m]
+                    if len(s):
+                        print(f"{m.replace('_TREND','')}={s[col].mean():+.1f}%(n{len(s)})", end="  ")
+                print()
 
     # 4) RANGE band coverage at the scaled horizon
     cib = df.dropna(subset=["close_in_band"])
