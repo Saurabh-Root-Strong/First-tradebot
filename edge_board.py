@@ -110,9 +110,9 @@ def ledger(days_now):
         ("Direction arrow (CE/PE buy)",    "DEAD@cost",  "balanced after bugfix, but <50% win, 3% wall"),
         ("Option WRITING (straddle/strgl)","DEAD@cost",  "gross~0 (ATM efficient), -6..-12% to spread"),
         ("Fade-the-level (reversion)",     "DEAD",       "35-37%@15m, significantly wrong, all TF sets"),
-        ("MTF with-trend confirm",         "PROMISING",  "~60%@15m, db CI straddles 50 (unproven)"),
-        ("Downside-breakout continue",     "PROMISING",  "83% down-break BOTH regimes (short-asym), n-thin"),
-        ("Upside-breakout / CE-long",      "WEAK/FADE",  "up-break ~50% even on up-days (longs fade)"),
+        ("MTF confirm (options/fut)",      "DEAD@cost",  "gross +0.025%@15m, too small to beat even fut cost"),
+        ("Downside-break SHORT (FUTURES)", "CANDIDATE",  "gross +0.083% SIG, net +0.05%@0.03% (underpowered)"),
+        ("Upside-break LONG / CE",         "DEAD/FADE",  "gross~0, net clears below 0 at fut cost (longs bleed)"),
     ]
     for name, status, note in rows:
         print(f"   {status:10s} | {name:32s} | {note}")
