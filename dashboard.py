@@ -1655,12 +1655,10 @@ app.layout = dbc.Container([
 
     # State stores
     dcc.Location(id="url", refresh=False),
-    # session-persisted so a page reload (e.g. hard-refresh while on /charts)
-    # keeps the open section — otherwise sel-sym resets to None and every
-    # section-gated callback (charts-graph, charts-scout, live-oi …) PreventUpdate's
-    # forever, leaving a permanent loading spinner.
-    dcc.Store(id="sel-sym",    data=None, storage_type="session"),
-    dcc.Store(id="sel-expiry", data="",   storage_type="session"),
+    # sel-sym (open section) is derived from the URL by _route — restored on every
+    # load/refresh — so it needs no client persistence.
+    dcc.Store(id="sel-sym",    data=None),
+    dcc.Store(id="sel-expiry", data=""),
     # Regime Radar checkpoint lives in a static Store: the dropdown that sets it
     # is rendered dynamically inside the Trade Book, and a callback may not use a
     # dynamically-created component as an Input before it exists in the DOM.
@@ -3095,52 +3093,63 @@ def _render_trade_rec(rec: dict, sym: str) -> html.Div:
 
 
 # ── Callback 1: sidebar nav clicks → update selected symbol ────────────────────
+_URL_SHORT = {"NSE:NIFTY50-INDEX": "nifty50", "NSE:NIFTYBANK-INDEX": "banknifty",
+              "NSE:FINNIFTY-INDEX": "finnifty", "NSE:MIDCPNIFTY-INDEX": "midcpnifty"}
+_SHORT_TO_SYM = {v: k for k, v in _URL_SHORT.items()}
+_PATH_TO_SEL = {"/live-oi": "LIVEOI", "/charts": "CHARTS",
+                "/alerts": "ALERTS", "/trades": "TRADES"}
+_SEL_TO_PATH = {v: k for k, v in _PATH_TO_SEL.items()}
+
+
 @app.callback(
-    Output("sel-sym",    "data"),
-    Output("sel-expiry", "data"),
+    Output("url", "pathname"),
     [Input(f"nav-{_slug(s)}", "n_clicks") for s in INDEX_SYMBOLS],
     Input("nav-liveoi",    "n_clicks"),
     Input("nav-charts",    "n_clicks"),
     Input("nav-alerts",    "n_clicks"),
-    State("sel-sym", "data"),
+    State("url", "pathname"),
     prevent_initial_call=True,
 )
 def on_nav_click(*args):
-    *_, _liveoi_clicks, _charts_clicks, _alerts_clicks, current = args
+    """Nav click → set the URL (the section's source of truth). Clicking the section
+    you're already on toggles back to "/". The URL then drives sel-sym via _route, so
+    there is NO sel-sym→url edge and thus no circular dependency."""
     from dash import callback_context as ctx
+    from dash.exceptions import PreventUpdate
+    *_, _liveoi_clicks, _charts_clicks, _alerts_clicks, cur = args
     if not ctx.triggered:
-        return current, ""
+        raise PreventUpdate
     tid = ctx.triggered[0]["prop_id"].split(".")[0]
+    cur = (cur or "/").rstrip("/") or "/"
+    def toggle(path: str) -> str:
+        return "/" if cur == path else path
     if tid == "nav-liveoi":
-        return (None, "") if current == "LIVEOI" else ("LIVEOI", "")
+        return toggle("/live-oi")
     if tid == "nav-charts":
-        return (None, "") if current == "CHARTS" else ("CHARTS", "")
+        return toggle("/charts")
     if tid == "nav-alerts":
-        return (None, "") if current == "ALERTS" else ("ALERTS", "")
+        return toggle("/alerts")
     for sym in INDEX_SYMBOLS:
         if tid == f"nav-{_slug(sym)}":
-            return (None, "") if current == sym else (sym, "")
-    return current, ""
+            return toggle(f"/chain/{_URL_SHORT.get(sym, 'index')}")
+    raise PreventUpdate
 
 
-_URL_SHORT = {"NSE:NIFTY50-INDEX": "nifty50", "NSE:NIFTYBANK-INDEX": "banknifty",
-              "NSE:FINNIFTY-INDEX": "finnifty", "NSE:MIDCPNIFTY-INDEX": "midcpnifty"}
-
-
-@app.callback(Output("url", "pathname"), Input("sel-sym", "data"))
-def _sync_url(sym):
-    """Reflect the active section in the address bar so the current page is visible."""
-    if sym == "TRADES":
-        return "/trades"
-    if sym == "LIVEOI":
-        return "/live-oi"
-    if sym == "CHARTS":
-        return "/charts"
-    if sym == "ALERTS":
-        return "/alerts"
-    if sym in INDEX_SYMBOLS:
-        return f"/chain/{_URL_SHORT.get(sym, 'index')}"
-    return "/"
+@app.callback(
+    Output("sel-sym",    "data"),
+    Output("sel-expiry", "data"),
+    Input("url", "pathname"),
+)
+def _route(pathname):
+    """URL → open section. Fires on every navigation AND on initial page load, so a
+    direct hit / hard-refresh on /charts (or /live-oi, /alerts, /chain/...) restores
+    the section instead of leaving section-gated callbacks stuck in PreventUpdate."""
+    p = (pathname or "/").rstrip("/") or "/"
+    if p in _PATH_TO_SEL:
+        return _PATH_TO_SEL[p], ""
+    if p.startswith("/chain/"):
+        return _SHORT_TO_SYM.get(p.split("/chain/", 1)[1]), ""
+    return None, ""
 
 
 # ── Charts section: full-session price/OI/volume/premium for index + timeframe ──
