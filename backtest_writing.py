@@ -70,6 +70,19 @@ def _leg_asof(piv, ts, k):
     return float(v) if pd.notna(v) else np.nan
 
 
+def _tail(x):
+    """Negative-skew lens: worst single outcome, 5th pct, CVaR (mean of worst 10%).
+    Writing can show +mean / high-win and still be ruinous via a fat left tail."""
+    x = np.asarray(x, float)
+    x = x[~np.isnan(x)]
+    if len(x) < 5:
+        return np.nan, np.nan, np.nan
+    p5 = float(np.percentile(x, 5))
+    k = max(1, int(round(0.10 * len(x))))
+    cvar = float(np.sort(x)[:k].mean())     # mean of the worst 10%
+    return float(x.min()), p5, cvar
+
+
 def _boot_mean_ci(x, groups, reps, rng):
     """Day-block bootstrap CI of the mean (resample whole days)."""
     x = np.asarray(x, float)
@@ -179,8 +192,10 @@ def report(df, rng):
             nm, nlo, nhi = _boot_mean_ci(n, sub.date.to_numpy(), 1500, rng)
             win = 100 * (n[~np.isnan(n)] > 0).mean() if (~np.isnan(n)).any() else float("nan")
             tag = "+" if nlo > 0 else ("-" if nhi < 0 else "0")
+            wmin, wp5, wcvar = _tail(n)
             print(f"     {H:>4}m  gross {gm:+5.1f}% [{glo:+5.1f},{ghi:+5.1f}]"
-                  f"   net {nm:+5.1f}% [{nlo:+5.1f},{nhi:+5.1f}][{tag}]  win {win:4.0f}%")
+                  f"   net {nm:+5.1f}% [{nlo:+5.1f},{nhi:+5.1f}][{tag}]  win {win:4.0f}%"
+                  f"   tail: worst {wmin:+6.1f}% p5 {wp5:+6.1f}% CVaR10 {wcvar:+6.1f}%")
 
     def block_st(sub, label):
         print(f"\n  {label}  (n={sub['st_net30'].notna().sum()})")
@@ -191,8 +206,10 @@ def report(df, rng):
             nm, nlo, nhi = _boot_mean_ci(n, sub.date.to_numpy(), 1500, rng)
             win = 100 * (n[~np.isnan(n)] > 0).mean() if (~np.isnan(n)).any() else float("nan")
             tag = "+" if nlo > 0 else ("-" if nhi < 0 else "0")
+            wmin, wp5, wcvar = _tail(n)
             print(f"     {H:>4}m  gross {gm:+5.1f}% [{glo:+5.1f},{ghi:+5.1f}]"
-                  f"   net {nm:+5.1f}% [{nlo:+5.1f},{nhi:+5.1f}][{tag}]  win {win:4.0f}%")
+                  f"   net {nm:+5.1f}% [{nlo:+5.1f},{nhi:+5.1f}][{tag}]  win {win:4.0f}%"
+                  f"   tail: worst {wmin:+6.1f}% p5 {wp5:+6.1f}% CVaR10 {wcvar:+6.1f}%")
 
     block(df, "ATM STRADDLE — ALL checkpoints")
     side = df.dropna(subset=["strength"])
