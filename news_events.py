@@ -142,6 +142,16 @@ _MACRO = [
 
 _ALL_TABLES = _STOCK_NEG + _STOCK_POS + _SECTOR + _MACRO
 
+# AVOIDABLE = binary / structural-risk events where the desk should STAY OUT of the
+# NAME entirely — the move is a governance/solvency/regulatory gap that neither a long
+# nor a short cleanly captures. A distinct lens (RISK, not direction): these are pulled
+# OUT of the plain BEARISH bucket. Ordinary directional negatives (earnings miss,
+# promoter selling, crude shock, rate hike) stay BEARISH — they are tradeable context.
+AVOID_EVENT_TYPES = frozenset({
+    "SEBI action", "Fraud allegation", "Auditor resignation", "Key-exec resignation",
+    "Credit downgrade", "Regulatory ban", "Tax/enforcement", "USFDA observation",
+})
+
 
 # ── Event record ─────────────────────────────────────────────────────────────────
 @dataclass
@@ -159,6 +169,15 @@ class NewsEvent:
     @property
     def bias(self) -> Bias:
         return Bias.BULL if self.score > 0 else Bias.BEAR if self.score < 0 else Bias.NEUTRAL
+
+    @property
+    def bucket(self) -> str:
+        """Trader-facing lens for the panel tabs: AVOIDABLE (stay out of the name —
+        binary governance/solvency/regulatory risk) takes precedence over direction;
+        otherwise BULLISH / BEARISH by score sign; NEUTRAL if unscored."""
+        if self.event_type in AVOID_EVENT_TYPES:
+            return "AVOIDABLE"
+        return "BULLISH" if self.score > 0 else "BEARISH" if self.score < 0 else "NEUTRAL"
 
 
 def _uid(source: str, ticker: str, headline: str) -> str:
@@ -433,10 +452,14 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None) -
     net = sum(e.score for e in macro)
     macro_bias = (Bias.BULL if net > 2 else Bias.BEAR if net < -2 else Bias.NEUTRAL).value
     by_scope = {sc: sum(1 for e in alerts if e.scope == sc) for sc in (MACRO, SECTOR, STOCK)}
+    shown = alerts[:limit]
+    by_bucket = {b: sum(1 for e in shown if e.bucket == b)
+                 for b in ("BULLISH", "BEARISH", "AVOIDABLE")}
     return {
-        "alerts": [asdict(e) | {"bias": e.bias.value} for e in alerts[:limit]],
+        "alerts": [asdict(e) | {"bias": e.bias.value, "bucket": e.bucket} for e in shown],
         "macro_bias": macro_bias, "macro_net": net,
-        "by_scope": by_scope, "n_total": len(evs), "n_alerts": len(alerts),
+        "by_scope": by_scope, "by_bucket": by_bucket,
+        "n_total": len(evs), "n_alerts": len(alerts),
         "date": day, "dates": available_dates(),
         "as_of": datetime.datetime.now(tz=IST).strftime("%H:%M:%S"),
     }

@@ -664,15 +664,18 @@ def _slug(sym: str) -> str:
 
 
 # ── Live news / event-impact panel ──────────────────────────────────────────────
-def _render_news_panel(data: dict) -> html.Div:
+def _render_news_panel(data: dict, tab: str = "ALL") -> html.Div:
     """Event-impact alerts: scope tag · impact score (−10..+10) · ticker · headline.
-    Driven by news_events.analyze_news(); colour = canonical bias green/red/grey."""
+    Driven by news_events.analyze_news(); colour = canonical bias green/red/grey.
+    `tab` filters by trader-facing bucket: ALL | BULLISH | BEARISH | AVOIDABLE."""
     if not data:
         return html.Div("news layer offline", style={"color": "#475569", "fontSize": "0.55rem"})
     alerts = data.get("alerts", [])
+    if tab and tab != "ALL":
+        alerts = [e for e in alerts if e.get("bucket") == tab]
     mb     = data.get("macro_bias", "NEUTRAL")
     mb_clr = sig.color(mb)
-    by     = data.get("by_scope", {})
+    bb     = data.get("by_bucket", {})
     cur    = data.get("date", "")
     header = html.Div([
         html.Span("📰 NEWS / EVENT IMPACT", style={
@@ -680,7 +683,10 @@ def _render_news_panel(data: dict) -> html.Div:
             "letterSpacing": "0.1em"}),
         html.Span(f"  macro ", style={"color": "#475569", "fontSize": "0.5rem"}),
         html.Span(mb, style={"color": mb_clr, "fontWeight": "700", "fontSize": "0.56rem"}),
-        html.Span(f"  ·  {data.get('n_alerts',0)} alerts  ·  {cur}  ·  {data.get('as_of','')}",
+        # live per-bucket tally (always full-day counts, regardless of active tab)
+        html.Span(f"  ·  🟢{bb.get('BULLISH',0)} 🔴{bb.get('BEARISH',0)} ⛔{bb.get('AVOIDABLE',0)}",
+                  style={"color": "#94a3b8", "fontSize": "0.5rem", "fontWeight": "700"}),
+        html.Span(f"  ·  {cur}  ·  {data.get('as_of','')}",
                   style={"color": "#475569", "fontSize": "0.5rem"}),
     ], style={"marginBottom": "6px", "display": "flex", "alignItems": "center"})
     rows = []
@@ -707,8 +713,9 @@ def _render_news_panel(data: dict) -> html.Div:
         ], style={"display": "flex", "alignItems": "center", "gap": "2px",
                   "padding": "3px 0", "borderBottom": "1px solid #111d2e"}))
     if not rows:
-        rows = [html.Div("no market-moving events this day (feeds quiet or IP-blocked)",
-                         style={"color": "#475569", "fontSize": "0.52rem", "padding": "4px 0"})]
+        msg = (f"no {tab.lower()} events this day" if tab and tab != "ALL"
+               else "no market-moving events this day (feeds quiet or IP-blocked)")
+        rows = [html.Div(msg, style={"color": "#475569", "fontSize": "0.52rem", "padding": "4px 0"})]
     body = html.Div(rows, style={"maxHeight": "168px", "overflowY": "auto",
                                  "paddingRight": "4px"})
     return html.Div([header, body], style={
@@ -1330,6 +1337,19 @@ app.layout = dbc.Container([
             html.Span("scroll dates ◂▸", style={
                 "color": "#475569", "fontSize": "0.46rem", "marginLeft": "8px"}),
         ], style={"display": "flex", "alignItems": "center", "marginTop": "10px"}),
+        # Bucket tabs — filter the news panel by trader-facing lens. Kept in the STATIC
+        # layout (not inside news-panel) so the selection survives the 30s tick refresh.
+        dcc.RadioItems(
+            id="news-tab", value="ALL", inline=True,
+            options=[{"label": "ALL", "value": "ALL"},
+                     {"label": "🟢 Bullish", "value": "BULLISH"},
+                     {"label": "🔴 Bearish", "value": "BEARISH"},
+                     {"label": "⛔ Avoidable", "value": "AVOIDABLE"}],
+            className="news-tab",
+            labelStyle={"display": "inline-block", "marginRight": "12px",
+                        "cursor": "pointer", "fontSize": "0.52rem", "fontWeight": "700"},
+            inputStyle={"marginRight": "4px", "cursor": "pointer"},
+            style={"marginTop": "6px", "color": "#94a3b8"}),
         html.Div(id="news-panel", style={"marginTop": "4px"}),
         html.Div(id="macro-radar-panel", style={"marginTop": "4px"}),
     ], style={"padding": "14px 16px 10px"}),
@@ -5924,12 +5944,13 @@ def _seed_cards_on_date(date):
 
 
 @app.callback(Output("news-panel", "children"),
-              Input("news-date", "data"), Input("news-tick", "n_intervals"))
-def _update_news_panel(date, _n):
+              Input("news-date", "data"), Input("news-tick", "n_intervals"),
+              Input("news-tab", "value"))
+def _update_news_panel(date, _n, tab):
     if not _NEWS_AVAILABLE:
         return no_update
     try:
-        return _render_news_panel(news_events.analyze_news(date=date))
+        return _render_news_panel(news_events.analyze_news(date=date), tab or "ALL")
     except Exception:
         return no_update
 
