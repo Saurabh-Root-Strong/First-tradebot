@@ -416,6 +416,10 @@ def main() -> None:
     ap.add_argument("--t1-r", type=float, default=1.5, help="T1 in R multiples. Default: 1.5")
     ap.add_argument("--t2-r", type=float, default=3.0, help="T2 in R multiples. Default: 3.0")
     ap.add_argument("--cooldown-min", type=int, default=10, help="Re-entry cooldown minutes. Default: 10")
+    ap.add_argument("--cost-bps", type=float, default=0.0,
+                    help="Round-trip cost (spread+slippage+taxes) in bps of notional, charged per "
+                         "trade and converted to R via the trade's ATR risk. 0=gross. ~3=index futures, "
+                         "~5 conservative. Default: 0")
     ap.add_argument("--no-self-test", action="store_true", help="Skip the vectorized-vs-_analyze check")
     ap.add_argument("--save", action="store_true", help="Write per-trade ledger + summaries to data/backtest/")
     args = ap.parse_args()
@@ -443,6 +447,7 @@ def main() -> None:
     print(f"  Entry     : band >= {args.min_band}, >= {args.min_agree} TFs agree")
     print(f"  Geometry  : SL {args.sl_atr} ATR | T1 {args.t1_r}R | T2 {args.t2_r}R | cooldown {args.cooldown_min}m | EOD square-off")
     print(f"  Signal    : multi-TF technical consensus (signals._analyze, layer 1 of 10)")
+    print(f"  Cost      : {args.cost_bps:.1f} bps round-trip ({'GROSS' if args.cost_bps==0 else 'NET of cost'})")
     print("=" * 70)
 
     all_trades: list[pd.DataFrame] = []
@@ -472,6 +477,12 @@ def main() -> None:
             print(f"  [{k:>3}/{len(fy_syms)}] {LABELS.get(fy, fy):<14} — ERROR: {exc}")
             continue
         tdf = pd.DataFrame(tr)
+        if not tdf.empty and args.cost_bps > 0:
+            # round-trip cost in R = (entry * bps) / risk_price, risk_price = sl_atr*ATR
+            risk_price = args.sl_atr * tdf["atr"]
+            cost_r = (tdf["entry_px"] * args.cost_bps / 1e4) / risk_price.replace(0, np.nan)
+            tdf["r_gross"] = tdf["r"]
+            tdf["r"] = (tdf["r"] - cost_r).round(3)
         if not tdf.empty:
             all_trades.append(tdf)
             per_symbol_rows.append(summarize(tdf, LABELS.get(fy, fy)))
