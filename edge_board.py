@@ -111,8 +111,8 @@ def ledger(days_now):
         ("Option WRITING (straddle/strgl)","DEAD@cost",  "gross~0 (ATM efficient), -6..-12% to spread"),
         ("Fade-the-level (reversion)",     "DEAD",       "35-37%@15m, significantly wrong, all TF sets"),
         ("MTF confirm (options/fut)",      "DEAD@cost",  "gross +0.025%@15m, too small to beat even fut cost"),
-        ("Downside-break SHORT (FUTURES)", "CANDIDATE",  "gross +0.083% SIG, net +0.05%@0.03% (underpowered)"),
-        ("Upside-break LONG / CE",         "DEAD/FADE",  "gross~0, net clears below 0 at fut cost (longs bleed)"),
+        ("Downside-break SHORT (FUTURES)", "DEAD-OOS",   "2yr OOS n=2157: gross~0 win51%, net-neg; 7d+0.083 was luck"),
+        ("Upside-break LONG / CE",         "DEAD",       "2yr OOS gross~0 win51%, net-neg (no asymmetry at scale)"),
     ]
     for name, status, note in rows:
         print(f"   {status:10s} | {name:32s} | {note}")
@@ -166,8 +166,9 @@ def candidates(days, rng):
         emit("Downside-breakout @15m", None)
 
     print("-" * 74)
-    print("   NOTE: estimate assumes the point estimate is real and stable. Caches are")
-    print("   date-keyed; a new captured day auto-invalidates them on the next --run.")
+    print("   NOTE: the downside-break short was FALSIFIED on 2yr OOS history")
+    print("   (backtest_levels_history.py: n=2157, gross~0 win51%, net-negative). The")
+    print("   captured-day numbers above are small-sample; directional chapter is CLOSED.")
 
 
 def run_harnesses(days):
