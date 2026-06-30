@@ -20,8 +20,48 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from core.constants import NSE_NAME, STRIKE_DISPLAY_STEP, STRIKE_STEP
-from core.mirror_io import read_mirror as _read
+from core.constants import IST, LIVE_DIR, NSE_NAME, STRIKE_DISPLAY_STEP, STRIKE_STEP, today_iso
+from core.mirror_io import read_mirror as _read_raw
+
+# ── full-day read cache (mtime-keyed) ────────────────────────────────────────────
+# core.mirror_io caches PAST days but reads TODAY fresh on every call (the live file
+# grows). The scout lifecycle walk-back calls build_series ~120× per render at
+# different as_of cutoffs of the SAME day → 120 disk reads + re-parses of today's
+# mirrors = a ~50s render (the live "scout stuck loading" bug). Here we cache the
+# FULL-day frame once per (table,date,symbol), keyed by the file's (mtime,size) so a
+# live append refreshes it, and apply the as_of cutoff IN MEMORY. Identical result to
+# read_mirror (which just filters ts<=as_of), but the 120 walk-back reads collapse to
+# one. Local to this module — global read_mirror / the capture box are untouched.
+# Bounded: one entry per (table,date,symbol) (~a dozen), each a per-symbol frame.
+_FULL_CACHE: dict = {}
+
+
+def _read(tbl: str, date=None, as_of=None, symbol=None):
+    day = date or today_iso()
+    p = LIVE_DIR / f"{day}_{tbl}.parquet"
+    try:
+        st = p.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    key = (tbl, day, symbol)
+    hit = _FULL_CACHE.get(key)
+    if hit is None or hit[0] != sig:
+        full = _read_raw(tbl, day, None, symbol)        # whole day, no as_of cutoff
+        if len(_FULL_CACHE) > 80:           # bound (browsing many past days) — t3.micro
+            _FULL_CACHE.clear()
+        _FULL_CACHE[key] = (sig, full)
+    else:
+        full = hit[1]
+    if full is None:
+        return None
+    if as_of is None:
+        return full
+    ts_cut = pd.Timestamp(as_of)
+    if ts_cut.tzinfo is None:
+        ts_cut = ts_cut.tz_localize(IST)
+    out = full[full["ts"] <= ts_cut]
+    return out.reset_index(drop=True) if len(out) else None
 
 
 def _filter_expiry(c, kind: str):
@@ -51,7 +91,33 @@ def _wallclock(idx):
     return idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
 
 
+_SERIES_CACHE: dict = {}   # (sym,tf,date,as_of_iso,expiry) -> (chain_sig, result)
+
+
 def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") -> dict:
+    """Memoised wrapper: the scout lifecycle walk-back asks for the SAME (sym,tf,date,
+    as_of) series repeatedly (every 30s tick re-walks the same minutes; post-close the
+    clamped as_of is constant), and each rebuild is a ~0.2s pivot+loop. Cache the result
+    keyed by the chain file's (mtime,size) so a live append invalidates it. This is what
+    turns the live scout render from ~25s (120 rebuilds) into ~instant after the first."""
+    day = date or today_iso()
+    try:
+        st = (LIVE_DIR / f"{day}_chain_snapshots.parquet").stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = None
+    key = (sym, tf_min, day, as_of.isoformat() if as_of is not None else None, expiry)
+    hit = _SERIES_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    res = _build_series_impl(sym, tf_min, date, as_of, expiry)
+    _SERIES_CACHE[key] = (sig, res)
+    if len(_SERIES_CACHE) > 2000:          # bound for the t3.micro (OOM-sensitive)
+        _SERIES_CACHE.clear()
+    return res
+
+
+def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") -> dict:
     """Return the bar series for `sym` at `tf_min` minutes. {'has_data': False, ...}
     until enough is captured. tf_min is the bar size AND the highlighted window.
     `expiry` in {weekly, monthly} picks the option expiry (weekly until capture is

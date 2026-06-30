@@ -488,6 +488,17 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     Replay-only (needs as_of); live shows the trade with manage='HOLD' until graded."""
     if as_of is None or direction not in ("CE", "PE"):
         return None
+    # Clamp the walk-back reference to the last captured tick. Live `as_of` is wall-clock
+    # now, which after the close (or any data stall) sits well past the last data point;
+    # every dead minute in between re-evaluates to the SAME verdict on static data, so the
+    # minute-by-minute walk-back wastes its whole budget rebuilding the series (the
+    # post-close "scout stuck loading" hang). The honest "now" for an open trade is the
+    # last data we actually have.
+    _tk = _read_mirror("ticks", date, as_of, sym)
+    if _tk is not None and len(_tk):
+        _last_ts = _tk["ts"].max().to_pydatetime()
+        if as_of > _last_ts:
+            as_of = _last_ts
     side = direction
     want = f"TRADE {direction}"
 
