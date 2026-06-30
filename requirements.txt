@@ -11,3 +11,4 @@ pyarrow==24.0.0
 duckdb==1.5.3
 pandas-ta==0.4.71b0
 requests==2.31.0
+yfinance==1.5.1   # global macro feeds (Brent/USD-INR/DXY/yields/US-futures/metals) — Fyers serves none

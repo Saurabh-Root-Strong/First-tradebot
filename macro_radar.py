@@ -55,36 +55,48 @@ def _fetch(tkr):
         return None
 
 
-def main():
-    print("=" * 74)
-    print("  LIVE MACRO RADAR -> INDIA  (risk/context, not a trade signal)")
-    print("=" * 74)
-    rows = []
+def compute():
+    """Fetch all factors -> (rows, tilt, lean). rows: list of dicts sorted by |z|.
+
+    Importable by the dashboard poller (no subprocess). Network-bound — call from a
+    background thread, never the request path.
+    """
+    out = []
+    tilt = 0.0
     for tkr, lab, sgn, w in FACTORS:
         c = _fetch(tkr)
         if c is None or len(c) < 10:
-            rows.append((lab, None, None, None, sgn, w)); continue
+            out.append({"factor": lab, "level": None, "chg": None, "z": None,
+                        "impact": "n/a", "spike": False})
+            continue
         ret = c.pct_change() * 100
         chg = float(ret.iloc[-1])
         vol = float(ret.iloc[-21:-1].std())
         z = chg / vol if vol > 0 else 0.0
-        rows.append((lab, float(c.iloc[-1]), chg, z, sgn, w))
-
-    # sort by |z| (biggest movers first)
-    rows.sort(key=lambda r: (abs(r[3]) if r[3] is not None else -1), reverse=True)
-    print(f"  {'factor':14s} {'level':>10} {'chg%':>7} {'z':>6}  {'India':>6}  flag")
-    print("  " + "-" * 64)
-    tilt = 0.0
-    for lab, lvl, chg, z, sgn, w in rows:
-        if lvl is None:
-            print(f"  {lab:14s} {'n/a':>10}  (fetch failed)"); continue
         impact = "UP" if (sgn * np.sign(chg)) > 0 else "DOWN" if (sgn * np.sign(chg)) < 0 else "flat"
-        flag = "  <-- SPIKE" if abs(z) >= SPIKE_Z else ""
         tilt += sgn * z * w
-        print(f"  {lab:14s} {lvl:>10.2f} {chg:>+6.2f}% {z:>+5.1f}  {impact:>6}  {flag}")
-    print("  " + "-" * 64)
+        out.append({"factor": lab, "level": float(c.iloc[-1]), "chg": chg, "z": z,
+                    "impact": impact, "spike": abs(z) >= SPIKE_Z})
+    out.sort(key=lambda r: (abs(r["z"]) if r["z"] is not None else -1), reverse=True)
     lean = ("RISK-ON / India tailwind" if tilt > 1 else
             "RISK-OFF / India headwind" if tilt < -1 else "MIXED / neutral")
+    return out, tilt, lean
+
+
+def main():
+    print("=" * 74)
+    print("  LIVE MACRO RADAR -> INDIA  (risk/context, not a trade signal)")
+    print("=" * 74)
+    data, tilt, lean = compute()
+    print(f"  {'factor':14s} {'level':>10} {'chg%':>7} {'z':>6}  {'India':>6}  flag")
+    print("  " + "-" * 64)
+    for r in data:
+        if r["level"] is None:
+            print(f"  {r['factor']:14s} {'n/a':>10}  (fetch failed)"); continue
+        flag = "  <-- SPIKE" if r["spike"] else ""
+        print(f"  {r['factor']:14s} {r['level']:>10.2f} {r['chg']:>+6.2f}% {r['z']:>+5.1f}  "
+              f"{r['impact']:>6}  {flag}")
+    print("  " + "-" * 64)
     print(f"  NET MACRO TILT for India: {tilt:+.1f}  ->  {lean}")
     print("\n  NOTE: this is CONTEXT/RISK — public macro is priced in seconds and the next-day")
     print("  gap is pre-priced by GIFT Nifty. Use to know WHY / flatten on a shock / size the")

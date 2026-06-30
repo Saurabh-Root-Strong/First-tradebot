@@ -62,6 +62,11 @@ try:
 except Exception:
     _NEWS_AVAILABLE = False
 try:
+    import macro_radar
+    _MACRO_AVAILABLE = True
+except Exception:
+    _MACRO_AVAILABLE = False
+try:
     import trend_matrix
     _TREND_AVAILABLE = True
 except Exception:
@@ -712,6 +717,73 @@ def _render_news_panel(data: dict) -> html.Div:
         "marginBottom": "12px"})
 
 
+# ── Macro radar (global risk board -> India) ───────────────────────────────────
+_MACRO_STATE: dict = {"rows": [], "tilt": 0.0, "lean": "—", "as_of": ""}
+
+
+def _macro_radar_poller(every: int = 180):
+    """Background: refresh the global macro board into _MACRO_STATE every `every`s.
+    Network-bound (yfinance) — NEVER call macro_radar.compute() from a request path."""
+    import time as _t
+    while True:
+        try:
+            rows, tilt, lean = macro_radar.compute()
+            _MACRO_STATE.update({"rows": rows, "tilt": tilt, "lean": lean,
+                                 "as_of": pd.Timestamp.now(IST).strftime("%H:%M:%S")})
+        except Exception:
+            pass
+        _t.sleep(max(60, every))
+
+
+def _render_macro_radar(state: dict) -> html.Div:
+    """Live global macro board -> India: per-factor %chg/z/impact + net risk tilt.
+    CONTEXT/RISK only (public macro priced fast; gap pre-priced by GIFT Nifty)."""
+    rows = state.get("rows") or []
+    if not rows:
+        return html.Div("macro radar warming up…",
+                        style={"color": "#475569", "fontSize": "0.55rem"})
+    tilt = state.get("tilt", 0.0)
+    lean_clr = "#22c55e" if tilt > 1 else "#ef4444" if tilt < -1 else "#94a3b8"
+    header = html.Div([
+        html.Span("🌐 MACRO RADAR → INDIA", style={
+            "color": "#38bdf8", "fontWeight": "700", "fontSize": "0.62rem",
+            "letterSpacing": "0.1em"}),
+        html.Span(f"  tilt {tilt:+.1f}  ", style={"color": "#475569", "fontSize": "0.5rem"}),
+        html.Span(state.get("lean", "—"),
+                  style={"color": lean_clr, "fontWeight": "700", "fontSize": "0.56rem"}),
+        html.Span(f"  ·  {state.get('as_of','')}",
+                  style={"color": "#475569", "fontSize": "0.5rem"}),
+    ], style={"marginBottom": "6px", "display": "flex", "alignItems": "center"})
+    body_rows = []
+    for r in rows:
+        if r.get("level") is None:
+            continue
+        up = r["impact"] == "UP"; dn = r["impact"] == "DOWN"
+        iclr = "#22c55e" if up else "#ef4444" if dn else "#94a3b8"
+        chg_clr = "#22c55e" if (r["chg"] or 0) >= 0 else "#ef4444"
+        body_rows.append(html.Div([
+            html.Span(r["factor"][:13], style={"color": "#cbd5e1", "fontSize": "0.55rem",
+                      "width": "92px", "fontWeight": "700"}),
+            html.Span(f"{r['chg']:+.2f}%", style={"color": chg_clr, "fontSize": "0.55rem",
+                      "width": "56px", "textAlign": "right", **MONO}),
+            html.Span(f"z{r['z']:+.1f}", style={"color": "#64748b", "fontSize": "0.5rem",
+                      "width": "44px", "textAlign": "right", **MONO}),
+            html.Span(("▲" if up else "▼" if dn else "•"), style={
+                      "color": iclr, "fontSize": "0.6rem", "width": "20px", "textAlign": "center"}),
+            html.Span("SPIKE" if r.get("spike") else "", style={"color": "#fbbf24",
+                      "fontSize": "0.46rem", "fontWeight": "700"}),
+        ], style={"display": "flex", "alignItems": "center", "gap": "4px",
+                  "padding": "2px 0", "borderBottom": "1px solid #111d2e"}))
+    body = html.Div(body_rows, style={"maxHeight": "168px", "overflowY": "auto",
+                                      "paddingRight": "4px"})
+    note = html.Div("context/risk — public macro is priced fast; not a front-run",
+                    style={"color": "#475569", "fontSize": "0.46rem", "marginTop": "4px"})
+    return html.Div([header, body, note], style={
+        "padding": "10px 12px", "borderRadius": "8px", "background": BG_CARD,
+        "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #38bdf8",
+        "marginBottom": "12px"})
+
+
 # ── Sidebar card (always visible, clickable) ───────────────────────────────────
 def _nav_card(sym: str) -> html.Div:
     slug, color = _slug(sym), COLORS[sym]
@@ -1259,6 +1331,7 @@ app.layout = dbc.Container([
                 "color": "#475569", "fontSize": "0.46rem", "marginLeft": "8px"}),
         ], style={"display": "flex", "alignItems": "center", "marginTop": "10px"}),
         html.Div(id="news-panel", style={"marginTop": "4px"}),
+        html.Div(id="macro-radar-panel", style={"marginTop": "4px"}),
     ], style={"padding": "14px 16px 10px"}),
     html.Div(className="header-line"),
 
@@ -5861,6 +5934,16 @@ def _update_news_panel(date, _n):
         return no_update
 
 
+@app.callback(Output("macro-radar-panel", "children"), Input("news-tick", "n_intervals"))
+def _update_macro_radar(_n):
+    if not _MACRO_AVAILABLE:
+        return no_update
+    try:
+        return _render_macro_radar(_MACRO_STATE)     # reads the poller cache, never fetches
+    except Exception:
+        return no_update
+
+
 def _viewer_seed_latest(date=None) -> None:
     """VIEWER mode: fill _latest from the last SESSION tick (≤15:30) of each index in
     the mirror, mapped to the WS field names the overview/sidebar cards expect, so the
@@ -5968,6 +6051,15 @@ if __name__ == "__main__":
                 daemon=True, name="news",
             ).start()
             print("  News/event poller started — 60s intervals")
+
+        # Macro radar — global risk board (crude/USD-INR/DXY/yields/US-futures/metals/VIX)
+        # via yfinance into _MACRO_STATE; the panel reads the cache (never fetches in-request).
+        if _MACRO_AVAILABLE:
+            threading.Thread(
+                target=lambda: _macro_radar_poller(180),
+                daemon=True, name="macro-radar",
+            ).start()
+            print("  Macro radar poller started — 180s intervals")
 
         threading.Thread(
             target=_heartbeat_writer,
