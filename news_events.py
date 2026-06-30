@@ -142,16 +142,6 @@ _MACRO = [
 
 _ALL_TABLES = _STOCK_NEG + _STOCK_POS + _SECTOR + _MACRO
 
-# AVOIDABLE = binary / structural-risk events where the desk should STAY OUT of the
-# NAME entirely — the move is a governance/solvency/regulatory gap that neither a long
-# nor a short cleanly captures. A distinct lens (RISK, not direction): these are pulled
-# OUT of the plain BEARISH bucket. Ordinary directional negatives (earnings miss,
-# promoter selling, crude shock, rate hike) stay BEARISH — they are tradeable context.
-AVOID_EVENT_TYPES = frozenset({
-    "SEBI action", "Fraud allegation", "Auditor resignation", "Key-exec resignation",
-    "Credit downgrade", "Regulatory ban", "Tax/enforcement", "USFDA observation",
-})
-
 
 # ── Event record ─────────────────────────────────────────────────────────────────
 @dataclass
@@ -172,11 +162,8 @@ class NewsEvent:
 
     @property
     def bucket(self) -> str:
-        """Trader-facing lens for the panel tabs: AVOIDABLE (stay out of the name —
-        binary governance/solvency/regulatory risk) takes precedence over direction;
-        otherwise BULLISH / BEARISH by score sign; NEUTRAL if unscored."""
-        if self.event_type in AVOID_EVENT_TYPES:
-            return "AVOIDABLE"
+        """Trader-facing lens for the panel tabs: BULLISH / BEARISH by score sign
+        (NEUTRAL if unscored)."""
         return "BULLISH" if self.score > 0 else "BEARISH" if self.score < 0 else "NEUTRAL"
 
 
@@ -454,7 +441,7 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None) -
     by_scope = {sc: sum(1 for e in alerts if e.scope == sc) for sc in (MACRO, SECTOR, STOCK)}
     shown = alerts[:limit]
     by_bucket = {b: sum(1 for e in shown if e.bucket == b)
-                 for b in ("BULLISH", "BEARISH", "AVOIDABLE")}
+                 for b in ("BULLISH", "BEARISH")}
     return {
         "alerts": [asdict(e) | {"bias": e.bias.value, "bucket": e.bucket} for e in shown],
         "macro_bias": macro_bias, "macro_net": net,

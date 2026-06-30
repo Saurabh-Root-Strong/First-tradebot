@@ -684,7 +684,7 @@ def _render_news_panel(data: dict, tab: str = "ALL") -> html.Div:
         html.Span(f"  macro ", style={"color": "#475569", "fontSize": "0.5rem"}),
         html.Span(mb, style={"color": mb_clr, "fontWeight": "700", "fontSize": "0.56rem"}),
         # live per-bucket tally (always full-day counts, regardless of active tab)
-        html.Span(f"  ·  🟢{bb.get('BULLISH',0)} 🔴{bb.get('BEARISH',0)} ⛔{bb.get('AVOIDABLE',0)}",
+        html.Span(f"  ·  🟢{bb.get('BULLISH',0)} 🔴{bb.get('BEARISH',0)}",
                   style={"color": "#94a3b8", "fontSize": "0.5rem", "fontWeight": "700"}),
         html.Span(f"  ·  {cur}  ·  {data.get('as_of','')}",
                   style={"color": "#475569", "fontSize": "0.5rem"}),
@@ -1343,8 +1343,7 @@ app.layout = dbc.Container([
             id="news-tab", value="ALL", inline=True,
             options=[{"label": "ALL", "value": "ALL"},
                      {"label": "🟢 Bullish", "value": "BULLISH"},
-                     {"label": "🔴 Bearish", "value": "BEARISH"},
-                     {"label": "⛔ Avoidable", "value": "AVOIDABLE"}],
+                     {"label": "🔴 Bearish", "value": "BEARISH"}],
             className="news-tab",
             labelStyle={"display": "inline-block", "marginRight": "12px",
                         "cursor": "pointer", "fontSize": "0.52rem", "fontWeight": "700"},
