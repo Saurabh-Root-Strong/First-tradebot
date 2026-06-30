@@ -141,6 +141,20 @@ def main():
     hdb, _ = hit(np.sign(big["g_S&P500"]), big["dayret"])
     print(f"     big-S&P-night(top20%)  {hgb:6.0f}% {hdb:8.0f}%  (n={nb})")
 
+    # ── THE TRADEABILITY TEST: on event nights, does India TREND intraday or FADE? ──
+    print("\n  EVENT-DAY INTRADAY (open->close) — is the gap CAPTURABLE (trend) or does it FADE?")
+    print("  enter at India OPEN in the overnight direction, exit at CLOSE; this is the only")
+    print("  part GIFT Nifty does NOT already price. >50% net = first tradeable directional edge.")
+    psbig = np.sign(big["g_S&P500"])
+    hi, ni = hit(psbig, big["intra"])
+    mean_intra = (np.sign(big["g_S&P500"]) * big["intra"]).mean() * 100
+    print(f"     ALL event nights      intra-cont hit {hi:.0f}%  mean {mean_intra:+.3f}%  (n={ni})")
+    upe = big[big["g_S&P500"] > 0]; dne = big[big["g_S&P500"] < 0]
+    for lbl, s in (("UP-event (risk-on) ", upe), ("DOWN-event (risk-off)", dne)):
+        h, n = hit(np.sign(s["g_S&P500"]), s["intra"])
+        m = (np.sign(s["g_S&P500"]) * s["intra"]).mean() * 100
+        print(f"     {lbl}  intra-cont hit {h:.0f}%  mean {m:+.3f}%  (n={n})")
+
     # ── tomorrow's reading ────────────────────────────────────────────────────
     last = df.iloc[-1]
     print("\n" + "=" * 76)
