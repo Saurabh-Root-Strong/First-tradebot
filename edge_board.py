@@ -41,8 +41,14 @@ TREND_PCT = 0.30          # |day net move| beyond this = trend day, else range
 def _captured_days():
     out = set()
     for p in glob.glob(str(LIVE_DIR / "*_ticks.parquet")):
-        if os.path.getsize(p) >= 2000:
-            out.add(os.path.basename(p).split("_")[0])
+        if os.path.getsize(p) < 2000:
+            continue
+        name = os.path.basename(p).split("_")[0]
+        try:
+            datetime.date.fromisoformat(name)        # skip tmp_/partial/non-date files
+        except ValueError:
+            continue
+        out.add(name)
     return sorted(out)
 
 
@@ -115,23 +121,53 @@ def ledger(days_now):
     print("   more days before their day-block CI can clear 50 (see days-to-sig below).")
 
 
-def candidates():
-    """Days-to-significance for the two live candidates, from their cached harvests."""
-    print("\nDAYS-TO-SIGNIFICANCE  (if the observed hit rate holds; day-block scaled)")
+def _dayblock_hit(signed, dates, rng, reps=2000):
+    """Day-block bootstrap CI of P(signed>0). signed: array of signed fwd returns."""
+    s = np.asarray(signed, float); d = np.asarray(dates)
+    keep = ~np.isnan(s); s, d = s[keep], d[keep]
+    if len(s) < 5:
+        return None
+    hits = (s > 0).astype(float)
+    u = np.unique(d); idx = {x: np.where(d == x)[0] for x in u}
+    bs = [hits[np.concatenate([idx[x] for x in rng.choice(u, len(u), replace=True)])].mean()
+          for _ in range(reps)]
+    return 100 * hits.mean(), 100 * np.percentile(bs, 2.5), 100 * np.percentile(bs, 97.5), len(s), len(u)
+
+
+def candidates(days, rng):
+    """Days-to-significance for the live candidates, computed FROM the date-keyed caches."""
+    print("\nDAYS-TO-SIGNIFICANCE  (live from caches; if the observed hit rate holds)")
     print("-" * 74)
-    # MTF confirm @15m and level with-trend breakout @15m — headline numbers from harnesses
-    cands = [
-        ("MTF confirm @15m",            63.0, 49.0, 76.0, 9),
-        ("Downside-breakout @15m",      83.0, 53.0, 89.0, 7),   # regime-indep but n-thin (6-14/cell)
-    ]
-    for name, p, lo, hi, dn in cands:
-        togo = _days_to_sig(p, lo, hi, dn)
-        msg = "already clears" if (lo > 50) else (f"~{togo} more day(s) if rate holds"
-                                                  if togo is not None else "n/a")
-        print(f"   {name:28s} hit {p:.0f}%  db[{lo:.0f},{hi:.0f}]  ->  {msg}")
+    last = days[-1]
+    mtf_c = os.path.join(CACHE_DIR, f"mtf_{last}.parquet")
+    lv_c = os.path.join(CACHE_DIR, f"lv_{last}.parquet")
+
+    def emit(name, res):
+        if res is None:
+            print(f"   {name:28s} cache missing/thin -> run with --run"); return
+        p, lo, hi, n, nd = res
+        togo = _days_to_sig(p, lo, hi, nd)
+        msg = "already clears 50" if lo > 50 else (
+            f"~{togo} more day(s) if rate holds" if togo is not None else "n/a")
+        print(f"   {name:28s} hit {p:3.0f}%  db[{lo:3.0f},{hi:3.0f}]  n={n}/{nd}d  -> {msg}")
+
+    if os.path.exists(mtf_c):
+        m = pd.read_parquet(mtf_c)
+        best = m[m.pair.isin(["10->30", "15->60"]) & m.confirmed & ~m.conflict]
+        emit("MTF confirm @15m", _dayblock_hit(best["sret15"], best["date"], rng))
+    else:
+        emit("MTF confirm @15m", None)
+
+    if os.path.exists(lv_c):
+        lv = pd.read_parquet(lv_c)
+        dn = lv[(lv.cfg == "any2of4") & lv.is_brk & (lv.brk_dir < 0)]
+        emit("Downside-breakout @15m", _dayblock_hit(dn["brk15"], dn["date"], rng))
+    else:
+        emit("Downside-breakout @15m", None)
+
     print("-" * 74)
-    print("   NOTE: estimate assumes the point estimate is real and stable — the whole")
-    print("   point of accumulating an UP-week is to find out whether it is.")
+    print("   NOTE: estimate assumes the point estimate is real and stable. Caches are")
+    print("   date-keyed; a new captured day auto-invalidates them on the next --run.")
 
 
 def run_harnesses(days):
@@ -158,11 +194,11 @@ def main():
     print("=" * 78)
     cnt = regime_composition(days)
     ledger(len(days))
-    candidates()
     if "--run" in sys.argv:
-        run_harnesses(days)
-    else:
-        print("\n(run with --run to (re)execute the 3 harnesses with date-keyed caches)")
+        run_harnesses(days)          # refresh date-keyed caches first
+    candidates(days, np.random.default_rng(7))   # then read them live
+    if "--run" not in sys.argv:
+        print("\n(run with --run to (re)harvest the 3 harnesses for the latest day)")
 
 
 if __name__ == "__main__":

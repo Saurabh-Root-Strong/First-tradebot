@@ -57,7 +57,12 @@ def _captured_days():
     for p in glob.glob(str(LIVE_DIR / "*_ticks.parquet")):
         if os.path.getsize(p) < 2000:
             continue
-        out.add(os.path.basename(p).split("_")[0])
+        name = os.path.basename(p).split("_")[0]
+        try:
+            datetime.date.fromisoformat(name)        # skip tmp_/partial/non-date files
+        except ValueError:
+            continue
+        out.add(name)
     return sorted(out)
 
 

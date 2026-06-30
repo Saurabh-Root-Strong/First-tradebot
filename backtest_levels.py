@@ -58,8 +58,14 @@ CACHE = os.environ.get("LV_CACHE", "")
 def _captured_days():
     out = set()
     for p in glob.glob(str(LIVE_DIR / "*_ticks.parquet")):
-        if os.path.getsize(p) >= 2000:
-            out.add(os.path.basename(p).split("_")[0])
+        if os.path.getsize(p) < 2000:
+            continue
+        name = os.path.basename(p).split("_")[0]
+        try:
+            datetime.date.fromisoformat(name)        # skip tmp_/partial/non-date files
+        except ValueError:
+            continue
+        out.add(name)
     return sorted(out)
 
 
