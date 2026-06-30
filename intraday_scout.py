@@ -516,9 +516,16 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     # Minute resolution is the honest "held since". Naturally cheap — a flickery signal
     # stops on the first step back; only a genuinely persistent hold walks far (capped
     # at _TRIG_MAX_MIN). ──────────────────────────────────────────────────────────
+    # Walk back at BAR granularity (step = tf_min), not per-minute. The trade is defined
+    # on tf_min bars, so a minute-resolution walk just re-probes the same forming bar
+    # tf_min times — ~120 build_series rebuilds for a long hold = the live "scout stuck
+    # loading" hang. Stepping by tf_min checks each completed bar once (~8 probes for the
+    # 120-min cap): same contiguous-run logic, trigger reported to the bar (the honest
+    # grain for a tf_min trade), an order of magnitude fewer builds.
+    step = max(1, int(tf_min))
     trig_t = as_of
-    for i in range(1, _TRIG_MAX_MIN + 1):
-        t_i = as_of - datetime.timedelta(minutes=i)
+    for i in range(1, _TRIG_MAX_MIN // step + 1):
+        t_i = as_of - datetime.timedelta(minutes=i * step)
         if t_i.time() < _MKT_OPEN:
             break
         if not_before is not None and t_i < not_before:
