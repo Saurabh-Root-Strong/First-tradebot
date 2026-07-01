@@ -113,6 +113,11 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
             band["lo"], band["hi"] = round(mid - half, 1), round(mid + half, 1)
     except Exception:
         band = {}
+    # measured per-index coverage of THIS 60m band (honest accuracy tag, not a flat ~70%)
+    try:
+        bcov = hf.band_coverage(sym, 60)
+    except Exception:
+        bcov = {"cover": None, "n": 0, "conf": "none"}
     return {"sym": sym, "label": label, "ok": True, "spot": spot,
             "regime": r["regime"], "conf": r["confidence"], "action": r["action"],
             "structure": r.get("structure", ""), "carry": r["carry"],
@@ -121,7 +126,10 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
             "flags": r.get("flags", []), "flag_notes": r.get("flag_notes", []),
             "phase": f.phase, "er": f.er, "iv_atm": ser.get("iv_atm", [None])[-1],
             "band_lo": band.get("lo"), "band_hi": band.get("hi"),
-            "band_pct": band.get("exp_move_pct")}
+            "band_pct": band.get("exp_move_pct"),
+            "band_horizon": 60,
+            "band_cover": bcov.get("cover"), "band_n": bcov.get("n", 0),
+            "band_conf": bcov.get("conf", "none")}
 
 
 def main():
@@ -138,7 +146,7 @@ def main():
           f"   (intraday-only; BTST-carry only fires after 15:00 on a strong close)")
     print("=" * 92)
     post3 = now.time() >= dt.time(15, 0)
-    print(f"  {'index':11}{'spot':>10}  {'regime':10}{'conf':>5}  {'band (~70%)':>20}  action")
+    print(f"  {'index':11}{'spot':>10}  {'regime':10}{'conf':>5}  {'next-60m band':>20}  action")
     carries = []
     for sym in INDEX_SYMBOLS:
         r = read(sym, date, as_of)
@@ -149,6 +157,11 @@ def main():
         flagstr = ("  ⚑ " + " ".join(r["flags"])) if r["flags"] else ""
         print(f"  {r['label']:11}{r['spot']:>10.1f}  {r['regime']:10}{r['conf']:>4}  {band:>20}  "
               f"{r['action'][:42]}{flagstr}")
+        # measured 60m coverage tag — trust the band per-index, not a flat ~70%
+        if r.get("band_cover") is not None:
+            _cm = {"ok": "✓", "soft": "~", "low": "⚠ low", "thin": "· thin"}.get(r["band_conf"], "")
+            print(f"  {'':11}{'':>10}       {'':10}   ↳ 60m cover "
+                  f"{r['band_cover']*100:.0f}% n{r['band_n']} {_cm}")
         # honest defensive POSTURE line — SIZE + trade/no-trade, never a direction
         szx = f"{r['size']:.1f}x" if r.get("size") is not None else "—"
         print(f"  {'':11}{'':>10}  → {r['posture']:11} size {szx:5} · {r['state']:14}"

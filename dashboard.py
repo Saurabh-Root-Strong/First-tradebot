@@ -6042,13 +6042,24 @@ def _render_cockpit(date):
         band = (f"{r['band_lo']:.0f}–{r['band_hi']:.0f}"
                 if r.get("band_lo") and r.get("band_hi") else "—")
         chips = [html.Span(fl, style=_CK_CHIP) for fl in r.get("flags", [])]
+        # measured 60m coverage tag: how often price actually lands in THIS index's band
+        cov, cconf = r.get("band_cover"), r.get("band_conf", "none")
+        _cc = {"ok": "#22c55e", "soft": "#eab308", "low": "#ef4444", "thin": "#64748b"}
+        cov_span = (html.Span(
+            f" {cov*100:.0f}% {'✓' if cconf=='ok' else '~' if cconf=='soft' else '⚠' if cconf=='low' else '·'}",
+            style={"color": _cc.get(cconf, "#64748b"), "fontSize": "0.55rem"},
+            title=f"measured: price lands in this 60m band {cov*100:.0f}% of the time "
+                  f"(n={r.get('band_n', 0)}). Trust the band where this is high.")
+            if cov is not None else html.Span(""))
         rows.append(html.Div([
             html.Span(f"{r['label']:11}", style={"color": "#e2e8f0", "fontWeight": "700"}),
             html.Span(f"{r['spot']:>9.1f}  ", style={"color": "#94a3b8"}),
             html.Span(f"{r['regime']:9}", style={"color": col, "fontWeight": "700"}),
             html.Span(f" {r['conf']:>2}%  ", style={"color": "#64748b"}),
-            html.Span(f"band {band:>16}  ", style={"color": "#38bdf8"}),
-            html.Span(r["action"][:46], style={"color": "#94a3b8", "fontSize": "0.6rem"}),
+            html.Span("60m band ", style={"color": "#475569", "fontSize": "0.55rem"}),
+            html.Span(f"{band:>16}", style={"color": "#38bdf8"}),
+            cov_span,
+            html.Span("  " + r["action"][:44], style={"color": "#94a3b8", "fontSize": "0.6rem"}),
             *chips,
         ], style={"fontSize": "0.64rem", "padding": "2px 0", "whiteSpace": "nowrap", **MONO}))
         # honest defensive POSTURE sub-line — SIZE + trade/no-trade, never a direction
