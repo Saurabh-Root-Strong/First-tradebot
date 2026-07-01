@@ -254,11 +254,19 @@ def main() -> None:
             print("        nothing to harvest yet")
     except Exception as exc:
         print(f"        skipped: {exc}")
+    print("  [6/7] LEARN — refresh band coverage + recalibrate multipliers (L4 loop)")
+    try:
+        import backtest_band_horizon as bh
+        import calibration_engine as cal
+        bh.run(30, [15, 60])              # regenerate data/calibration/band_coverage.json
+        cal.learn()                       # shrink-recalibrate band_multipliers.json
+    except Exception as exc:
+        print(f"        skipped: {exc}")
     # Purge LAST — only after every fetch/merge above has safely landed locally.
     if args.no_purge:
-        print("  [6/6] purge VM (skipped: --no-purge)")
+        print("  [7/7] purge VM (skipped: --no-purge)")
     else:
-        print(f"  [6/6] purge VM of already-archived days (< {today})")
+        print(f"  [7/7] purge VM of already-archived days (< {today})")
         _purge_vm(args.host, args.key, q, today)
     print("eod_sync done.")
 

@@ -157,6 +157,39 @@ def band_coverage(sym: str, horizon_min: int) -> dict:
     return {"cover": cover, "n": n, "conf": conf}
 
 
+# ── LEARNED band multiplier — the L4 calibration loop's live output ───────────────
+# calibration_engine.py recalibrates a per-(index,horizon) multiplier (shrunk toward 1.0
+# on thin data) so each band self-tunes toward the 68% coverage target. Applied on TOP of
+# the base band. 1.0 = no change / no data. Cached by mtime like the coverage ledger.
+_MULT = DATA_DIR / "calibration" / "band_multipliers.json"
+_MULT_CACHE: dict = {}
+
+
+def band_multiplier(sym: str, horizon_min: int) -> float:
+    """Learned band-width multiplier for (index, horizon); 1.0 when absent/thin."""
+    try:
+        mt = _MULT.stat().st_mtime_ns
+    except OSError:
+        return 1.0
+    d = _MULT_CACHE.get(mt)
+    if d is None:
+        import json
+        try:
+            d = json.loads(_MULT.read_text())
+        except Exception:
+            d = {}
+        _MULT_CACHE.clear(); _MULT_CACHE[mt] = d
+    cells = (d.get("by_index", {}) or {}).get(sym, {})
+    if not cells:
+        return 1.0
+    key = str(horizon_min) if str(horizon_min) in cells else \
+        min(cells, key=lambda k: abs(int(k) - horizon_min))
+    try:
+        return float(cells.get(key, {}).get("mult", 1.0))
+    except Exception:
+        return 1.0
+
+
 if __name__ == "__main__":
     import sys
     from core.constants import INDEX_SYMBOLS

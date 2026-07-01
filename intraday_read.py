@@ -105,6 +105,12 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     r = FE.classify(f)
     try:
         band = hf.forecast(sym, as_of=as_of, date=date) or {}
+        # L4 learned calibration: self-tuned per-index 60m band multiplier
+        bm = hf.band_multiplier(sym, 60)
+        if bm != 1.0 and band.get("lo") is not None and band.get("hi") is not None:
+            mid = (band["lo"] + band["hi"]) / 2.0
+            half = (band["hi"] - band["lo"]) / 2.0 * bm
+            band["lo"], band["hi"] = round(mid - half, 1), round(mid + half, 1)
     except Exception:
         band = {}
     return {"sym": sym, "label": label, "ok": True, "spot": spot,
