@@ -6074,61 +6074,56 @@ def _render_cockpit(date):
         ], style={"fontSize": "0.58rem", "padding": "0 0 3px 0", "whiteSpace": "nowrap", **MONO}))
         if r.get("carry"):
             carries.append(r["label"])
-    _ck_help = (
-        "INTRADAY REGIME COCKPIT — a live map of where each index goes in the next "
-        "60 minutes, and whether you should trade. It never shouts BUY or DOWN "
-        "(guessing direction loses money). It tells you the mood, the range, and how "
-        "big to bet.\n\n"
-        "EACH ROW:\n"
-        "  index · spot · MOOD · confidence% · 60-min band low–high · trust% · what-to-do\n"
-        "  MOOD: OPENING (just opened) / NORMAL (calm, most of the day) / "
-        "HIGH_VOL (wild-swing day).\n"
-        "  60-MIN BAND: where price likely sits an hour from now (~7 times out of 10). "
-        "This is your stop zone.\n"
-        "  TRUST%: how often this index's band was actually right. Green ✓ = trust it "
-        "(NIFTY ~74%). Red ⚠ ~50% = shaky, use as a rough guide only. · = too few days.\n\n"
-        "→ THE '→' LINE = what to do right now, in plain words:\n"
-        "  TRADE-BAND  = you may trade. Wait for price to reach the band EDGE (top or "
-        "bottom), then bet it bounces back to the middle. Never trade in the middle.\n"
-        "  STAND-ASIDE = market is choppy or changing mood — you lose here. Do nothing.\n"
-        "  SIZE-DOWN   = wild day — trade only HALF your normal size.\n"
-        "  WAIT        = too early, the day's range hasn't formed. Sit tight.\n"
-        "  BTST-CARRY  = after 3 PM only, if the day closed strong — buy the index "
-        "FUTURE, hold overnight, sell tomorrow ~9:30 AM. The one proven trade.\n"
-        "  size Nx = how big to bet (1.0x normal, 0.5x half, 0.0x don't).\n"
-        "  option-buy: NO = don't buy call/put options intraday — it's a coin flip "
-        "and options cost ~3%, so you slowly lose.\n\n"
-        "HOW TO USE: check the mood → look at trust% (only lean on green bands) → if it "
-        "says TRADE-BAND, wait for the edge and fade back to the middle, stop just "
-        "beyond the far edge. Never chase the middle. No overnight unless it says "
-        "BTST-CARRY after 3 PM.\n\n"
-        "EXAMPLE — reading a full entry (both lines):\n"
-        "  LINE 1 (the state):\n"
-        "    NIFTY 50  23975  NORMAL 55%  60m band 23916–24024  74%✓\n"
-        "    NIFTY is at 23975. Mood NORMAL (calm), 55% sure of that mood. Over the "
-        "next hour it should stay between 23916 and 24024. That band was right 74% of "
-        "the time (green = trust it).\n"
-        "  LINE 2 (the '->' line, what to do):\n"
-        "    -> TRADE-BAND  size 1.0x · drift · option-buy: NO\n"
-        "    TRADE-BAND = you may trade the band. size 1.0x = full normal size. drift = "
-        "slow one-way lean. option-buy: NO = don't buy calls/puts (coin flip + 3% cost).\n"
-        "  PUT TOGETHER, the plan is:\n"
-        "  • Price drops near 23916 (bottom edge) -> BUY, target the middle (~23970), "
-        "stop if it closes below 23916.\n"
-        "  • Price rises near 24024 (top edge) -> SELL, target the middle, stop if it "
-        "closes above 24024.\n"
-        "  • Price in the middle (~23970) -> do NOTHING, no edge there.\n"
-        "  • Trade the underlying/future, NOT options (that's the option-buy: NO).\n"
-        "  COUNTER-EXAMPLE — line 2 instead says:\n"
-        "    -> STAND-ASIDE  size 0.0x · chop · option-buy: NO\n"
-        "    or line 1 shows 50%⚠ (red). Then you do NOT trade at all — sit out.")
+    def _hh(txt):   # section heading
+        return html.Div(txt, style={"color": "#67e8f9", "fontSize": "0.62rem",
+                        "fontWeight": "700", "padding": "5px 0 1px 0", **MONO})
+    def _hl(txt, color="#94a3b8"):   # plain line
+        return html.Div(txt, style={"color": color, "fontSize": "0.6rem",
+                        "padding": "1px 0 1px 8px", **MONO})
+    def _hm(txt, color="#38bdf8"):   # mono sample from the screen
+        return html.Div(txt, style={"color": color, "fontSize": "0.6rem", "fontWeight": "700",
+                        "padding": "2px 6px", "margin": "1px 0", "background": "#0b1220",
+                        "borderLeft": "2px solid #334155", **MONO})
+    help_box = html.Details([
+        html.Summary("ⓘ how to read", style={"color": "#67e8f9", "fontSize": "0.58rem",
+                     "cursor": "pointer", **MONO}),
+        html.Div([
+            _hl("A live map of where each index goes in the next 60 minutes — and whether "
+                "to trade. It NEVER says buy or sell a direction (that loses money). It "
+                "gives you a range and one order per index. Two lines each:", "#cbd5e1"),
+            _hh("LINE 1 — the state (where price is + the range)"),
+            _hm("NIFTY 50  23987  NORMAL 62%  60m band 23982–24030  74% ✓"),
+            _hl("• 23987 = price now    • NORMAL = calm mood (62% sure)"),
+            _hl("• 23982–24030 = where it likely sits in 1 hour (your range)"),
+            _hl("• 74% ✓ = that band was right 74% of the time. GREEN ✓ = trust it. "
+                "RED ⚠ (~50%) = shaky, rough guide only. · = too few days."),
+            _hh("LINE 2 — your order (the → line; this is the boss)"),
+            _hm("→ STAND-ASIDE  size 0.0x · choppy · option-buy: NO"),
+            _hl("• the WORD = your order    • size = how big (1.0x full, 0.5x half, 0.0x none)"),
+            _hl("• option-buy: NO = never buy calls/puts intraday (coin flip + 3% cost = you lose)"),
+            _hh("THE ORDERS (just read the → word)"),
+            _hl("• TRADE-BAND  = buy at the LOW edge, sell at the HIGH edge, nothing in the middle"),
+            _hl("• STAND-ASIDE = choppy — do nothing"),
+            _hl("• SIZE-DOWN   = wild day — half size"),
+            _hl("• WAIT        = too early, range not formed yet"),
+            _hl("• BTST-CARRY  = after 3 PM + strong close — buy the FUTURE, hold overnight, "
+                "sell tomorrow ~9:30 (the one proven trade)"),
+            _hh("EXAMPLE — band 23982–24030, order says TRADE-BAND"),
+            _hl("• price near 23982 (low edge)  → BUY,  target middle ~24006, stop below 23982",
+                "#4ade80"),
+            _hl("• price near 24030 (high edge) → SELL, target middle ~24006, stop above 24030",
+                "#f87171"),
+            _hl("• price in the middle (~24006) → do NOTHING (no edge there)"),
+            _hl("If the → word is STAND-ASIDE, or trust% is red ⚠ → SIT OUT, no trade.",
+                "#f59e0b"),
+        ], style={"padding": "5px 8px 7px 8px", "marginTop": "3px", "maxWidth": "660px",
+                  "background": "#0b1220", "border": "1px solid #1e293b", "borderRadius": "6px"}),
+    ], style={"display": "inline-block", "marginLeft": "10px", "verticalAlign": "middle"})
     head = html.Div([
         html.Span("🧭 INTRADAY REGIME COCKPIT   ", style=_CK_HEAD),
         html.Span("live" if live else f"replay {date}",
                   style={"color": "#22c55e" if live else "#f59e0b", "fontSize": "0.6rem", **MONO}),
-        html.Span("  ⓘ how to read", title=_ck_help,
-                  style={"color": "#475569", "fontSize": "0.58rem", "cursor": "help",
-                         "borderBottom": "1px dotted #475569", **MONO}),
+        help_box,
     ])
     tail = []
     post3 = _dt.datetime.now(IST).time() >= _dt.time(15, 0)
