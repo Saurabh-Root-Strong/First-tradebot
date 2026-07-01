@@ -52,6 +52,24 @@ def _trailing_day_ranges(sym: str, n: int = 40) -> np.ndarray:
     return r
 
 
+def _prev_close(sym: str, ref_date: str) -> float | None:
+    """Prior captured trading day's last close (from the live mirrors — correct for live/
+    recent, vs the stale daily parquet). Used for the opening-gap flag."""
+    import glob, os
+    from core.constants import LIVE_DIR
+    try:
+        days = sorted({os.path.basename(p)[:10]
+                       for p in glob.glob(str(LIVE_DIR / "*_oi_snapshots.parquet"))
+                       if os.path.getsize(p) > 800})
+        priors = [d for d in days if d < ref_date]
+        if not priors:
+            return None
+        cl = fc.build_series(sym, 5, priors[-1], None).get("close") or []
+        return float(cl[-1]) if cl else None
+    except Exception:
+        return None
+
+
 def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     label = LABELS.get(sym, sym)
     ser = fc.build_series(sym, 5, date, as_of)
@@ -66,8 +84,10 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     trail = _trailing_day_ranges(sym)
     day_rng = (df["high"].max() - df["low"].min()) / df["open"].iloc[0] * 100
     dvp = float((trail <= day_rng).mean()) if len(trail) >= 10 else float("nan")
+    ref = date or (as_of.date().isoformat() if as_of else dt.datetime.now(IST).date().isoformat())
+    prev_c = _prev_close(sym, ref)
 
-    f = FE.compute(df, day_vol_pctile=dvp)
+    f = FE.compute(df, day_vol_pctile=dvp, prev_close=prev_c)
     r = FE.classify(f)
     try:
         band = hf.forecast(sym, as_of=as_of, date=date) or {}
@@ -76,6 +96,7 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     return {"sym": sym, "label": label, "ok": True, "spot": spot,
             "regime": r["regime"], "conf": r["confidence"], "action": r["action"],
             "structure": r.get("structure", ""), "carry": r["carry"],
+            "flags": r.get("flags", []), "flag_notes": r.get("flag_notes", []),
             "phase": f.phase, "er": f.er, "iv_atm": ser.get("iv_atm", [None])[-1],
             "band_lo": band.get("lo"), "band_hi": band.get("hi"),
             "band_pct": band.get("exp_move_pct")}
@@ -103,9 +124,11 @@ def main():
             print(f"  {LABELS.get(sym, sym):11}{'':>10}  {'—':10}       {r['note']}")
             continue
         band = (f"{r['band_lo']:.0f}–{r['band_hi']:.0f}" if r["band_lo"] and r["band_hi"] else "—")
-        struct = f"/{r['structure']}" if r["structure"] else ""
+        flagstr = ("  ⚑ " + " ".join(r["flags"])) if r["flags"] else ""
         print(f"  {r['label']:11}{r['spot']:>10.1f}  {r['regime']:10}{r['conf']:>4}  {band:>20}  "
-              f"{r['action'][:44]}")
+              f"{r['action'][:42]}{flagstr}")
+        for note in r["flag_notes"]:
+            print(f"  {'':11}{'':>10}       {'':10}   ↳ {note}")
         if r["carry"]:
             carries.append(r["label"])
     # the one intraday→BTST bridge

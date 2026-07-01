@@ -105,11 +105,19 @@ class Features:
     call_wall: float = float("nan"); put_wall: float = float("nan")
     # time / expiry
     phase: str = ""; mins_to_close: int = 0; dte: Optional[int] = None; post3: bool = False
+    # EVENT FLAGS — detection only, NOT regimes. They sharpen the risk-map + confidence
+    # (where the stop/band sits, when NOT to initiate). They do NOT predict direction.
+    gap_pct: float = float("nan"); gap_type: str = ""       # FLAT/GAP_UP/GAP_DOWN/SHARP_*
+    or_high: float = float("nan"); or_low: float = float("nan")
+    broke: str = ""             # "" / HIGH / LOW  — price beyond the opening range
+    fake_break: str = ""        # "" / FAILED_HIGH / FAILED_LOW — broke then reclaimed
+    transition: bool = False    # regime destabilising (vol expanding fast) — don't initiate
 
 
 def compute(df: pd.DataFrame, as_of: Optional[dt.datetime] = None,
             chain: Optional[pd.DataFrame] = None, basis: Optional[float] = None,
-            dte: Optional[int] = None, day_vol_pctile: Optional[float] = None) -> Features:
+            dte: Optional[int] = None, day_vol_pctile: Optional[float] = None,
+            prev_close: Optional[float] = None) -> Features:
     """Causal feature vector from intraday OHLCV (df: ts,open,high,low,close,volume).
     Structure reads CLOSED bars only (drops the forming bar)."""
     d = df.copy()
@@ -176,6 +184,38 @@ def compute(df: pd.DataFrame, as_of: Optional[dt.datetime] = None,
     f.post3 = t >= POST3
     f.phase = ("OPENING" if t < dt.time(9, 45) else "PRE_CLOSE" if t >= POST3
                else "LUNCH" if dt.time(12, 0) <= t < dt.time(13, 30) else "MID")
+
+    # ── EVENT FLAGS (causal detection; risk-map / confidence, not direction) ─────
+    today_open = float(closed["open"].iloc[0])
+    cur = float(c.iloc[-1])
+    # opening gap vs prior close
+    if prev_close:
+        f.gap_pct = (today_open - prev_close) / prev_close * 100
+        a = abs(f.gap_pct)
+        if a < 0.15:
+            f.gap_type = "FLAT"
+        else:
+            sharp = a >= 0.75
+            f.gap_type = ("SHARP_GAP_UP" if f.gap_pct > 0 else "SHARP_GAP_DOWN") if sharp else \
+                         ("GAP_UP" if f.gap_pct > 0 else "GAP_DOWN")
+    # opening range (first ~30 min) + break / fake-break
+    oq = closed.head(6)
+    f.or_high = float(oq["high"].max()); f.or_low = float(oq["low"].min())
+    if len(closed) > 6:
+        post_or = closed.iloc[6:]
+        if cur > f.or_high:
+            f.broke = "HIGH"
+        elif cur < f.or_low:
+            f.broke = "LOW"
+        # broke beyond OR earlier but reclaimed = failed/fake break (range held)
+        if post_or["high"].max() > f.or_high and cur <= f.or_high:
+            f.fake_break = "FAILED_HIGH"
+        elif post_or["low"].min() < f.or_low and cur >= f.or_low:
+            f.fake_break = "FAILED_LOW"
+    # transition pressure = recent realised vol expanding fast vs the session (regime shifting)
+    if len(ret.dropna()) >= 10:
+        r5 = float(ret.iloc[-5:].std()); rall = float(ret.std())
+        f.transition = bool(rall > 0 and r5 > 1.6 * rall)
     return f
 
 
@@ -209,12 +249,29 @@ def classify(f: Features) -> dict:
 
 def _out(regime: str, base_conf: int, action: str, f: Features, structure: str = "") -> dict:
     conf = int(max(30, min(85, base_conf)))
+    # EVENT FLAGS — detection layer on top of the regime (risk-map + confidence, not direction)
+    flags, notes = [], []
+    if f.gap_type and f.gap_type != "FLAT":
+        flags.append(f"{f.gap_type}{f.gap_pct:+.2f}%")
+        notes.append("gap day — wider expected range; don't fade the open, gaps often fade later")
+    if f.fake_break:
+        flags.append(f.fake_break)
+        notes.append("range HELD (failed break) — mean-revert reference valid; failed side = S/R")
+    elif f.broke:
+        flags.append(f"BROKE_{f.broke}")
+        notes.append("opening range broke — move the stop/band reference; do NOT chase (most fail)")
+    if f.transition:
+        flags.append("SHIFTING")
+        notes.append("regime destabilising (vol expanding) — LOWER confidence, don't initiate")
+        conf -= 10
+    conf = int(max(30, min(85, conf)))
     # post-3pm carry hook: a late STRONG CLOSE (any regime) becomes the validated BTST-long.
     carry = ""
-    if f.post3 and f.range_pos == f.range_pos and f.range_pos >= 0.66:
+    if f.post3 and f.range_pos == f.range_pos and f.range_pos >= 0.66 and not f.transition:
         carry = ("POST-3PM CARRY → strong close forming; becomes the validated BTST-long "
                  "(close-strength → overnight, exit ~09:30). See btst_signal.py.")
-    out = {"regime": regime, "confidence": conf, "action": action, "carry": carry,
+    out = {"regime": regime, "confidence": conf, "action": action, "flags": flags,
+           "flag_notes": notes, "carry": carry,
            "features": {k: (round(v, 3) if isinstance(v, float) and v == v else v)
                         for k, v in asdict(f).items()}}
     if structure:
