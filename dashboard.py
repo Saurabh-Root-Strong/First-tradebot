@@ -3698,6 +3698,16 @@ def _scout_row(r, mem=None, today=None):
                 + (f"  band[{r['pred_lo']}, {r['pred_hi']}]" if r.get("pred_lo") else ""))
     pred_kids = [html.Span(pred_txt, title=_TIP_BAND,
                            style={"color": pclr, "fontWeight": "700", "cursor": "help"})]
+    # HONEST measured band coverage for this (index, horizon) from the calibration ledger
+    if r.get("band_cover") is not None:
+        _cc = {"ok": "#22c55e", "soft": "#fbbf24", "low": "#f87171", "thin": "#64748b"}
+        _cm = {"ok": "✓", "soft": "~", "low": "⚠ low", "thin": "· thin"}
+        pred_kids.append(html.Span(
+            f"  cover {r['band_cover']*100:.0f}% {_cm.get(r['band_conf'], '')} (n{r['band_n']})",
+            title="measured endpoint coverage of this band at this horizon "
+                  "(backtest_band_horizon.py ledger); trust the band only where this is high",
+            style={"color": _cc.get(r["band_conf"], "#94a3b8"), "fontWeight": "700",
+                   "cursor": "help"}))
     v = r.get("verify")
     if v:
         ok = v["dir_hit"]

@@ -627,14 +627,24 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     return out
 
 
+# Horizon-scaling exponent for the band. Pure sqrt (0.5 = random walk) UNDER-covers at
+# short horizons because intraday index moves MEAN-REVERT (realised dispersion at short H is
+# relatively larger than sqrt-from-1min-vol predicts). Coverage backtest (backtest_band_horizon
+# .py, 3 captured days) implied Hurst ~0.37 from the 15m/60m coverage pair; use 0.40 (mild,
+# in the documented 0.35-0.45 intraday range). (H/60)^0.40 = 1 at H=60 so the 60m calibration
+# (_RANGE_M in hour_forecast) is PRESERVED — only the shorter horizons widen. Do NOT re-level
+# from a 3-day adverse sample; that stays a ledger job.
+_BAND_HURST = 0.40
+
+
 def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:
     """Forward prediction over horizon_min: UP/DOWN/RANGE + target + band.
-    Band scales the 60m realised-vol forecast by sqrt(H/60) (vol ~ sqrt time)."""
+    Band scales the 60m realised-vol forecast by (H/60)^_BAND_HURST (mean-reverting, not sqrt)."""
     pdir = "UP" if direction == "CE" else "DOWN" if direction == "PE" else "RANGE"
     if not spot or range_pct_60 is None:
         return {"pdir": pdir, "target": None, "pred_lo": None, "pred_hi": None,
                 "move_pct": None}
-    band_pct = float(range_pct_60) * math.sqrt(max(horizon_min, 1) / 60.0)
+    band_pct = float(range_pct_60) * (max(horizon_min, 1) / 60.0) ** _BAND_HURST
     band = spot * band_pct / 100.0
     target = (round(spot + band, 1) if pdir == "UP"
               else round(spot - band, 1) if pdir == "DOWN" else None)
@@ -788,6 +798,7 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
 
     # ── forward prediction over the selected horizon + replay verify ─────────────
     fwd = _forward(direction, spot, fcst.get("exp_move_pct"), horizon_min)
+    bcov = hf.band_coverage(sym, horizon_min)          # HONEST measured coverage for this cell
     verify = _verify(sym, date, as_of, horizon_min, spot,
                      fwd["pdir"], fwd["pred_lo"], fwd["pred_hi"], atm=atm)
     lifecycle = (_lifecycle(sym, tf_min, date, as_of, direction, horizon_min, strength,
@@ -815,6 +826,7 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         "pred_dir": fwd["pdir"], "pred_target": fwd["target"],
         "pred_lo": fwd["pred_lo"], "pred_hi": fwd["pred_hi"],
         "pred_move_pct": fwd["move_pct"], "verify": verify,
+        "band_cover": bcov["cover"], "band_n": bcov["n"], "band_conf": bcov["conf"],
     }
 
 
@@ -863,6 +875,9 @@ if __name__ == "__main__":
         pl = (f"      PREDICT next {r['horizon']}m: {r['pred_dir']}"
               + (f" -> {r['pred_target']}" if r['pred_target'] else "")
               + (f"  band[{r['pred_lo']}, {r['pred_hi']}]" if r['pred_lo'] else ""))
+        if r.get("band_cover") is not None:
+            _cm = {"ok": "✓", "soft": "~", "low": "⚠ low", "thin": "· thin"}.get(r["band_conf"], "")
+            pl += f"  (cover {r['band_cover']*100:.0f}% n{r['band_n']} {_cm})"
         v = r.get("verify")
         if v:
             mark = "HIT ✓" if v["dir_hit"] else "MISS ✗"

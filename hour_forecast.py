@@ -114,6 +114,49 @@ def forecast(sym: str, as_of: Optional[datetime.datetime] = None,
     return predict(features(sym, as_of, date))
 
 
+# ── HONEST band coverage — the band's REAL measured accuracy, self-updating ───────
+# backtest_band_horizon.py persists per-(index,horizon) endpoint coverage to
+# data/calibration/band_coverage.json. Surfacing it next to the band stops the UI
+# claiming a flat "~70%" when e.g. the 15m / BANK / FIN bands measure ~50%. Cached by
+# file mtime so it refreshes when the ledger is regenerated without a restart.
+from core.constants import DATA_DIR  # noqa: E402
+_LEDGER = DATA_DIR / "calibration" / "band_coverage.json"
+_COV_CACHE: dict = {}
+
+
+def band_coverage(sym: str, horizon_min: int) -> dict:
+    """{'cover': pct|None, 'n': int, 'conf': tag} for this (index, horizon) from the ledger.
+    Nearest available horizon if the exact one isn't logged. conf: ok/soft/low/thin/none."""
+    try:
+        mt = _LEDGER.stat().st_mtime_ns
+    except OSError:
+        return {"cover": None, "n": 0, "conf": "none"}
+    led = _COV_CACHE.get(mt)
+    if led is None:
+        import json
+        try:
+            led = json.loads(_LEDGER.read_text())
+        except Exception:
+            led = {}
+        _COV_CACHE.clear(); _COV_CACHE[mt] = led
+    cells = (led.get("by_index", {}) or {}).get(sym, {})
+    if not cells:
+        return {"cover": None, "n": 0, "conf": "none"}
+    key = str(horizon_min) if str(horizon_min) in cells else \
+        min(cells, key=lambda k: abs(int(k) - horizon_min))
+    c = cells.get(key, {}) or {}
+    cover, n = c.get("endpoint"), int(c.get("n", 0))
+    if cover is None or n < 20:
+        conf = "thin"
+    elif cover >= 0.66:
+        conf = "ok"
+    elif cover >= 0.58:
+        conf = "soft"
+    else:
+        conf = "low"
+    return {"cover": cover, "n": n, "conf": conf}
+
+
 if __name__ == "__main__":
     import sys
     from core.constants import INDEX_SYMBOLS
