@@ -181,7 +181,7 @@ def _flow_signal(ser: dict) -> tuple[float, str]:
     dom_ce = _dom_action(ce_r, _CALL_VAL)
     dom_pe = _dom_action(pe_r, _PUT_VAL)
     lean = "bullish" if s > 0.05 else "bearish" if s < -0.05 else "mixed"
-    reason = (f"flow: CALL {_ACT_WORD.get(dom_ce, dom_ce)} / "
+    reason = (f"flow {s:+.2f}: CALL {_ACT_WORD.get(dom_ce, dom_ce)} / "
               f"PUT {_ACT_WORD.get(dom_pe, dom_pe)} ({lean})")
     return s, reason
 
@@ -207,6 +207,10 @@ def _divergence_signal(ser: dict) -> tuple[float, str]:
         s = 0.4;  reason = "price up, puts being written — floor following price (bullish)"
     elif dpx < 0 and ce_build > pe_build:
         s = -0.4; reason = "price down, calls being written — ceiling following (bearish)"
+    # carry the signed value AND the raw ΔOI magnitudes (per-index, distinct even in the
+    # same bucket) so the read is transparently this-index-specific, not a repeated template.
+    if reason:
+        reason = f"div {s:+.1f} — {reason}  [ΔOI ce{ce_build:+.0f}/pe{pe_build:+.0f}]"
     return s, reason
 
 
