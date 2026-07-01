@@ -270,8 +270,36 @@ def _out(regime: str, base_conf: int, action: str, f: Features, structure: str =
     if f.post3 and f.range_pos == f.range_pos and f.range_pos >= 0.66 and not f.transition:
         carry = ("POST-3PM CARRY → strong close forming; becomes the validated BTST-long "
                  "(close-strength → overnight, exit ~09:30). See btst_signal.py.")
+
+    # ── DEFENSIVE POSTURE — the honest product: SIZE + trade/no-trade, NEVER a direction.
+    # Pure function of the already-detected regime/structure/flags (adds NO new signal). It
+    # answers the question with edge ("should I trade, and how big") not the dead one ("which
+    # way" — 47% continuation, coin flip at the 3% cost wall). opt_buy = is buying premium
+    # viable right now (needs gamma > theta+cost — almost never true intraday).
+    if regime == OPENING:
+        posture, size, opt_buy = "WAIT", 0.0, "— opening range forming"
+    elif carry:
+        posture, size, opt_buy = "BTST-CARRY", 1.0, "n/a — long FUTURES o/n, not options"
+    elif f.transition:
+        posture, size, opt_buy = "STAND-ASIDE", 0.0, "NO — regime shifting, don't initiate"
+    elif regime == HIGH_VOL:
+        posture, size, opt_buy = "SIZE-DOWN", 0.5, "RARELY — IV already rich, you pay up"
+    elif structure == "range":
+        posture, size, opt_buy = "STAND-ASIDE", 0.0, "NO — chop, theta sink (worst P&L bucket)"
+    else:                                                    # NORMAL/drift
+        posture, size, opt_buy = "TRADE-BAND", 1.0, "NO — coin flip at 3% cost wall"
+    # detected-state descriptor — makes the detection VISIBLE (trend/chop/gap/break), tagged
+    if regime == OPENING:
+        state = "opening"
+    elif regime == HIGH_VOL:
+        state = (f"HIGH_VOL top-{(1 - f.day_vol_pctile) * 100:.0f}%"
+                 if f.day_vol_pctile == f.day_vol_pctile else "HIGH_VOL")
+    else:
+        state = "choppy" if structure == "range" else "trend/drift"
+
     out = {"regime": regime, "confidence": conf, "action": action, "flags": flags,
            "flag_notes": notes, "carry": carry,
+           "posture": posture, "size": size, "opt_buy": opt_buy, "state": state,
            "features": {k: (round(v, 3) if isinstance(v, float) and v == v else v)
                         for k, v in asdict(f).items()}}
     if structure:

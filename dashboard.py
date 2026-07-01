@@ -6006,6 +6006,8 @@ def _update_macro_radar(_n):
 
 # ── Intraday Regime Cockpit (3-regime + band + event flags + post-3pm BTST carry) ──
 _REG_COLOR = {"OPENING": "#64748b", "NORMAL": "#38bdf8", "HIGH_VOL": "#f59e0b"}
+_POSTURE_COLOR = {"TRADE-BAND": "#38bdf8", "SIZE-DOWN": "#f59e0b",
+                  "STAND-ASIDE": "#f87171", "BTST-CARRY": "#a78bfa", "WAIT": "#64748b"}
 _CK_HEAD = {"color": "#67e8f9", "fontSize": "0.72rem", "fontWeight": "700", **MONO}
 _CK_CHIP = {"background": "#1e293b", "color": "#fbbf24", "fontSize": "0.58rem",
             "padding": "1px 5px", "borderRadius": "4px", "marginLeft": "5px", **MONO}
@@ -6039,6 +6041,16 @@ def _render_cockpit(date):
             html.Span(r["action"][:46], style={"color": "#94a3b8", "fontSize": "0.6rem"}),
             *chips,
         ], style={"fontSize": "0.64rem", "padding": "2px 0", "whiteSpace": "nowrap", **MONO}))
+        # honest defensive POSTURE sub-line — SIZE + trade/no-trade, never a direction
+        pcol = _POSTURE_COLOR.get(r.get("posture", ""), "#94a3b8")
+        szx = f"{r['size']:.1f}x" if r.get("size") is not None else "—"
+        rows.append(html.Div([
+            html.Span(f"{'':13}→ ", style={"color": "#334155"}),
+            html.Span(f"{r.get('posture', '—'):11}", style={"color": pcol, "fontWeight": "700"}),
+            html.Span(f" size {szx:5} · ", style={"color": "#64748b"}),
+            html.Span(f"{r.get('state', '—'):14}", style={"color": "#94a3b8"}),
+            html.Span(f" · option-buy: {r.get('opt_buy', '')}", style={"color": "#64748b"}),
+        ], style={"fontSize": "0.58rem", "padding": "0 0 3px 0", "whiteSpace": "nowrap", **MONO}))
         if r.get("carry"):
             carries.append(r["label"])
     head = html.Div([

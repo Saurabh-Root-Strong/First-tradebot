@@ -110,6 +110,8 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     return {"sym": sym, "label": label, "ok": True, "spot": spot,
             "regime": r["regime"], "conf": r["confidence"], "action": r["action"],
             "structure": r.get("structure", ""), "carry": r["carry"],
+            "posture": r.get("posture", ""), "size": r.get("size"),
+            "opt_buy": r.get("opt_buy", ""), "state": r.get("state", ""),
             "flags": r.get("flags", []), "flag_notes": r.get("flag_notes", []),
             "phase": f.phase, "er": f.er, "iv_atm": ser.get("iv_atm", [None])[-1],
             "band_lo": band.get("lo"), "band_hi": band.get("hi"),
@@ -141,6 +143,10 @@ def main():
         flagstr = ("  ⚑ " + " ".join(r["flags"])) if r["flags"] else ""
         print(f"  {r['label']:11}{r['spot']:>10.1f}  {r['regime']:10}{r['conf']:>4}  {band:>20}  "
               f"{r['action'][:42]}{flagstr}")
+        # honest defensive POSTURE line — SIZE + trade/no-trade, never a direction
+        szx = f"{r['size']:.1f}x" if r.get("size") is not None else "—"
+        print(f"  {'':11}{'':>10}  → {r['posture']:11} size {szx:5} · {r['state']:14}"
+              f" · option-buy: {r['opt_buy']}")
         for note in r["flag_notes"]:
             print(f"  {'':11}{'':>10}       {'':10}   ↳ {note}")
         if r["carry"]:
