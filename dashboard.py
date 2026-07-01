@@ -6074,10 +6074,36 @@ def _render_cockpit(date):
         ], style={"fontSize": "0.58rem", "padding": "0 0 3px 0", "whiteSpace": "nowrap", **MONO}))
         if r.get("carry"):
             carries.append(r["label"])
+    _ck_help = (
+        "INTRADAY REGIME COCKPIT — a live next-60-minute risk map per index. "
+        "Not a buy/sell arrow (intraday direction loses at cost); it tells you the "
+        "STATE, the RANGE, and HOW to size.\n\n"
+        "EACH ROW:\n"
+        "  index · spot · REGIME · conf% · 60m band lo–hi · cover% · action · flags\n"
+        "  REGIME: OPENING (range still forming) / NORMAL (~79% of the day) / "
+        "HIGH_VOL (top vol days — size down).\n"
+        "  60m BAND: where price sits ~68% of the time 60 min ahead — the risk map / "
+        "where your stop lives.\n"
+        "  COVER%: MEASURED accuracy of THIS index's band. Green ✓ = trustworthy "
+        "(NIFTY ~74%). Red ⚠ ~50% = geometry only, not a promise. · = too few samples.\n\n"
+        "→ SUB-LINE (posture):\n"
+        "  TRADE-BAND  = fade the band EDGES back toward mid (only real intraday play).\n"
+        "  STAND-ASIDE = chop / regime shifting — don't initiate.\n"
+        "  SIZE-DOWN   = HIGH_VOL — half size, IV already rich.\n"
+        "  WAIT        = opening range not formed yet.\n"
+        "  BTST-CARRY  = after 15:00 on a strong close — long FUTURES overnight, "
+        "exit ~09:30 (the one validated edge).\n"
+        "  size Nx · option-buy: NO = buying CE/PE is a coin flip at the 3% cost wall.\n\n"
+        "HOW TO USE: read regime → check the band's cover% (trust it where green) → "
+        "on TRADE-BAND, fade the edge toward mid with your stop a 5-min close beyond "
+        "the far edge. Never chase mid-band. No overnight unless BTST-CARRY fires post-3pm.")
     head = html.Div([
         html.Span("🧭 INTRADAY REGIME COCKPIT   ", style=_CK_HEAD),
         html.Span("live" if live else f"replay {date}",
                   style={"color": "#22c55e" if live else "#f59e0b", "fontSize": "0.6rem", **MONO}),
+        html.Span("  ⓘ how to read", title=_ck_help,
+                  style={"color": "#475569", "fontSize": "0.58rem", "cursor": "help",
+                         "borderBottom": "1px dotted #475569", **MONO}),
     ])
     tail = []
     post3 = _dt.datetime.now(IST).time() >= _dt.time(15, 0)
