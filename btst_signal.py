@@ -105,7 +105,12 @@ def emit(date):
         print(f"    LONG {c['sym']:11} clr {c['clr']:.2f}  entry≈{c['entry_px']:.1f}  "
               f"→ exp +10–13bps  (size for a ~2% gap tail / hedge OTM put)")
         key = (led["date"].astype(str) == str(date)) & (led["sym"] == c["sym"])
-        if not key.any():
+        if key.any():
+            # re-emit same day (e.g. an earlier run) → UPDATE the OPEN entry to the latest
+            # clr/entry, so a 15:20 run corrects a premature morning run. Never touch CLOSED.
+            m = key & (led["status"] == "OPEN")
+            led.loc[m, "clr"] = c["clr"]; led.loc[m, "entry_px"] = c["entry_px"]
+        else:
             led = pd.concat([led, pd.DataFrame([{**c, "status": "OPEN"}])], ignore_index=True)
     _save_ledger(led)
     return cands

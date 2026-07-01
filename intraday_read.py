@@ -52,11 +52,18 @@ def _trailing_day_ranges(sym: str, n: int = 40) -> np.ndarray:
     return r
 
 
+_PREV_CACHE: dict = {}
+
+
 def _prev_close(sym: str, ref_date: str) -> float | None:
     """Prior captured trading day's last close (from the live mirrors — correct for live/
-    recent, vs the stale daily parquet). Used for the opening-gap flag."""
+    recent, vs the stale daily parquet). Used for the opening-gap flag. Cached: the prior
+    day's close is static, so it never needs recomputing within a session."""
     import glob, os
     from core.constants import LIVE_DIR
+    key = (sym, ref_date)
+    if key in _PREV_CACHE:
+        return _PREV_CACHE[key]
     try:
         days = sorted({os.path.basename(p)[:10]
                        for p in glob.glob(str(LIVE_DIR / "*_oi_snapshots.parquet"))
@@ -65,7 +72,9 @@ def _prev_close(sym: str, ref_date: str) -> float | None:
         if not priors:
             return None
         cl = fc.build_series(sym, 5, priors[-1], None).get("close") or []
-        return float(cl[-1]) if cl else None
+        pc = float(cl[-1]) if cl else None
+        _PREV_CACHE[key] = pc
+        return pc
     except Exception:
         return None
 

@@ -18,6 +18,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import footprint_chart   # full-session OI/Volume/ATM-premium series for the popup chart
 import hour_forecast     # next-60-min zone + directional lean (accumulating, unproven)
+try:
+    import intraday_read as _cockpit   # 3-regime + band + event flags + post-3pm BTST carry
+    _COCKPIT_OK = True
+except Exception:
+    _COCKPIT_OK = False
 from fyers_apiv3.FyersWebsocket import data_ws
 from signals import run_full_analysis, fetch_ohlcv, _vwap
 from trade_setup import build_recommendation, TF_PROFILES
@@ -1354,6 +1359,7 @@ app.layout = dbc.Container([
             inputStyle={"marginRight": "4px", "cursor": "pointer"},
             style={"marginTop": "6px", "color": "#94a3b8"}),
         html.Div(id="news-panel", style={"marginTop": "4px"}),
+        html.Div(id="cockpit-panel", style={"marginTop": "4px"}),
         html.Div(id="macro-radar-panel", style={"marginTop": "4px"}),
     ], style={"padding": "14px 16px 10px"}),
     html.Div(className="header-line"),
@@ -5977,6 +5983,77 @@ def _update_macro_radar(_n):
         return no_update
     try:
         return _render_macro_radar(_MACRO_STATE)     # reads the poller cache, never fetches
+    except Exception:
+        return no_update
+
+
+# ── Intraday Regime Cockpit (3-regime + band + event flags + post-3pm BTST carry) ──
+_REG_COLOR = {"OPENING": "#64748b", "NORMAL": "#38bdf8", "HIGH_VOL": "#f59e0b"}
+_CK_HEAD = {"color": "#67e8f9", "fontSize": "0.72rem", "fontWeight": "700", **MONO}
+_CK_CHIP = {"background": "#1e293b", "color": "#fbbf24", "fontSize": "0.58rem",
+            "padding": "1px 5px", "borderRadius": "4px", "marginLeft": "5px", **MONO}
+
+
+def _render_cockpit(date):
+    import datetime as _dt
+    today = _dt.datetime.now(IST).date().isoformat()
+    date_arg = None if (not date or date == today) else date
+    live = date_arg is None
+    rows, carries = [], []
+    for sym in INDEX_SYMBOLS:
+        try:
+            r = _cockpit.read(sym, date_arg, None)
+        except Exception:
+            continue
+        if not r.get("ok"):
+            rows.append(html.Div(f"  {LABELS.get(sym, sym):11} {r.get('note', '—')}",
+                        style={"color": "#475569", "fontSize": "0.62rem", **MONO}))
+            continue
+        col = _REG_COLOR.get(r["regime"], "#94a3b8")
+        band = (f"{r['band_lo']:.0f}–{r['band_hi']:.0f}"
+                if r.get("band_lo") and r.get("band_hi") else "—")
+        chips = [html.Span(fl, style=_CK_CHIP) for fl in r.get("flags", [])]
+        rows.append(html.Div([
+            html.Span(f"{r['label']:11}", style={"color": "#e2e8f0", "fontWeight": "700"}),
+            html.Span(f"{r['spot']:>9.1f}  ", style={"color": "#94a3b8"}),
+            html.Span(f"{r['regime']:9}", style={"color": col, "fontWeight": "700"}),
+            html.Span(f" {r['conf']:>2}%  ", style={"color": "#64748b"}),
+            html.Span(f"band {band:>16}  ", style={"color": "#38bdf8"}),
+            html.Span(r["action"][:46], style={"color": "#94a3b8", "fontSize": "0.6rem"}),
+            *chips,
+        ], style={"fontSize": "0.64rem", "padding": "2px 0", "whiteSpace": "nowrap", **MONO}))
+        if r.get("carry"):
+            carries.append(r["label"])
+    head = html.Div([
+        html.Span("🧭 INTRADAY REGIME COCKPIT   ", style=_CK_HEAD),
+        html.Span("live" if live else f"replay {date}",
+                  style={"color": "#22c55e" if live else "#f59e0b", "fontSize": "0.6rem", **MONO}),
+    ])
+    tail = []
+    post3 = _dt.datetime.now(IST).time() >= _dt.time(15, 0)
+    if carries:
+        tail.append(html.Div(f"🌙 POST-3PM BTST-LONG: {', '.join(carries)} — strong close; long "
+                             f"FUTURES, exit next ~09:30 (size for gap tail)",
+                             style={"color": "#a78bfa", "fontSize": "0.62rem", "fontWeight": "700",
+                                    "marginTop": "3px", **MONO}))
+    elif post3:
+        tail.append(html.Div("after 15:00 — no strong close → no BTST carry; flat into close",
+                             style={"color": "#64748b", "fontSize": "0.58rem", **MONO}))
+    tail.append(html.Div("no intraday directional arrow (loses at cost) — trade the band; "
+                         "BTST only on a post-3pm strong close",
+                         style={"color": "#475569", "fontSize": "0.55rem", "marginTop": "2px", **MONO}))
+    return html.Div([head, html.Div(rows, style={"marginTop": "3px"})] + tail,
+                    style={"padding": "8px 12px", "background": "#0b1220",
+                           "border": "1px solid #1e293b", "borderRadius": "6px"})
+
+
+@app.callback(Output("cockpit-panel", "children"),
+              Input("news-date", "data"), Input("setup-tick", "n_intervals"))
+def _update_cockpit(date, _n):
+    if not _COCKPIT_OK:
+        return no_update
+    try:
+        return _render_cockpit(date)
     except Exception:
         return no_update
 
