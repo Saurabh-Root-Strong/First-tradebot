@@ -3641,8 +3641,11 @@ def _scout_row(r, mem=None, today=None):
         inst = f" · {lc['entry_strike']} {side} (held since {lc['trigger']})"
     else:
         inst = (f" · {r['instrument']}" if r.get("instrument") else "")
-    if trade and r.get("expiry"):
-        inst += f" ({r['expiry']})"
+    # expiry label on EVERY strike-bearing row (holding OR trade), not just TRADE — a
+    # trader must know weekly (0-3 DTE) vs monthly + the actual date to judge theta/liquidity.
+    if inst and r.get("expiry"):
+        _exp = r["expiry"] + (f" {r['expiry_date']}" if r.get("expiry_date") else "")
+        inst += f" · {_exp} exp"
     if r.get("thin"):
         inst += "  ⚠ thin"
     _ul = {"textDecoration": "underline dotted", "cursor": "help"}
@@ -3828,7 +3831,9 @@ def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
     entry = pos.get("entry"); sl = pos.get("sl"); tgt = pos.get("tgt")
     if kind == "NEW":
         act = "CALL BUY" if side == "CE" else "PUT BUY"
-        head = f"{act} {strike or ''} {side}"
+        _ek = pos.get("expiry"); _ed = pos.get("expiry_date")
+        _exp = (f" · {_ek}{(' ' + _ed) if _ed else ''} exp" if _ek else "")
+        head = f"{act} {strike or ''} {side}{_exp}"
         body = f"{label} @ index {pos.get('spot')} · entry ₹{entry}  SL ₹{sl}  T ₹{tgt}"
         color = "#34d399" if side == "CE" else "#f87171"
     elif kind == "SL":
@@ -3954,7 +3959,8 @@ def _scout_detect(state, now, persist):
                    "strike": lc.get("entry_strike") or r.get("atm"),
                    "entry": lc.get("entry_prem"), "sl": lc.get("sl"), "tgt": lc.get("target"),
                    "bl": r.get("pred_lo"), "bh": r.get("pred_hi"), "bb": False,
-                   "trig": now.strftime("%H:%M"),
+                   "trig": now.strftime("%H:%M"), "expiry": r.get("expiry"),
+                   "expiry_date": r.get("expiry_date"),
                    "label": r["label"], "thin": bool(r.get("thin")), "spot": spot}
             _emit(sym, _scout_alert_rec(now, pos, "NEW"))
             st["open"] = pos

@@ -70,6 +70,37 @@ def _expiry_kind(sym: str) -> str:
     return "weekly" if sym == NIFTY else "monthly"
 
 
+_EXP_DATE_CACHE: dict = {}
+_DCM_SYM = {"NSE:NIFTY50-INDEX": "NIFTY", "NSE:NIFTYBANK-INDEX": "BANKNIFTY",
+            "NSE:FINNIFTY-INDEX": "FINNIFTY", "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY"}
+
+
+def _expiry_date(sym: str) -> Optional[str]:
+    """Nearest tradeable expiry DATE for the index (weekly for NIFTY, monthly for the
+    others), from the DCM fno_bhavcopy real calendar. Cached per day, best-effort — a
+    display label only, so any failure returns None (falls back to the kind alone)."""
+    import datetime as _dt
+    key = (sym, _dt.date.today())
+    if key in _EXP_DATE_CACHE:
+        return _EXP_DATE_CACHE[key]
+    out = None
+    try:
+        import duckdb, glob
+        nsym = _DCM_SYM.get(sym)
+        p = glob.glob("../Daily_Cash_Market/**/market_data.duckdb", recursive=True)
+        if nsym and p:
+            con = duckdb.connect(p[0], read_only=True)
+            r = con.execute("select min(expiry_date) from fno_bhavcopy "
+                            "where symbol=? and expiry_date >= current_date", [nsym]).fetchone()
+            con.close()
+            if r and r[0]:
+                out = r[0].strftime("%d%b")            # e.g. 03Jul
+    except Exception:
+        out = None
+    _EXP_DATE_CACHE[key] = out
+    return out
+
+
 # Premium SL / first-target as % of entry, by timeframe (from trade_setup.TF_PROFILES).
 # Wider stop + further target the longer the hold.
 _SLT = {5: (0.30, 0.50), 15: (0.32, 0.55), 60: (0.35, 0.65)}
@@ -766,7 +797,7 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         "opening": opening,
         "sym": sym, "label": label, "has_data": True,
         "tf": tf_min, "horizon": horizon_min, "spot": spot, "atm": atm,
-        "expiry": _expiry_kind(sym), "thin": sym in _THIN,
+        "expiry": _expiry_kind(sym), "expiry_date": _expiry_date(sym), "thin": sym in _THIN,
         "strength": round(strength, 3), "agree": agree, "active": active,
         "verdict": verdict, "direction": direction, "confidence": conf,
         "instrument": (f"{atm} {direction}" if direction and atm else ""),
