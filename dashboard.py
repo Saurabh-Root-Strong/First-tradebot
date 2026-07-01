@@ -1359,6 +1359,22 @@ app.layout = dbc.Container([
             inputStyle={"marginRight": "4px", "cursor": "pointer"},
             style={"marginTop": "6px", "color": "#94a3b8"}),
         html.Div(id="news-panel", style={"marginTop": "4px"}),
+        # Cockpit REPLAY control — type a past time (HH:MM) to see the band/regime AS IT
+        # STOOD at that instant on the selected date (causal, lookahead-free). Blank = live/
+        # latest tick. Persistent (outside cockpit-panel) so the typed value survives the 30s
+        # tick re-render. Combined with the ◀▶ date nav: pick the day, type the minute.
+        html.Div([
+            html.Span("cockpit replay →", style={
+                "color": "#67e8f9", "fontSize": "0.52rem", "fontWeight": "700", **MONO}),
+            dcc.Input(id="cockpit-asof", type="text", debounce=True, value="",
+                      placeholder="live · type HH:MM", style={
+                          "width": "120px", "marginLeft": "6px", "fontSize": "0.55rem",
+                          "background": "#0b1220", "color": "#e2e8f0",
+                          "border": "1px solid #334155", "borderRadius": "4px",
+                          "padding": "1px 6px", **MONO}),
+            html.Span("↵ band as it stood at that minute (past days too)", style={
+                "color": "#475569", "fontSize": "0.46rem", "marginLeft": "8px"}),
+        ], style={"display": "flex", "alignItems": "center", "marginTop": "8px"}),
         html.Div(id="cockpit-panel", style={"marginTop": "4px"}),
         html.Div(id="macro-radar-panel", style={"marginTop": "4px"}),
     ], style={"padding": "14px 16px 10px"}),
@@ -6023,15 +6039,41 @@ _CK_CHIP = {"background": "#1e293b", "color": "#fbbf24", "fontSize": "0.58rem",
             "padding": "1px 5px", "borderRadius": "4px", "marginLeft": "5px", **MONO}
 
 
-def _render_cockpit(date):
+def _parse_asof(date, asof_str):
+    """Parse an 'HH:MM' (or 'HHMM'/'HH.MM') replay time against the selected date into an
+    IST datetime. Returns None on blank/garbage → live/latest. The date is the news-date
+    (today if blank). Causal: read()/hour_forecast use only ts ≤ as_of, so this reconstructs
+    the band exactly as it stood at that minute — for today OR any past captured day."""
+    import datetime as _dt
+    if not asof_str or not str(asof_str).strip():
+        return None
+    s = str(asof_str).strip().replace(".", ":")
+    try:
+        if ":" in s:
+            hh, mm = s.split(":")[:2]
+        elif s.isdigit() and len(s) in (3, 4):      # 930 / 1230
+            hh, mm = s[:-2], s[-2:]
+        else:
+            return None
+        hh, mm = int(hh), int(mm)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            return None
+    except Exception:
+        return None
+    d = date or _dt.datetime.now(IST).date().isoformat()
+    return _dt.datetime.combine(_dt.date.fromisoformat(d), _dt.time(hh, mm), tzinfo=IST)
+
+
+def _render_cockpit(date, asof_str=""):
     import datetime as _dt
     today = _dt.datetime.now(IST).date().isoformat()
     date_arg = None if (not date or date == today) else date
-    live = date_arg is None
+    as_of = _parse_asof(date, asof_str)
+    live = date_arg is None and as_of is None
     rows, carries = [], []
     for sym in INDEX_SYMBOLS:
         try:
-            r = _cockpit.read(sym, date_arg, None)
+            r = _cockpit.read(sym, date_arg, as_of)
         except Exception:
             continue
         if not r.get("ok"):
@@ -6119,14 +6161,21 @@ def _render_cockpit(date):
         ], style={"padding": "5px 8px 7px 8px", "marginTop": "3px", "maxWidth": "660px",
                   "background": "#0b1220", "border": "1px solid #1e293b", "borderRadius": "6px"}),
     ], style={"display": "inline-block", "marginLeft": "10px", "verticalAlign": "middle"})
+    if live:
+        _tag = "live"
+    elif as_of is not None:
+        _tag = f"replay {as_of:%Y-%m-%d %H:%M} (band as it stood then)"
+    else:
+        _tag = f"replay {date}"
     head = html.Div([
         html.Span("🧭 INTRADAY REGIME COCKPIT   ", style=_CK_HEAD),
-        html.Span("live" if live else f"replay {date}",
+        html.Span(_tag,
                   style={"color": "#22c55e" if live else "#f59e0b", "fontSize": "0.6rem", **MONO}),
         help_box,
     ])
     tail = []
-    post3 = _dt.datetime.now(IST).time() >= _dt.time(15, 0)
+    _now_t = as_of.time() if as_of is not None else _dt.datetime.now(IST).time()
+    post3 = _now_t >= _dt.time(15, 0)
     if carries:
         tail.append(html.Div(f"🌙 POST-3PM BTST-LONG: {', '.join(carries)} — strong close; long "
                              f"FUTURES, exit next ~09:30 (size for gap tail)",
@@ -6144,12 +6193,13 @@ def _render_cockpit(date):
 
 
 @app.callback(Output("cockpit-panel", "children"),
-              Input("news-date", "data"), Input("setup-tick", "n_intervals"))
-def _update_cockpit(date, _n):
+              Input("news-date", "data"), Input("setup-tick", "n_intervals"),
+              Input("cockpit-asof", "value"))
+def _update_cockpit(date, _n, asof_str):
     if not _COCKPIT_OK:
         return no_update
     try:
-        return _render_cockpit(date)
+        return _render_cockpit(date, asof_str)
     except Exception:
         return no_update
 
