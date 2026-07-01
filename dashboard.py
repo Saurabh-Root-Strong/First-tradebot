@@ -3839,6 +3839,12 @@ def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
         head = f"🎯 TARGET HIT · {label}"
         body = f"{strike or ''} {side} booked target ₹{tgt} (entry ₹{entry}, now ₹{cur})"
         color = "#22c55e"
+    elif kind == "FLIP":
+        newdir = "CE" if side == "PE" else "PE"
+        head = f"↺ REVERSED OUT · {label}"
+        body = (f"{strike or ''} {side} exited ₹{cur} (entry ₹{entry}) — arrow flipped to "
+                f"{newdir}; ⚠ whipsaw, NOT a new position on top (decision-support only)")
+        color = "#f59e0b"
     else:                                                 # BAND
         head = f"📊 RANGE BREAK {band_dir} · {label}"
         body = (f"index {spot} broke the 15m band [{pos.get('bl')}, {pos.get('bh')}]"
@@ -3917,6 +3923,11 @@ def _scout_detect(state, now, persist):
                 _emit(sym, _scout_alert_rec(now, pos, "TARGET", cur=round(cur, 2)))
                 closed, outcome = True, "TARGET"
             elif v.startswith("TRADE") and r.get("direction") != pos["dir"]:
+                # arrow reversed — EMIT the flip so the log records the prior side exiting
+                # (was silently overwritten → looked like two contradictory opens). One
+                # coherent stance per index: PE reversed out THEN CE opens, not both held.
+                _emit(sym, _scout_alert_rec(now, pos, "FLIP",
+                                            cur=round(cur, 2) if cur is not None else None))
                 closed, outcome = True, "FLIP"           # flipped to the other side
             if not closed:
                 if (not pos.get("bb")) and spot and pos.get("bl") and pos.get("bh") \
@@ -3983,7 +3994,7 @@ def _rehydrate_scout_state(state, today):
                     "thin": bool(r.get("thin")), "spot": _v(r.get("spot"))}
             elif kind == "BAND" and st.get("open"):
                 st["open"]["bb"] = True                   # band already broken → don't re-fire
-            elif kind in ("SL", "TARGET") and st.get("open"):
+            elif kind in ("SL", "TARGET", "FLIP") and st.get("open"):
                 st["open"] = None                        # episode closed → free the slot
         if st.get("open"):
             state[str(sym)] = st
@@ -4137,7 +4148,7 @@ def _alert_badge(_n, alerts):
 
 
 _ALERT_KIND_COLOR = {"SL": "#ef4444", "TARGET": "#22c55e",
-                     "BAND": "#60a5fa", "NEW": "#34d399"}
+                     "BAND": "#60a5fa", "NEW": "#34d399", "FLIP": "#f59e0b"}
 
 
 def _alerts_from_mirror(date):
@@ -4255,7 +4266,7 @@ def _render_alerts(_tick, alerts, sel, date, hour):
         tally[a.get("kind", "")] = tally.get(a.get("kind", ""), 0) + 1
     chips = []
     for kind, glyph in (("NEW", "▶ opened"), ("TARGET", "🎯 target"),
-                        ("SL", "🛑 stop"), ("BAND", "📊 band")):
+                        ("SL", "🛑 stop"), ("FLIP", "↺ flipped"), ("BAND", "📊 band")):
         n = tally.get(kind, 0)
         chips.append(html.Span(
             f"{glyph}: {n}",
