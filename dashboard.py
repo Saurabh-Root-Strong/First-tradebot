@@ -6101,7 +6101,19 @@ def _render_cockpit(date):
         "HOW TO USE: check the mood → look at trust% (only lean on green bands) → if it "
         "says TRADE-BAND, wait for the edge and fade back to the middle, stop just "
         "beyond the far edge. Never chase the middle. No overnight unless it says "
-        "BTST-CARRY after 3 PM.")
+        "BTST-CARRY after 3 PM.\n\n"
+        "EXAMPLE — reading one row:\n"
+        "  NIFTY 50  23975  NORMAL 55%  60m band 23916–24024  74%✓  TRADE-BAND\n"
+        "  Read it as: NIFTY is at 23975. Mood is NORMAL (calm). Over the next hour it "
+        "should stay between 23916 and 24024. That band has been right 74% of the time "
+        "(green = trust it). What to do: TRADE-BAND — so WAIT.\n"
+        "  • If price drops near 23916 (bottom edge) -> buy, target the middle (~23970), "
+        "stop if it closes below ~23916.\n"
+        "  • If price rises near 24024 (top edge) -> sell, target the middle, stop if it "
+        "closes above ~24024.\n"
+        "  • If price is in the middle (~23970) -> do NOTHING, no edge there.\n"
+        "  Counter-example: if the same row showed 50%⚠ (red) or said STAND-ASIDE, you "
+        "would NOT trade the band at all.")
     head = html.Div([
         html.Span("🧭 INTRADAY REGIME COCKPIT   ", style=_CK_HEAD),
         html.Span("live" if live else f"replay {date}",
