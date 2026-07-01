@@ -39,16 +39,21 @@ FY = {"NSE:NIFTY50-INDEX": "NIFTY50", "NSE:NIFTYBANK-INDEX": "NIFTYBANK",
 _RANGE_CACHE: dict = {}
 
 
-def _trailing_day_ranges(sym: str, n: int = 40) -> np.ndarray:
-    """Trailing full-day range% distribution (the cross-day vol reference for HIGH_VOL)."""
-    if sym in _RANGE_CACHE:
-        return _RANGE_CACHE[sym]
+def _trailing_day_ranges(sym: str, ref_date: str, n: int = 40) -> np.ndarray:
+    """Trailing full-day range% distribution (the cross-day vol reference for HIGH_VOL).
+    CAUSAL: uses only days STRICTLY BEFORE ref_date. Without the ref filter a replay of a
+    past day would pull in later days' ranges = lookahead (live is unaffected — today is the
+    last row, but replay/backtest via this path leaked)."""
+    key = (sym, ref_date)
+    if key in _RANGE_CACHE:
+        return _RANGE_CACHE[key]
     try:
         d = pd.read_parquet(f"data/historical/daily/NSE_{FY[sym]}_INDEX_daily.parquet")
+        d = d[pd.to_datetime(d["ts"]).dt.date.astype(str) < ref_date]      # past days only
         r = ((d["high"] - d["low"]) / d["open"] * 100).dropna().to_numpy()[-n:]
     except Exception:
         r = np.array([])
-    _RANGE_CACHE[sym] = r
+    _RANGE_CACHE[key] = r
     return r
 
 
@@ -89,11 +94,11 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     if len(df) < 3:
         return {"sym": sym, "label": label, "ok": False, "note": "warming up"}
     spot = ser.get("spot", [None])[-1] or float(df["close"].iloc[-1])
-    # cross-day vol percentile: today's range-so-far vs trailing full-day ranges
-    trail = _trailing_day_ranges(sym)
+    ref = date or (as_of.date().isoformat() if as_of else dt.datetime.now(IST).date().isoformat())
+    # cross-day vol percentile: today's range-so-far vs trailing full-day ranges (PAST only)
+    trail = _trailing_day_ranges(sym, ref)
     day_rng = (df["high"].max() - df["low"].min()) / df["open"].iloc[0] * 100
     dvp = float((trail <= day_rng).mean()) if len(trail) >= 10 else float("nan")
-    ref = date or (as_of.date().isoformat() if as_of else dt.datetime.now(IST).date().isoformat())
     prev_c = _prev_close(sym, ref)
 
     f = FE.compute(df, day_vol_pctile=dvp, prev_close=prev_c)
