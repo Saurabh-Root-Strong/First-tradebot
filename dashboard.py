@@ -1276,7 +1276,11 @@ def _captured_days() -> list:
                 have.add(p.name[:10])
     except Exception:
         pass
-    return sorted(have, reverse=True) or [today_iso()]
+    # ALWAYS include the actual calendar today so the LIVE default is today from the first
+    # load — even before this morning's capture has flushed a mirror (the >800B gate would
+    # otherwise freeze the default to the last captured day, showing yesterday all session).
+    have.add(today_iso())
+    return sorted(have, reverse=True)
 
 
 _DEFAULT_DAY = _captured_days()[0]
