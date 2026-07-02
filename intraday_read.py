@@ -108,8 +108,8 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     # in a strong trend where the endpoint persists past the vol estimate (measured).
     mood = rc.classify_from_bars(ser, n=10)
     rw = rc.band_width_mult(mood)
-    tw = hf.tod_width_mult(as_of)          # time-of-day: widen into the close (under-covers)
     hz, H_eff = hf.horizon_band_factor(60, as_of)   # clip 60m → rest-of-session near close
+    tw = hf.tod_width_mult(as_of, H_eff)   # close-hour widen — gated OFF on short clipped windows
     try:
         band = hf.forecast(sym, as_of=as_of, date=date) or {}
         # L4 per-index × regime width × time-of-day width × horizon clip, one rescale.

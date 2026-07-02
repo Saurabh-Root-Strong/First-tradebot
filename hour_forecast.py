@@ -202,11 +202,20 @@ _TOD_CLOSE_START = datetime.time(14, 0)
 _TOD_CLOSE_MULT = 1.15
 
 
-def tod_width_mult(as_of: Optional[datetime.datetime] = None) -> float:
-    """Time-of-day band-width multiplier: 1.15 for predictions from 14:00 IST (the close
-    hour under-covers), 1.0 otherwise. as_of=None → live now (IST)."""
+_TOD_MIN_HORIZON = 40      # tod only applies to a still-~full 60m window ending at the close
+
+
+def tod_width_mult(as_of: Optional[datetime.datetime] = None,
+                   horizon_eff: int = 60) -> float:
+    """Time-of-day band-width multiplier: 1.15 for predictions from 14:00 IST, 1.0 otherwise.
+    GATED on the effective horizon — the ×1.15 was calibrated on the ~60m window that ends at
+    the close (which UNDER-covers); a SHORT clipped window (session_horizon near close) already
+    OVER-covers (tiny end-of-day moves pin/mean-revert), so tod must NOT fire there or it stacks
+    to 77-86% (backtest_band_closeclip). as_of=None → live now (IST)."""
     t = (as_of.astimezone(IST) if as_of is not None else datetime.datetime.now(IST)).time()
-    return _TOD_CLOSE_MULT if t >= _TOD_CLOSE_START else 1.0
+    if t >= _TOD_CLOSE_START and horizon_eff >= _TOD_MIN_HORIZON:
+        return _TOD_CLOSE_MULT
+    return 1.0
 
 
 # ── LEARNED band multiplier — the L4 calibration loop's live output ───────────────
