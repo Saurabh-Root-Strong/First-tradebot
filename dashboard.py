@@ -1641,8 +1641,12 @@ app.layout = dbc.Container([
                 # says which index has the cleanest crossover/divergence/flow setup
                 # right now (or under the Replay cutoff). Decision-support — direction
                 # is null/contrarian in backtests, the range band is the honest part.
+                # delay_show: the scout re-renders on the 30s setup-tick; without a delay the
+                # spinner flashed over the panel every cycle (and the lifecycle walk-back makes
+                # the callback slow), blanking what you're reading and breaking focus. Keep the
+                # OLD content visible and only show the spinner if a load genuinely hangs (>8s).
                 dcc.Loading(html.Div(id="charts-scout", style={"marginBottom": "10px"}),
-                            type="circle", color="#34d399"),
+                            type="circle", color="#34d399", delay_show=12000),
                 # Mode-aware help in a POPUP — opens over the chart, closes via the X /
                 # click-outside, so it never covers or pushes the chart down.
                 dbc.Button("ℹ what is this · how to read", id="charts-help-btn",
@@ -1669,7 +1673,7 @@ app.layout = dbc.Container([
                                                    "toggleSpikelines"],
                         "edits": {"shapePosition": True},
                     }),
-                    type="circle", color="#a78bfa"),
+                    type="circle", color="#a78bfa", delay_show=800),
                 # Descriptive positioning map (Options mode only): where today's
                 # live OI is REINFORCING vs ABANDONING last night's EOD positions,
                 # per strike, anchored to the DCM EOD baseline. CONTEXT, not a call
