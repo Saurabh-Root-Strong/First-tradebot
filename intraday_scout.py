@@ -798,13 +798,16 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
 
     # ── forward prediction over the selected horizon + replay verify ─────────────
     fwd = _forward(direction, spot, fcst.get("exp_move_pct"), horizon_min)
-    # L4 learned calibration: widen/tighten the band by the self-tuned per-cell multiplier
+    # L4 learned per-cell multiplier × regime-conditional width (widen in a strong trend
+    # where the endpoint persists past the vol estimate — measured, backtest_band_regime).
     _bm = hf.band_multiplier(sym, horizon_min)
-    if _bm != 1.0 and spot and fwd.get("pred_lo") is not None:
-        half = (fwd["pred_hi"] - fwd["pred_lo"]) / 2.0 * _bm
+    _rw = rc.band_width_mult(mood)
+    _wf = _bm * _rw
+    if _wf != 1.0 and spot and fwd.get("pred_lo") is not None:
+        half = (fwd["pred_hi"] - fwd["pred_lo"]) / 2.0 * _wf
         fwd["pred_lo"], fwd["pred_hi"] = round(spot - half, 1), round(spot + half, 1)
         if fwd.get("move_pct") is not None:
-            fwd["move_pct"] = round(fwd["move_pct"] * _bm, 3)
+            fwd["move_pct"] = round(fwd["move_pct"] * _wf, 3)
         if fwd.get("target") is not None:
             fwd["target"] = (round(spot + half, 1) if fwd["pdir"] == "UP"
                              else round(spot - half, 1) if fwd["pdir"] == "DOWN" else None)

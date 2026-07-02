@@ -32,6 +32,7 @@ import pandas as pd
 import footprint_chart as fc
 import feature_engine as FE
 import hour_forecast as hf
+import regime_classifier as rc
 from core.constants import INDEX_SYMBOLS, LABELS, IST
 
 FY = {"NSE:NIFTY50-INDEX": "NIFTY50", "NSE:NIFTYBANK-INDEX": "NIFTYBANK",
@@ -103,14 +104,22 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
 
     f = FE.compute(df, day_vol_pctile=dvp, prev_close=prev_c)
     r = FE.classify(f)
+    # trend regime (Kaufman ER, causal, forming bar dropped) — used to widen the band
+    # in a strong trend where the endpoint persists past the vol estimate (measured).
+    mood = rc.classify_from_bars(ser, n=10)
+    rw = rc.band_width_mult(mood)
     try:
         band = hf.forecast(sym, as_of=as_of, date=date) or {}
-        # L4 learned calibration: self-tuned per-index 60m band multiplier
+        # L4 learned per-index multiplier × regime-conditional width factor, one rescale.
         bm = hf.band_multiplier(sym, 60)
-        if bm != 1.0 and band.get("lo") is not None and band.get("hi") is not None:
+        wf = bm * rw
+        if wf != 1.0 and band.get("lo") is not None and band.get("hi") is not None:
             mid = (band["lo"] + band["hi"]) / 2.0
-            half = (band["hi"] - band["lo"]) / 2.0 * bm
+            half = (band["hi"] - band["lo"]) / 2.0 * wf
             band["lo"], band["hi"] = round(mid - half, 1), round(mid + half, 1)
+            # keep the displayed ±% in lock-step with the (now rescaled) band
+            if mid:
+                band["exp_move_pct"] = round(half / mid * 100.0, 3)
     except Exception:
         band = {}
     # measured per-index coverage of THIS 60m band (honest accuracy tag, not a flat ~70%)
@@ -128,6 +137,7 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
             "band_lo": band.get("lo"), "band_hi": band.get("hi"),
             "band_pct": band.get("exp_move_pct"),
             "band_horizon": 60,
+            "trend_regime": mood.short, "band_regime_mult": round(rw, 2),
             "band_cover": bcov.get("cover"), "band_n": bcov.get("n", 0),
             "band_conf": bcov.get("conf", "none")}
 

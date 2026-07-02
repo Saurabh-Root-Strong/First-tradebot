@@ -156,6 +156,28 @@ def classify_from_bars(ser: dict, n: int = ER_WINDOW, er_hi: float = ER_HI,
     return classify_at(df, None, n, er_hi, er_lo, drift_big)
 
 
+# ── Regime-conditional BAND WIDTH ────────────────────────────────────────────────
+# The 60m RANGE band is realised-vol × horizon-scaling, direction-free. Measured on the
+# full 2yr 5-min history (backtest_band_regime.py, ER10), the flat _RANGE_M=0.73 band's
+# ENDPOINT coverage is NOT regime-invariant: BIG_TREND 64.5% (n=5873, under-covers — moves
+# PERSIST, endpoint overshoots the vol estimate), SMALL_TREND 69.6% (n=10145), CHOP 68.2%
+# (n=22602, already on target — the base is effectively CHOP-calibrated). Robust across all
+# four indices. These factors relevel EACH regime to ~68% while holding the pooled 68%.
+# CHOP = 1.0 anchor. Applied on TOP of the base band and the L4 learned multiplier.
+_REGIME_WIDTH = {
+    BIG_UP: 1.08, BIG_DOWN: 1.08,
+    SMALL_UP: 0.96, SMALL_DOWN: 0.96,
+    CHOP: 1.00,
+}
+
+
+def band_width_mult(mood) -> float:
+    """Regime-conditional band-width multiplier. Accepts a Mood or a mood label.
+    1.0 when unknown/chop so the band only ever WIDENS in a confirmed strong trend."""
+    label = mood.mood if isinstance(mood, Mood) else mood
+    return _REGIME_WIDTH.get(label, 1.0)
+
+
 def veto(mood: Mood, direction: str) -> tuple[bool, str]:
     """Veto the arrow when the mood is CONSOLIDATION (the both-side SL-hunt chop the
     day-trend read lets through as NEUTRAL). Trend moods never veto here — counter-trend

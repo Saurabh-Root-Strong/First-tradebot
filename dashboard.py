@@ -6084,6 +6084,15 @@ def _render_cockpit(date, asof_str=""):
         band = (f"{r['band_lo']:.0f}–{r['band_hi']:.0f}"
                 if r.get("band_lo") and r.get("band_hi") else "—")
         chips = [html.Span(fl, style=_CK_CHIP) for fl in r.get("flags", [])]
+        # trend-regime badge: WHY the band width was adjusted (widen in a strong trend)
+        _trm = r.get("band_regime_mult", 1.0)
+        trend_span = html.Span(
+            f" [{r.get('trend_regime', '')}" + (f" ×{_trm:g}]" if _trm != 1.0 else "]"),
+            style={"color": "#f59e0b" if _trm > 1.0 else "#22d3ee" if _trm < 1.0 else "#475569",
+                   "fontSize": "0.52rem"},
+            title="trend regime (Kaufman efficiency, causal). The 60m band WIDENS ×1.08 in a "
+                  "strong trend — the endpoint persists past the vol estimate (measured on 2yr "
+                  "history) — tightens ×0.96 in mild drift, and uses the base width in CHOP.")
         # measured 60m coverage tag: how often price actually lands in THIS index's band
         cov, cconf = r.get("band_cover"), r.get("band_conf", "none")
         _cc = {"ok": "#22c55e", "soft": "#eab308", "low": "#ef4444", "thin": "#64748b"}
@@ -6100,6 +6109,7 @@ def _render_cockpit(date, asof_str=""):
             html.Span(f" {r['conf']:>2}%  ", style={"color": "#64748b"}),
             html.Span("60m band ", style={"color": "#475569", "fontSize": "0.55rem"}),
             html.Span(f"{band:>16}", style={"color": "#38bdf8"}),
+            trend_span,
             cov_span,
             html.Span("  " + r["action"][:44], style={"color": "#94a3b8", "fontSize": "0.6rem"}),
             *chips,
