@@ -659,6 +659,9 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     lookback scan to avoid recursion. verdict_only=True returns just the gate
     verdict/strength/spot (skips hour_forecast + verify + forward) — the cheap probe
     the lifecycle walk-back/refine uses, ~3-5x faster per call."""
+    # Cap the evaluation at the session close FIRST — the tick feed emits after 15:30, which
+    # would otherwise produce phantom post-close triggers ("held since 15:51").
+    as_of = hf.eval_asof(as_of, date)
     horizon_min = int(horizon_min or tf_min)
     # Clip to the remaining session near the close: "next 60m" at 15:18 would project past
     # 15:30 into the overnight gap — not an intraday read. The band/verify/label then honestly

@@ -87,6 +87,9 @@ def _prev_close(sym: str, ref_date: str) -> float | None:
 
 def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     label = LABELS.get(sym, sym)
+    # cap at the session close — the tick feed emits after 15:30, which would otherwise show a
+    # phantom post-close spot/band (freeze the 15:30 snapshot post-market).
+    as_of = hf.eval_asof(as_of, date)
     ser = fc.build_series(sym, 5, date, as_of)
     if not ser.get("has_data"):
         return {"sym": sym, "label": label, "ok": False, "note": ser.get("note", "warming up")}

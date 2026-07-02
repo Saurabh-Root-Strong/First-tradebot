@@ -67,6 +67,28 @@ def session_horizon(horizon_min: int, as_of: Optional[datetime.datetime] = None)
     return int(max(5, min(horizon_min, to_close)))
 
 
+def eval_asof(as_of: Optional[datetime.datetime] = None,
+              date: Optional[str] = None) -> Optional[datetime.datetime]:
+    """Resolve the evaluation instant, CAPPED at the session close (15:30 IST). The index tick
+    feed keeps emitting after 15:30 (settlement/after-hours); without this cap the live engine
+    reads post-close ticks and shows PHANTOM post-close triggers/bands ('held since 15:51').
+    No valid intraday state exists after the close.
+      • explicit as_of past 15:30      → that day's 15:30
+      • live (None), session ENDED     → that session's 15:30 (freeze the close snapshot)
+      • live (None), today intraday     → None (unchanged, cache-friendly)"""
+    if as_of is not None:
+        a = as_of.astimezone(IST)
+        close = datetime.datetime.combine(a.date(), _SESSION_CLOSE_T, tzinfo=IST)
+        return close if a > close else as_of
+    now = datetime.datetime.now(IST)
+    ref = date or now.date().isoformat()
+    close = datetime.datetime.combine(datetime.date.fromisoformat(ref), _SESSION_CLOSE_T,
+                                      tzinfo=IST)
+    if ref < now.date().isoformat() or now > close:
+        return close
+    return None
+
+
 def horizon_band_factor(horizon_min: int, as_of: Optional[datetime.datetime] = None):
     """(H_eff/60)^_BAND_HURST scaling factor AND the effective horizon — for clipping the
     fixed-60m base band to the remaining session near the close. Returns (factor, H_eff)."""
