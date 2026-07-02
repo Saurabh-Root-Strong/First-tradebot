@@ -628,13 +628,13 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
 
 
 # Horizon-scaling exponent for the band. Pure sqrt (0.5 = random walk) UNDER-covers at
-# short horizons because intraday index moves MEAN-REVERT (realised dispersion at short H is
-# relatively larger than sqrt-from-1min-vol predicts). Coverage backtest (backtest_band_horizon
-# .py, 3 captured days) implied Hurst ~0.37 from the 15m/60m coverage pair; use 0.40 (mild,
-# in the documented 0.35-0.45 intraday range). (H/60)^0.40 = 1 at H=60 so the 60m calibration
-# (_RANGE_M in hour_forecast) is PRESERVED — only the shorter horizons widen. Do NOT re-level
-# from a 3-day adverse sample; that stays a ledger job.
-_BAND_HURST = 0.40
+# short horizons because intraday index moves MEAN-REVERT. A 3-day sample first implied
+# Hurst ~0.37; the 2yr multi-horizon audit (backtest_band_horizon_hist.py, ~150k samples
+# 30/60/120/240m) OVERTURNED that for ENDPOINT coverage: the 68%-multiplier RISES with
+# horizon (0.68/0.73/0.78/0.82), i.e. the band grows too SLOWLY at 0.40 → true endpoint
+# exponent ≈0.48 (near random-walk). (H/60)^0.48 = 1 at H=60 so the 60m base (_RANGE_M
+# in hour_forecast) is PRESERVED; longer horizons widen to hold ~68%.
+_BAND_HURST = 0.48
 
 
 def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:

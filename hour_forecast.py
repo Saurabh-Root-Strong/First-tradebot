@@ -37,10 +37,14 @@ _WTOT = sum(_W.values())
 _SIG_FLOOR = 0.02          # min 1-min sigma %
 _P_K = 2.5                 # logistic steepness mapping composite -> p(up)
 # Range multiplier: 1-min realised vol scaled by sqrt(60) OVER-states the 60-min
-# move (microstructure bounce), so a raw 1-sigma band over-covers (~93%). 0.47 was
-# the empirical 68%-coverage multiplier on the first 116-row ledger; recalibrate as
-# the ledger grows (backtest_hour_forecast.py prints close-in-band).
-_RANGE_M = 0.47
+# move (microstructure bounce), so a raw 1-sigma band over-covers. 0.47 was the
+# empirical 68%-coverage multiplier on the FIRST 116-row ledger — but the 2yr
+# multi-horizon audit (backtest_band_horizon_hist.py, ~38k 60m samples across 495
+# sessions×4 idx, CROSS-checked on 15 live-tick days) OVERTURNED it: at 0.47 the
+# real 60m endpoint coverage is only ~50% (a coin flip), not 68%. The 68th-pctile of
+# |move|/base-σ clusters 0.72-0.74 for all four indices, so 0.73 is the honest ±1σ
+# multiplier. The L4 loop (calibration_engine) fine-tunes per-index AROUND this base.
+_RANGE_M = 0.73
 
 
 def _sigma1_pct(ticks: pd.DataFrame, upto) -> float | None:
