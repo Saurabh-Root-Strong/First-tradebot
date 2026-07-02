@@ -130,8 +130,9 @@ def run(H: int, er_n: int) -> None:
     def pct(x):
         return f"{100*np.mean(x):5.1f}%" if x else "  n/a"
 
-    # candidate regime width factor (multiplies the base band); CHOP=1.0 anchor
-    CAND = {"BIG_TREND": 1.08, "SMALL_TREND": 0.96, "CHOP": 1.00}
+    # deployed regime width factor (multiplies the base band); only BIG_TREND widens
+    # (robust across ER window + horizons + indices, safe direction). SMALL/CHOP = anchor.
+    CAND = {"BIG_TREND": 1.08, "SMALL_TREND": 1.00, "CHOP": 1.00}
 
     # ── pooled per-regime ────────────────────────────────────────────────────
     print(f"\n  POOLED (all 4 indices)   current _RANGE_M = {hf._RANGE_M}")

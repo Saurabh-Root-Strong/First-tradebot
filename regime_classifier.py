@@ -157,23 +157,30 @@ def classify_from_bars(ser: dict, n: int = ER_WINDOW, er_hi: float = ER_HI,
 
 
 # ── Regime-conditional BAND WIDTH ────────────────────────────────────────────────
-# The 60m RANGE band is realised-vol × horizon-scaling, direction-free. Measured on the
-# full 2yr 5-min history (backtest_band_regime.py, ER10), the flat _RANGE_M=0.73 band's
-# ENDPOINT coverage is NOT regime-invariant: BIG_TREND 64.5% (n=5873, under-covers — moves
-# PERSIST, endpoint overshoots the vol estimate), SMALL_TREND 69.6% (n=10145), CHOP 68.2%
-# (n=22602, already on target — the base is effectively CHOP-calibrated). Robust across all
-# four indices. These factors relevel EACH regime to ~68% while holding the pooled 68%.
-# CHOP = 1.0 anchor. Applied on TOP of the base band and the L4 learned multiplier.
+# The 60m RANGE band is realised-vol × horizon-scaling, direction-free — it captures the
+# DIFFUSION of the move but NOT a persistent DRIFT. In a strong trend the endpoint = spot +
+# drift ± diffusion, so a symmetric vol band UNDER-covers. Measured on the full 2yr 5-min
+# history (backtest_band_regime.py, causal): the flat _RANGE_M=0.73 band's ENDPOINT coverage
+# is BIG_TREND ~65% (under-covers), SMALL_TREND ~68-70%, CHOP ~68% (on target). The
+# BIG_TREND miss is ROBUST — it holds at ER window n=10 AND n=14 (needs 0.78-0.79 either
+# way), across all four indices, and the relative widening is ~1.08 stable across 30/60/120m
+# horizons (intraday trend persistence decays, so it does NOT blow up with horizon). So only
+# BIG_TREND is corrected, and only by WIDENING (the safe direction for a risk map).
+#
+# The SMALL_TREND tighten was DROPPED after audit: it was window-sensitive (0.70 at n=10 but
+# 0.73 at n=14) and tightening errs DANGEROUS (band narrower than claimed → understates
+# risk). A marginal, fragile correction in the unsafe direction fails the bar. CHOP = anchor.
 _REGIME_WIDTH = {
     BIG_UP: 1.08, BIG_DOWN: 1.08,
-    SMALL_UP: 0.96, SMALL_DOWN: 0.96,
+    SMALL_UP: 1.00, SMALL_DOWN: 1.00,
     CHOP: 1.00,
 }
 
 
 def band_width_mult(mood) -> float:
-    """Regime-conditional band-width multiplier. Accepts a Mood or a mood label.
-    1.0 when unknown/chop so the band only ever WIDENS in a confirmed strong trend."""
+    """Regime-conditional band-width multiplier. Accepts a Mood or a mood label. The band
+    only ever WIDENS (in a confirmed BIG trend); never tightens below base (safe for a risk
+    map). 1.0 for every other mood / unknown."""
     label = mood.mood if isinstance(mood, Mood) else mood
     return _REGIME_WIDTH.get(label, 1.0)
 

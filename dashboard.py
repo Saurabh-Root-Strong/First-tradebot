@@ -6091,8 +6091,8 @@ def _render_cockpit(date, asof_str=""):
             style={"color": "#f59e0b" if _trm > 1.0 else "#22d3ee" if _trm < 1.0 else "#475569",
                    "fontSize": "0.52rem"},
             title="trend regime (Kaufman efficiency, causal). The 60m band WIDENS ×1.08 in a "
-                  "strong trend — the endpoint persists past the vol estimate (measured on 2yr "
-                  "history) — tightens ×0.96 in mild drift, and uses the base width in CHOP.")
+                  "strong (BIG) trend — a symmetric vol band misses the trend's drift so it "
+                  "under-covers there (measured on 2yr history, robust). Base width otherwise.")
         # measured 60m coverage tag: how often price actually lands in THIS index's band
         cov, cconf = r.get("band_cover"), r.get("band_conf", "none")
         _cc = {"ok": "#22c55e", "soft": "#eab308", "low": "#ef4444", "thin": "#64748b"}
