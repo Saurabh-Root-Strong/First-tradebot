@@ -3548,6 +3548,42 @@ def _scout_playbook(r):
         body.append(line("Range cone still warming up (needs ~12 one-minute bars). "
                          "No trade until the band prints.", "#94a3b8"))
 
+    # ── reading the live grade line (the "↪ live now · next 60m ..." strip row) ──
+    plo, phi = r.get("pred_lo"), r.get("pred_hi")
+    if plo is not None:
+        hz = r.get("horizon", 60)
+        pdir = r.get("pred_dir"); ptgt = r.get("pred_target")
+        cov = r.get("band_cover"); bn = r.get("band_n", 0)
+        v = r.get("verify") or {}
+        body.append(hdr("📈 READING THE '↪ live now' LINE"))
+        body.append(line(
+            f"That grading row under the headline decodes token by token:\n"
+            f"   • next {hz}m: {pdir or 'RANGE'}"
+            + (f" → {ptgt}" if ptgt else "")
+            + "  — the arrow's LEAN (+ target). CONTEXT ONLY, neg-EV — don't trade it.\n"
+            f"   • band[{plo}, {phi}]  — the VALIDATED product: where price should sit "
+            f"over the next {hz}m (~1σ cone, center ~{center}).\n"
+            + (f"   • cover {cov*100:.0f}%  — MEASURED share of past days this exact "
+               f"cell's band held (n{bn} samples). ✓ = healthy (~68%+), ~ = soft.\n"
+               if cov is not None else "")
+            + f"   • ⇒ actual (move%)  — what price ACTUALLY did once the {hz}m elapsed "
+            "(the answer key; fills in after the fact, never feeds the call).\n"
+            "   • HIT / MISS  = did the ARROW's direction land — IGNORE, it's a coin flip.\n"
+            "   • band ✓ / ✗  = did price finish INSIDE the band. THIS is the score that "
+            "matters — the band is the whole product."))
+        if v.get("actual") is not None:
+            bh = v.get("band_hit"); dh = v.get("dir_hit")
+            body.append(line(
+                f"THIS row, graded: price ended {v['actual']} ({v.get('move_pct', 0):+.2f}%) — "
+                f"band {'HIT ✓ — stayed inside the cone' if bh else 'MISS ✗ — broke out'}; "
+                f"arrow {'hit' if dh else 'missed'} (noise either way). "
+                f"Read the band mark, not the arrow.", "#94a3b8"))
+        else:
+            body.append(line(
+                f"THIS row is still LIVE — the {hz}m has not elapsed, so 'actual' and the "
+                f"band ✓/✗ show PENDING; they self-grade once the hour completes.",
+                "#94a3b8"))
+
     # ── 1. the trade I'd actually take ───────────────────────────────────────────
     if lo is not None:
         body.append(hdr("② THE TRADE (range-based — the honest edge)"))
