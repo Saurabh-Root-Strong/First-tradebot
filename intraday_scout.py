@@ -810,7 +810,8 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     # where the endpoint persists past the vol estimate — measured, backtest_band_regime).
     _bm = hf.band_multiplier(sym, horizon_min)
     _rw = rc.band_width_mult(mood)
-    _wf = _bm * _rw
+    _tw = hf.tod_width_mult(as_of)          # time-of-day: widen into the close (under-covers)
+    _wf = _bm * _rw * _tw
     if _wf != 1.0 and spot and fwd.get("pred_lo") is not None:
         half = (fwd["pred_hi"] - fwd["pred_lo"]) / 2.0 * _wf
         fwd["pred_lo"], fwd["pred_hi"] = round(spot - half, 1), round(spot + half, 1)

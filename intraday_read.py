@@ -108,11 +108,12 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     # in a strong trend where the endpoint persists past the vol estimate (measured).
     mood = rc.classify_from_bars(ser, n=10)
     rw = rc.band_width_mult(mood)
+    tw = hf.tod_width_mult(as_of)          # time-of-day: widen into the close (under-covers)
     try:
         band = hf.forecast(sym, as_of=as_of, date=date) or {}
-        # L4 learned per-index multiplier × regime-conditional width factor, one rescale.
+        # L4 learned per-index multiplier × regime width × time-of-day width, one rescale.
         bm = hf.band_multiplier(sym, 60)
-        wf = bm * rw
+        wf = bm * rw * tw
         if wf != 1.0 and band.get("lo") is not None and band.get("hi") is not None:
             mid = (band["lo"] + band["hi"]) / 2.0
             half = (band["hi"] - band["lo"]) / 2.0 * wf

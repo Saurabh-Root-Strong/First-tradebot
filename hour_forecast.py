@@ -161,6 +161,27 @@ def band_coverage(sym: str, horizon_min: int) -> dict:
     return {"cover": cover, "n": n, "conf": conf}
 
 
+# ── TIME-OF-DAY band width — the intraday-vol U-shape correction ──────────────────
+# The vol estimate is session-CUMULATIVE, so it lags the last-hour vol pickup (position
+# squaring + close auction). Measured on 2yr 5-min history (backtest_band_scenarios.py):
+# 60m endpoint coverage is on-target at the open (67%) and pm (67%), mildly OVER midday
+# (71%), but UNDER-covers into the CLOSE — predictions from 14:00 on cover only ~61%
+# (55-63% across all four indices, robust). The miss is present even in CHOP (62%), so it
+# is a SEPARATE effect from the regime factor and composes with it. Fix = WIDEN the close
+# band ×1.15 (not_big needs 0.73→~0.84; safe direction — under-coverage is the dangerous
+# one for a risk map). Midday over-cover is LEFT (mild + safe side). Keyed on the PREDICTION
+# time, which is what was measured.
+_TOD_CLOSE_START = datetime.time(14, 0)
+_TOD_CLOSE_MULT = 1.15
+
+
+def tod_width_mult(as_of: Optional[datetime.datetime] = None) -> float:
+    """Time-of-day band-width multiplier: 1.15 for predictions from 14:00 IST (the close
+    hour under-covers), 1.0 otherwise. as_of=None → live now (IST)."""
+    t = (as_of.astimezone(IST) if as_of is not None else datetime.datetime.now(IST)).time()
+    return _TOD_CLOSE_MULT if t >= _TOD_CLOSE_START else 1.0
+
+
 # ── LEARNED band multiplier — the L4 calibration loop's live output ───────────────
 # calibration_engine.py recalibrates a per-(index,horizon) multiplier (shrunk toward 1.0
 # on thin data) so each band self-tunes toward the 68% coverage target. Applied on TOP of
