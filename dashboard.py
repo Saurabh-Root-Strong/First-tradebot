@@ -1611,7 +1611,7 @@ app.layout = dbc.Container([
                         options=[{"label": "5 min", "value": 5},
                                  {"label": "15 min", "value": 15},
                                  {"label": "60 min", "value": 60}],
-                        value=15, style={"fontSize": "0.72rem"}), md=2),
+                        value=60, style={"fontSize": "0.72rem"}), md=2),
                     # Replay: pick ANY cutoff minute (truncate every chart at that
                     # time to study what the market did next). Cleared = full/live
                     # session — the as_of cutoff is leakage-safe (enforced at the

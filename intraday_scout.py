@@ -744,8 +744,16 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     trend_veto, trend_veto_reason = ps.trend_veto(regime, direction)
     if _TREND_VETO and trend_veto and verdict.startswith("TRADE"):
         verdict, direction = "NO-TRADE", ""
-    # mood — the third mood (CONSOLIDATION) the day-trend read lets through (backtest_regime)
-    mood = rc.classify_from_bars(ser, n=_MOOD_WIN)
+    # mood — the third mood (CONSOLIDATION) the day-trend read lets through (backtest_regime).
+    # Read off a FIXED 5-min series, NOT the display tf: the regime is an objective read that
+    # must not depend on the chart timeframe, its band-width factor + veto were CALIBRATED on
+    # 5-min ER10 (backtest_band_regime / backtest_regime), and on coarse bars (tf=60) ER10
+    # would need 10 hours and never warm intraday. Matches the cockpit (intraday_read uses 5m).
+    try:
+        _mood_ser = ser if tf_min == 5 else fc.build_series(sym, 5, date, as_of)
+        mood = rc.classify_from_bars(_mood_ser, n=_MOOD_WIN)
+    except Exception:
+        mood = rc.classify_from_bars(ser, n=_MOOD_WIN)
     mood_veto, mood_veto_reason = rc.veto(mood, direction)
     if _MOOD_VETO and mood_veto and verdict.startswith("TRADE"):
         verdict, direction = "NO-TRADE", ""
