@@ -627,14 +627,11 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     return out
 
 
-# Horizon-scaling exponent for the band. Pure sqrt (0.5 = random walk) UNDER-covers at
-# short horizons because intraday index moves MEAN-REVERT. A 3-day sample first implied
-# Hurst ~0.37; the 2yr multi-horizon audit (backtest_band_horizon_hist.py, ~150k samples
-# 30/60/120/240m) OVERTURNED that for ENDPOINT coverage: the 68%-multiplier RISES with
-# horizon (0.68/0.73/0.78/0.82), i.e. the band grows too SLOWLY at 0.40 → true endpoint
-# exponent ≈0.48 (near random-walk). (H/60)^0.48 = 1 at H=60 so the 60m base (_RANGE_M
-# in hour_forecast) is PRESERVED; longer horizons widen to hold ~68%.
-_BAND_HURST = 0.48
+# Horizon-scaling exponent for the band — CENTRALISED in hour_forecast (band home) and
+# aliased here so intraday_scout + the backtests keep reading scout._BAND_HURST. (H/60)^0.48
+# holds endpoint coverage ~68% across 30/60/120/240m (2yr audit); =1 at H=60 (60m base
+# preserved). See hour_forecast for the derivation.
+_BAND_HURST = hf._BAND_HURST
 
 
 def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:
@@ -663,6 +660,10 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     verdict/strength/spot (skips hour_forecast + verify + forward) — the cheap probe
     the lifecycle walk-back/refine uses, ~3-5x faster per call."""
     horizon_min = int(horizon_min or tf_min)
+    # Clip to the remaining session near the close: "next 60m" at 15:18 would project past
+    # 15:30 into the overnight gap — not an intraday read. The band/verify/label then honestly
+    # reflect the rest-of-session window (hour_forecast.session_horizon).
+    horizon_min = hf.session_horizon(horizon_min, as_of)
     label = LABELS.get(sym, sym)
     try:
         ser = fc.build_series(sym, tf_min, date, as_of)

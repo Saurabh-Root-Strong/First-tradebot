@@ -46,6 +46,33 @@ _P_K = 2.5                 # logistic steepness mapping composite -> p(up)
 # multiplier. The L4 loop (calibration_engine) fine-tunes per-index AROUND this base.
 _RANGE_M = 0.73
 
+# Horizon-scaling exponent (endpoint). Centralised here (band home) — intraday_scout and the
+# backtests alias hf._BAND_HURST. The 2yr multi-horizon audit flattened coverage across
+# 30/60/120/240m at 0.48 (near random-walk for the ENDPOINT).
+_BAND_HURST = 0.48
+
+_SESSION_CLOSE_T = datetime.time(15, 30)
+
+
+def session_horizon(horizon_min: int, as_of: Optional[datetime.datetime] = None) -> int:
+    """Effective band horizon CLIPPED to time-until-close. Near the close, 'next 60m' would
+    project past 15:30 into the overnight gap — not an intraday read; the honest intraday band
+    is the range over the REMAINING session. Clamp to minutes-to-close (floor 5m). Post-close /
+    no session left → unclipped horizon (pure projection). as_of=None → live now (IST)."""
+    now = (as_of.astimezone(IST) if as_of is not None else datetime.datetime.now(IST))
+    close = datetime.datetime.combine(now.date(), _SESSION_CLOSE_T, tzinfo=IST)
+    to_close = (close - now).total_seconds() / 60.0
+    if to_close <= 0:
+        return int(horizon_min)
+    return int(max(5, min(horizon_min, to_close)))
+
+
+def horizon_band_factor(horizon_min: int, as_of: Optional[datetime.datetime] = None):
+    """(H_eff/60)^_BAND_HURST scaling factor AND the effective horizon — for clipping the
+    fixed-60m base band to the remaining session near the close. Returns (factor, H_eff)."""
+    h = session_horizon(horizon_min, as_of)
+    return (h / 60.0) ** _BAND_HURST, h
+
 
 def _sigma1_pct(ticks: pd.DataFrame, upto) -> float | None:
     s = ticks[ticks["ts"] <= pd.Timestamp(upto)].set_index("ts")["ltp"]

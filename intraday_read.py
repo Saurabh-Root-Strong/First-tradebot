@@ -109,11 +109,12 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
     mood = rc.classify_from_bars(ser, n=10)
     rw = rc.band_width_mult(mood)
     tw = hf.tod_width_mult(as_of)          # time-of-day: widen into the close (under-covers)
+    hz, H_eff = hf.horizon_band_factor(60, as_of)   # clip 60m → rest-of-session near close
     try:
         band = hf.forecast(sym, as_of=as_of, date=date) or {}
-        # L4 learned per-index multiplier × regime width × time-of-day width, one rescale.
-        bm = hf.band_multiplier(sym, 60)
-        wf = bm * rw * tw
+        # L4 per-index × regime width × time-of-day width × horizon clip, one rescale.
+        bm = hf.band_multiplier(sym, H_eff)
+        wf = bm * rw * tw * hz
         if wf != 1.0 and band.get("lo") is not None and band.get("hi") is not None:
             mid = (band["lo"] + band["hi"]) / 2.0
             half = (band["hi"] - band["lo"]) / 2.0 * wf
@@ -123,9 +124,9 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
                 band["exp_move_pct"] = round(half / mid * 100.0, 3)
     except Exception:
         band = {}
-    # measured per-index coverage of THIS 60m band (honest accuracy tag, not a flat ~70%)
+    # measured per-index coverage of THIS band at its (possibly clipped) horizon
     try:
-        bcov = hf.band_coverage(sym, 60)
+        bcov = hf.band_coverage(sym, H_eff)
     except Exception:
         bcov = {"cover": None, "n": 0, "conf": "none"}
     return {"sym": sym, "label": label, "ok": True, "spot": spot,
@@ -137,7 +138,7 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
             "phase": f.phase, "er": f.er, "iv_atm": ser.get("iv_atm", [None])[-1],
             "band_lo": band.get("lo"), "band_hi": band.get("hi"),
             "band_pct": band.get("exp_move_pct"),
-            "band_horizon": 60,
+            "band_horizon": H_eff,
             "trend_regime": mood.short, "band_regime_mult": round(rw, 2),
             "band_cover": bcov.get("cover"), "band_n": bcov.get("n", 0),
             "band_conf": bcov.get("conf", "none")}

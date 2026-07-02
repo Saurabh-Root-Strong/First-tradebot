@@ -3637,7 +3637,7 @@ def _scout_playbook(r):
     ], style={"marginLeft": "120px", "marginTop": "4px"})
 
 
-def _scout_row(r, mem=None, today=None):
+def _scout_row(r, mem=None, today=None, live=True):
     """One index row in the scout strip. `mem` = this index's persistent trade memory
     (scout-seen, live-only) so a held trade survives a NO-TRADE blink and a resolved
     trade shows its outcome instead of vanishing."""
@@ -3709,7 +3709,8 @@ def _scout_row(r, mem=None, today=None):
     # forward prediction over the selected horizon + (replay) grade
     pdir = r.get("pred_dir", "RANGE")
     pclr = {"UP": "#34d399", "DOWN": "#f87171"}.get(pdir, "#fbbf24")
-    pred_txt = (f"↪ predict next {r.get('horizon', r['tf'])}m: {pdir}"
+    _ctx = "live now" if live else "replay"
+    pred_txt = (f"↪ {_ctx} · next {r.get('horizon', r['tf'])}m: {pdir}"
                 + (f" → {r['pred_target']}" if r.get("pred_target") else "")
                 + (f"  band[{r['pred_lo']}, {r['pred_hi']}]" if r.get("pred_lo") else ""))
     pred_kids = [html.Span(pred_txt, title=_TIP_BAND,
@@ -3808,7 +3809,7 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None):
               "background": "#1a0c0c", "border": "1px solid #7f1d1d",
               "borderRadius": "4px", "padding": "5px 8px"})
     return html.Div(
-        [title] + [_scout_row(r, mem=(seen or {}).get(r.get("sym")), today=today)
+        [title] + [_scout_row(r, mem=(seen or {}).get(r.get("sym")), today=today, live=live)
                    for r in rows] + [note],
         style={"background": "#070d18", "border": "1px solid #1e293b",
                "borderRadius": "6px", "padding": "8px 12px"})
@@ -6107,7 +6108,11 @@ def _render_cockpit(date, asof_str=""):
             html.Span(f"{r['spot']:>9.1f}  ", style={"color": "#94a3b8"}),
             html.Span(f"{r['regime']:9}", style={"color": col, "fontWeight": "700"}),
             html.Span(f" {r['conf']:>2}%  ", style={"color": "#64748b"}),
-            html.Span("60m band ", style={"color": "#475569", "fontSize": "0.55rem"}),
+            html.Span(f"{r.get('band_horizon', 60)}m band ",
+                      style={"color": "#475569", "fontSize": "0.55rem"},
+                      title="forward band horizon. Clipped to the time left in the session near "
+                            "the close (a '60m' band at 15:18 would run past 15:30 into the "
+                            "overnight gap — not intraday)."),
             html.Span(f"{band:>16}", style={"color": "#38bdf8"}),
             trend_span,
             cov_span,
