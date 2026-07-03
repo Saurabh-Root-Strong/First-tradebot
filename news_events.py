@@ -478,28 +478,63 @@ def _load_day(date: "str | None" = None) -> "list[NewsEvent]":
     return out
 
 
-def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None) -> dict:
+def _dedup_stock(alerts: "list[NewsEvent]") -> "tuple[list[NewsEvent], dict[str, int]]":
+    """Collapse repeated STOCK filings: one (ticker, event_type) shows ONCE — its
+    FIRST sighting (a company re-files the same NCLT/downgrade story many times a
+    day; the desk cares when the story STARTED and when it CHANGES, not each
+    re-filing). Returns (kept, repeat-count by uid). MACRO/SECTOR left untouched
+    (distinct headlines carry distinct content there)."""
+    kept: "list[NewsEvent]" = []
+    reps: "dict[str, int]" = {}
+    first: "dict[tuple, NewsEvent]" = {}
+    for e in sorted(alerts, key=lambda e: e.ts):
+        if e.scope == STOCK and e.ticker:
+            k = (e.ticker.upper(), e.event_type)
+            if k in first:
+                reps[first[k].uid] = reps.get(first[k].uid, 1) + 1
+                continue
+            first[k] = e
+        kept.append(e)
+    return kept, reps
+
+
+def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None,
+                 order: str = "impact", dedup: bool = True) -> dict:
     """A day's scored events → the cockpit view-model (default today; date= for nav).
 
     Returns {alerts, macro_bias, by_scope, n_total, date, dates} where `alerts` is the
-    market-moving subset (|score| >= min_abs), most-impactful-and-recent first, and
-    `macro_bias` aggregates MACRO+SECTOR events into one market-wide tilt.
+    market-moving subset (|score| >= min_abs) and `macro_bias` aggregates MACRO+SECTOR
+    events into one market-wide tilt.
+
+    order  : "impact" — most-impactful-then-recent first, capped at `limit` (cockpit
+             glance default); "time" — CHRONOLOGICAL, uncapped: the full session
+             tape, review a whole day start-to-finish.
+    dedup  : collapse repeated STOCK (ticker, event_type) filings to the FIRST
+             sighting; each alert carries n_rep (how many times it re-filed).
     """
     day = date or _today()
     evs = _load_day(day)
     alerts = [e for e in evs if abs(e.score) >= min_abs]
-    # Rank: impact magnitude first, then recency.
-    alerts.sort(key=lambda e: (abs(e.score), e.ts), reverse=True)
+    reps: "dict[str, int]" = {}
+    if dedup:
+        alerts, reps = _dedup_stock(alerts)
+    if order == "time":
+        alerts.sort(key=lambda e: e.ts)               # chronological session tape
+        limit = 0                                     # full day, no cap
+    else:
+        # Rank: impact magnitude first, then recency.
+        alerts.sort(key=lambda e: (abs(e.score), e.ts), reverse=True)
     macro = [e for e in evs if e.scope in (MACRO, SECTOR) and e.score]
     net = sum(e.score for e in macro)
     macro_bias = (Bias.BULL if net > 2 else Bias.BEAR if net < -2 else Bias.NEUTRAL).value
     by_scope = {sc: sum(1 for e in alerts if e.scope == sc) for sc in (MACRO, SECTOR, STOCK)}
-    shown = alerts[:limit]
+    shown = alerts[:limit] if limit else alerts
     by_bucket = {b: sum(1 for e in shown if e.bucket == b)
                  for b in ("BULLISH", "BEARISH")}
     return {
         "alerts": [asdict(e) | {"bias": e.bias.value, "bucket": e.bucket,
-                                "severe": severe_tag(e)} for e in shown],
+                                "severe": severe_tag(e),
+                                "n_rep": reps.get(e.uid, 1)} for e in shown],
         "macro_bias": macro_bias, "macro_net": net,
         "by_scope": by_scope, "by_bucket": by_bucket,
         "n_total": len(evs), "n_alerts": len(alerts),

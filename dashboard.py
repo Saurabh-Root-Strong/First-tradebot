@@ -684,10 +684,11 @@ def _slug(sym: str) -> str:
 
 
 # ── Live news / event-impact panel ──────────────────────────────────────────────
-def _render_news_panel(data: dict, tab: str = "ALL") -> html.Div:
-    """Event-impact alerts: scope tag · impact score (−10..+10) · ticker · headline.
+def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html.Div:
+    """Event-impact alerts: time · impact score (−10..+10) · ticker · headline.
     Driven by news_events.analyze_news(); colour = canonical bias green/red/grey.
-    `tab` filters by trader-facing bucket: ALL | BULLISH | BEARISH | AVOIDABLE."""
+    `tab` filters by trader-facing bucket; `tape`=True = full-day chronological
+    view (taller scroll, shows the whole session's deduped event tape)."""
     if not data:
         return html.Div("news layer offline", style={"color": "#475569", "fontSize": "0.55rem"})
     alerts = data.get("alerts", [])
@@ -770,6 +771,12 @@ def _render_news_panel(data: dict, tab: str = "ALL") -> html.Div:
                 "width": "78px", **MONO}),
             html.Span(e["event_type"], style={
                 "color": clr, "fontSize": "0.52rem", "width": "120px"}),
+            # repeat count — same (ticker, event) re-filed N times; first shown, rest
+            # collapsed (a new row appears only when the STORY changes)
+            html.Span(f"×{e['n_rep']}" if e.get("n_rep", 1) > 1 else "", title=(
+                f"re-filed {e.get('n_rep')} times this day — collapsed to first sighting"),
+                style={"color": "#64748b", "fontSize": "0.48rem", "width": "26px",
+                       "cursor": "help", **MONO}),
         ] + ([sev_blk] if sev_blk is not None else []) + [
             html.Span(e["headline"][:90], style={
                 "color": "#64748b", "fontSize": "0.5rem", "flex": "1 1 auto",
@@ -780,8 +787,8 @@ def _render_news_panel(data: dict, tab: str = "ALL") -> html.Div:
         msg = (f"no {tab.lower()} events this day" if tab and tab != "ALL"
                else "no market-moving events this day (feeds quiet or IP-blocked)")
         rows = [html.Div(msg, style={"color": "#475569", "fontSize": "0.52rem", "padding": "4px 0"})]
-    body = html.Div(rows, style={"maxHeight": "168px", "overflowY": "auto",
-                                 "paddingRight": "4px"})
+    body = html.Div(rows, style={"maxHeight": "340px" if tape else "168px",
+                                 "overflowY": "auto", "paddingRight": "4px"})
     return html.Div([header, body], style={
         "padding": "10px 12px", "borderRadius": "8px", "background": BG_CARD,
         "border": "1px solid #1e3a5f55", "borderLeft": "3px solid #fbbf24",
@@ -1407,16 +1414,29 @@ app.layout = dbc.Container([
         ], style={"display": "flex", "alignItems": "center", "marginTop": "10px"}),
         # Bucket tabs — filter the news panel by trader-facing lens. Kept in the STATIC
         # layout (not inside news-panel) so the selection survives the 30s tick refresh.
-        dcc.RadioItems(
-            id="news-tab", value="ALL", inline=True,
-            options=[{"label": "ALL", "value": "ALL"},
-                     {"label": "🟢 Bullish", "value": "BULLISH"},
-                     {"label": "🔴 Bearish", "value": "BEARISH"}],
-            className="news-tab",
-            labelStyle={"display": "inline-block", "marginRight": "12px",
-                        "cursor": "pointer", "fontSize": "0.52rem", "fontWeight": "700"},
-            inputStyle={"marginRight": "4px", "cursor": "pointer"},
-            style={"marginTop": "6px", "color": "#94a3b8"}),
+        html.Div([
+            dcc.RadioItems(
+                id="news-tab", value="ALL", inline=True,
+                options=[{"label": "ALL", "value": "ALL"},
+                         {"label": "🟢 Bullish", "value": "BULLISH"},
+                         {"label": "🔴 Bearish", "value": "BEARISH"}],
+                className="news-tab",
+                labelStyle={"display": "inline-block", "marginRight": "12px",
+                            "cursor": "pointer", "fontSize": "0.52rem", "fontWeight": "700"},
+                inputStyle={"marginRight": "4px", "cursor": "pointer"},
+                style={"color": "#94a3b8"}),
+            # Order: ⏱ full-day chronological tape (review a whole session start-to-
+            # finish, deduped, uncapped) vs ⚡ top-impact glance (old default, top 25).
+            dcc.RadioItems(
+                id="news-sort", value="time", inline=True,
+                options=[{"label": "⏱ full day (time)", "value": "time"},
+                         {"label": "⚡ top impact", "value": "impact"}],
+                className="news-tab",
+                labelStyle={"display": "inline-block", "marginRight": "12px",
+                            "cursor": "pointer", "fontSize": "0.52rem", "fontWeight": "700"},
+                inputStyle={"marginRight": "4px", "cursor": "pointer"},
+                style={"color": "#94a3b8", "marginLeft": "18px"}),
+        ], style={"display": "flex", "alignItems": "center", "marginTop": "6px"}),
         html.Div(id="news-panel", style={"marginTop": "4px"}),
         # Cockpit REPLAY control — type a past time (HH:MM) to see the band/regime AS IT
         # STOOD at that instant on the selected date (causal, lookahead-free). Blank = live/
@@ -6112,12 +6132,14 @@ def _seed_cards_on_date(date):
 
 @app.callback(Output("news-panel", "children"),
               Input("news-date", "data"), Input("news-tick", "n_intervals"),
-              Input("news-tab", "value"))
-def _update_news_panel(date, _n, tab):
+              Input("news-tab", "value"), Input("news-sort", "value"))
+def _update_news_panel(date, _n, tab, order):
     if not _NEWS_AVAILABLE:
         return no_update
     try:
-        return _render_news_panel(news_events.analyze_news(date=date), tab or "ALL")
+        order = order or "time"
+        return _render_news_panel(news_events.analyze_news(date=date, order=order),
+                                  tab or "ALL", tape=(order == "time"))
     except Exception:
         return no_update
 
