@@ -662,6 +662,14 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     # Cap the evaluation at the session close FIRST — the tick feed emits after 15:30, which
     # would otherwise produce phantom post-close triggers ("held since 15:51").
     as_of = hf.eval_asof(as_of, date)
+    # Live intraday resolves to None — PIN the instant. With as_of=None the opening
+    # protections silently vanish (_opening_context returns None → no warmup gate;
+    # in_open is False → no 09:35 settle gate), so a caller that forgets to pass
+    # `now` (CLI live scan, any future headless consumer) trades into the open
+    # unprotected. The dashboard/poller always passed now explicitly; this makes
+    # every path equivalent.
+    if as_of is None:
+        as_of = datetime.datetime.now(IST)
     horizon_min = int(horizon_min or tf_min)
     # Clip to the remaining session near the close: "next 60m" at 15:18 would project past
     # 15:30 into the overnight gap — not an intraday read. The band/verify/label then honestly
