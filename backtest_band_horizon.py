@@ -3,9 +3,12 @@ backtest_band_horizon.py — RANGE-band coverage on the last N captured live day
 split by FORECAST HORIZON (15m vs 60m). The band is the desk's one trusted product;
 this measures whether it actually covers at the claimed ~68% at EACH horizon.
 
-The band is built in hour_forecast at 60m (calibrated mult _RANGE_M=0.47) and then
-sqrt(H/60)-scaled to any horizon by intraday_scout._forward. That scaling ASSUMES
-coverage is horizon-invariant. We test that assumption on real captured ticks.
+The band is built in hour_forecast at 60m (calibrated mult hf._RANGE_M — 0.73 since
+the 2026-07-02 recalibration; read the live value, don't trust this line) and then
+(H/60)^_BAND_HURST-scaled to any horizon by intraday_scout._forward. That scaling
+ASSUMES coverage is horizon-invariant. We test that assumption on real captured
+ticks. NOTE: this grades the BASE band — the deployed band additionally carries the
+L4 multiplier + regime/TOD widens (see the 2026-07-03 audit, finding M1).
 
 Two honest coverage metrics per horizon:
   • endpoint   — price AT t+H inside [lo,hi]  (matches _verify "close-in-band" / the

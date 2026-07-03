@@ -10,7 +10,6 @@ names? Reads the ledger written by backtest_engine.py --save; no re-run needed.
 """
 from __future__ import annotations
 import sys
-from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -18,7 +17,9 @@ if hasattr(sys.stdout, "reconfigure"):
 import numpy as np
 import pandas as pd
 
-LEDGER = Path("data") / "backtest" / "trades.parquet"
+from core.constants import DATA_DIR   # anchor to the repo, not the CWD
+
+LEDGER = DATA_DIR / "backtest" / "trades.parquet"
 
 
 def stats(r: pd.Series) -> dict:
