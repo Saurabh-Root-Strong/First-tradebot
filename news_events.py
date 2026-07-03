@@ -171,6 +171,44 @@ def _uid(source: str, ticker: str, headline: str) -> str:
     return hashlib.sha1(f"{source}|{ticker}|{headline}".encode("utf-8", "ignore")).hexdigest()[:16]
 
 
+# ── Severe-negative lens (fraud / insolvency / audit-exit class) ─────────────────
+# MEASURED 2026-07-03 (backtest_news_short.py, 5 weeks of capture, 43 priced events):
+# severe negatives drift DOWN next day (−0.57% mean, 60% fall) but the drift lives
+# in NON-F&O smallcaps (−0.85%, 67% fall, t≈−1.9) which have NO practical short
+# route (no stock futures; SLB is 1-month-minimum and illiquid; frauds migrate to
+# T2T/circuits). The F&O names — the only actually shortable ones — went UP
+# (+0.86% next day, n=7: big names get dip-bought). So the honest product today is
+# a DISCIPLINE tag (don't buy the dip / exit longs), NOT a short signal. The daily
+# news mirrors ARE the accumulating ledger — re-run the study as n grows before
+# promoting anything to a trade.
+SEVERE_NEG = {"Fraud allegation", "SEBI action", "Auditor resignation",
+              "Credit downgrade", "Regulatory ban", "Key-exec resignation"}
+_SEVERE_TH = -7          # score at/below this + a SEVERE_NEG category = severe
+
+_FNO_TICKERS: "set[str] | None" = None
+
+
+def _fno_tickers() -> "set[str]":
+    """Bare NSE tickers with stock futures (lazy; empty set if universe missing)."""
+    global _FNO_TICKERS
+    if _FNO_TICKERS is None:
+        try:
+            from fno_universe import STOCK_SYMBOLS
+            _FNO_TICKERS = {s.split(":")[1].rsplit("-", 1)[0] for s in STOCK_SYMBOLS}
+        except Exception:
+            _FNO_TICKERS = set()
+    return _FNO_TICKERS
+
+
+def severe_tag(e: "NewsEvent") -> "str | None":
+    """'FUT' (F&O name — futures exist, but short measured UNSUPPORTED so far) or
+    'AVOID' (no short route — discipline tag) for a severe negative stock event;
+    None for everything else."""
+    if e.scope != STOCK or e.score > _SEVERE_TH or e.event_type not in SEVERE_NEG:
+        return None
+    return "FUT" if e.ticker.upper() in _fno_tickers() else "AVOID"
+
+
 # ── Scoring ──────────────────────────────────────────────────────────────────────
 def score_text(text: str) -> "tuple[str, int, str]":
     """Score a headline/announcement → (event_type, score, scope).
@@ -443,7 +481,8 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None) -
     by_bucket = {b: sum(1 for e in shown if e.bucket == b)
                  for b in ("BULLISH", "BEARISH")}
     return {
-        "alerts": [asdict(e) | {"bias": e.bias.value, "bucket": e.bucket} for e in shown],
+        "alerts": [asdict(e) | {"bias": e.bias.value, "bucket": e.bucket,
+                                "severe": severe_tag(e)} for e in shown],
         "macro_bias": macro_bias, "macro_net": net,
         "by_scope": by_scope, "by_bucket": by_bucket,
         "n_total": len(evs), "n_alerts": len(alerts),

@@ -714,7 +714,34 @@ def _render_news_panel(data: dict, tab: str = "ALL") -> html.Div:
         sc  = e["score"]
         clr = sig.color(e["bias"])
         chip = {"MACRO": "#a78bfa", "SECTOR": "#38bdf8", "STOCK": "#94a3b8"}.get(e["scope"], "#94a3b8")
+        try:
+            tm = pd.Timestamp(e.get("ts")).strftime("%H:%M")
+        except Exception:
+            tm = "--:--"
+        # Severe-negative discipline badge (fraud/insolvency/audit-exit class).
+        # Copy is the MEASURED verdict (backtest_news_short.py): the drift lives in
+        # non-F&O names with no short route → discipline tag, not a short signal.
+        sev = e.get("severe")
+        sev_blk = None
+        if sev == "AVOID":
+            sev_blk = html.Span("⛔ AVOID/EXIT", title=(
+                "Severe negative event. Measured (5wk): non-F&O severe negs fall "
+                "−0.85% next day, 67% down — but NO practical short route (no "
+                "futures; SLB 1-month-min; circuit/T2T risk). Discipline tag: don't "
+                "buy this dip, exit longs. NOT a validated short signal."),
+                style={"color": "#f87171", "fontSize": "0.48rem", "fontWeight": "800",
+                       "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
+        elif sev == "FUT":
+            sev_blk = html.Span("⚠ F&O·no edge", title=(
+                "Severe negative on an F&O name — futures-shortable in principle, "
+                "BUT measured (5wk, n=7): these went UP +0.86% next day (big names "
+                "get dip-bought). Short NOT supported by the data yet."),
+                style={"color": "#fbbf24", "fontSize": "0.48rem", "fontWeight": "800",
+                       "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
         rows.append(html.Div([
+            html.Span(tm, style={
+                "color": "#475569", "fontSize": "0.5rem", "width": "34px",
+                "marginRight": "4px", **MONO}),
             html.Span(f"{sc:+d}", style={
                 "color": clr, "fontWeight": "800", "fontSize": "0.7rem",
                 "width": "32px", "textAlign": "right", "marginRight": "8px",
@@ -727,6 +754,7 @@ def _render_news_panel(data: dict, tab: str = "ALL") -> html.Div:
                 "width": "78px", **MONO}),
             html.Span(e["event_type"], style={
                 "color": clr, "fontSize": "0.52rem", "width": "120px"}),
+        ] + ([sev_blk] if sev_blk is not None else []) + [
             html.Span(e["headline"][:90], style={
                 "color": "#64748b", "fontSize": "0.5rem", "flex": "1 1 auto",
                 "overflow": "hidden", "textOverflow": "ellipsis", "whiteSpace": "nowrap"}),
