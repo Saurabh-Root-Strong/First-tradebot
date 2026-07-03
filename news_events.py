@@ -185,6 +185,17 @@ SEVERE_NEG = {"Fraud allegation", "SEBI action", "Auditor resignation",
               "Credit downgrade", "Regulatory ban", "Key-exec resignation"}
 _SEVERE_TH = -7          # score at/below this + a SEVERE_NEG category = severe
 
+# POSITIVE side, MEASURED 2026-07-03 (same study, --side pos, n=1734 priced — a real
+# sample): buying the NEXT OPEN after big positive news LOSES −0.16% +1d, 57% down,
+# t=−2.57 (significant) — the pop is in the opening gap, chasing it buys the fade.
+# "Large order win" pops +0.5% day 1 then REVERSES to −1.6% by day 5 (78% down).
+# F&O large caps: flat/negative at every horizon (priced instantly). The +5d smallcap
+# mean (+0.7%, t=4.3) is a pure lottery tail — median 0.0%. So the positive badge is
+# also DISCIPLINE copy: the news is real, the entry isn't — don't chase the open.
+SEVERE_POS = {"Buyback", "Large order win", "Acquisition", "Promoter buying",
+              "Capacity expansion", "Strong earnings"}
+_SEVERE_POS_TH = 6       # score at/above this + a SEVERE_POS category = severe
+
 _FNO_TICKERS: "set[str] | None" = None
 
 
@@ -201,12 +212,18 @@ def _fno_tickers() -> "set[str]":
 
 
 def severe_tag(e: "NewsEvent") -> "str | None":
-    """'FUT' (F&O name — futures exist, but short measured UNSUPPORTED so far) or
-    'AVOID' (no short route — discipline tag) for a severe negative stock event;
-    None for everything else."""
-    if e.scope != STOCK or e.score > _SEVERE_TH or e.event_type not in SEVERE_NEG:
+    """Discipline tag for severe stock events; None for everything else.
+    Negative: 'FUT' (F&O name — futures exist, short measured UNSUPPORTED) or
+              'AVOID' (no short route — don't buy the dip / exit longs).
+    Positive: 'POS_FUT' (F&O — priced instantly, no edge measured) or
+              'POS' (pop-fades — don't chase the open)."""
+    if e.scope != STOCK:
         return None
-    return "FUT" if e.ticker.upper() in _fno_tickers() else "AVOID"
+    if e.score <= _SEVERE_TH and e.event_type in SEVERE_NEG:
+        return "FUT" if e.ticker.upper() in _fno_tickers() else "AVOID"
+    if e.score >= _SEVERE_POS_TH and e.event_type in SEVERE_POS:
+        return "POS_FUT" if e.ticker.upper() in _fno_tickers() else "POS"
+    return None
 
 
 # ── Scoring ──────────────────────────────────────────────────────────────────────

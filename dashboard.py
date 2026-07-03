@@ -738,6 +738,22 @@ def _render_news_panel(data: dict, tab: str = "ALL") -> html.Div:
                 "get dip-bought). Short NOT supported by the data yet."),
                 style={"color": "#fbbf24", "fontSize": "0.48rem", "fontWeight": "800",
                        "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
+        elif sev == "POS":
+            sev_blk = html.Span("🚀 don't chase", title=(
+                "Big positive event. Measured (5wk, n=1734): buying the NEXT OPEN "
+                "loses −0.16% +1d, 57% down (t=−2.6) — the pop is in the opening gap; "
+                "chasing buys the fade. 'Large order win' reverses −1.6% by day 5. "
+                "+5d smallcap mean is a lottery tail (median 0.0%). News is real, the "
+                "late entry isn't."),
+                style={"color": "#4ade80", "fontSize": "0.48rem", "fontWeight": "800",
+                       "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
+        elif sev == "POS_FUT":
+            sev_blk = html.Span("⚡ priced-in F&O", title=(
+                "Big positive on an F&O name — measured (5wk, n=209): flat/negative "
+                "at EVERY horizon (−0.23% +1d) — large caps price public news "
+                "instantly. No long edge from chasing; context only."),
+                style={"color": "#34d399", "fontSize": "0.48rem", "fontWeight": "800",
+                       "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
         rows.append(html.Div([
             html.Span(tm, style={
                 "color": "#475569", "fontSize": "0.5rem", "width": "34px",

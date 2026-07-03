@@ -40,10 +40,12 @@ from core.constants import LIVE_DIR
 DCM_DB = Path(r"D:\Python Projects\Daily_Cash_Market\data\market_data.duckdb")
 SEVERE = {"Fraud allegation", "SEBI action", "Auditor resignation",
           "Credit downgrade", "Regulatory ban", "Key-exec resignation"}
+SEVERE_POS = {"Buyback", "Large order win", "Acquisition", "Promoter buying",
+              "Capacity expansion", "Strong earnings"}
 HORIZONS = (1, 3, 5)
 
 
-def load_events(score_th: int) -> pd.DataFrame:
+def load_events(score_th: int, side: str = "neg") -> pd.DataFrame:
     rows = []
     for p in sorted(glob.glob(str(LIVE_DIR / "*_news_events.parquet"))):
         try:
@@ -55,8 +57,8 @@ def load_events(score_th: int) -> pd.DataFrame:
         return pd.DataFrame()
     ev = pd.concat(rows, ignore_index=True)
     ev["ts"] = pd.to_datetime(ev["ts"], utc=True).dt.tz_convert("Asia/Kolkata")
-    ev = ev[(ev["scope"] == "STOCK") & (ev["score"] <= score_th)
-            & ev["ticker"].astype(bool)]
+    keep = (ev["score"] <= score_th) if side == "neg" else (ev["score"] >= score_th)
+    ev = ev[(ev["scope"] == "STOCK") & keep & ev["ticker"].astype(bool)]
     ev["day"] = ev["ts"].dt.tz_localize(None).dt.normalize()   # naive midnight, matches bhavcopy dates
     # one event per (ticker, event_type, day); keep the earliest sighting
     ev = (ev.sort_values("ts")
@@ -138,28 +140,36 @@ def block(title: str, df: pd.DataFrame) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--score", type=int, default=-7)
+    ap.add_argument("--score", type=int, default=None,
+                    help="score cutoff (default -7 for neg, +6 for pos)")
+    ap.add_argument("--side", choices=("neg", "pos"), default="neg")
     a = ap.parse_args()
-    ev = load_events(a.score)
+    neg = a.side == "neg"
+    th = a.score if a.score is not None else (-7 if neg else 6)
+    ev = load_events(th, a.side)
     if ev.empty:
         print("no captured events"); return
-    sev = ev[ev["event_type"].isin(SEVERE)]
+    cats = SEVERE if neg else SEVERE_POS
+    sev = ev[ev["event_type"].isin(cats)]
+    word = "NEGATIVE" if neg else "POSITIVE"
+    win = "short wins when return < 0" if neg else "long wins when return > 0"
     print("=" * 78)
-    print(f"  SEVERE-NEGATIVE EVENT → FORWARD DRIFT   events {ev['day'].min()} → {ev['day'].max()}")
-    print(f"  stock-neg events score<={a.score}: {len(ev)}  ·  severe categories: {len(sev)} "
+    print(f"  SEVERE-{word} EVENT → FORWARD DRIFT   events {ev['day'].min():%Y-%m-%d} → "
+          f"{ev['day'].max():%Y-%m-%d}")
+    print(f"  stock events past cutoff {th:+d}: {len(ev)}  ·  severe categories: {len(sev)} "
           f"({ev['ticker'].nunique()} tickers)")
     print("=" * 78)
     px = load_prices(sorted(ev["ticker"].unique()))
     r = fwd_returns(sev, px)
     if r.empty:
         print("no price joins — ticker mismatch vs daily_data?"); return
-    block("ALL severe negatives (next-open entry, short wins when return < 0)", r)
-    block("F&O names only (actually shortable via futures)", r[r["fno"]])
-    block("non-F&O (no short route — avoid/exit only)", r[~r["fno"]])
+    block(f"ALL severe {word.lower()}s (next-open entry, {win})", r)
+    block("F&O names only (futures-tradeable)", r[r["fno"]])
+    block("non-F&O", r[~r["fno"]])
     for et, g in r.groupby("event_type"):
         block(f"[{et}]", g)
     print(f"\n  join rate: {len(r)}/{len(sev)} severe events priced  ·  "
-          f"F&O members: {int(r['fno'].sum())}  ·  BE/BZ (T2T, unshortable+circuit): "
+          f"F&O members: {int(r['fno'].sum())}  ·  BE/BZ (T2T/circuit): "
           f"{(r['series'] != 'EQ').sum()}")
     print("  CAVEAT: ~5 weeks of capture, overlapping windows, one regime — a first read,")
     print("  NOT a validated edge. Wire nothing to auto-action off this alone.")
