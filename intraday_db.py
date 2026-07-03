@@ -87,6 +87,10 @@ class IntradayDB:
         self._duckdb              = None
         self._ok: bool            = False
         self._errors: int         = 0
+        # Per-record-kind insert failures. NEVER silent: the chain_snapshots capture
+        # died for weeks because per-record errors were swallowed — count every one,
+        # log the first per kind (+ every 500th), expose via session_stats().
+        self._insert_errors: dict[str, int] = {}
 
         # Per-symbol throttle — futures API fires every 2 s; we persist every 30 s
         self._fut_last: dict[str, float] = {}
@@ -232,6 +236,8 @@ class IntradayDB:
         for tbl in ("ticks", "candles", "oi_snapshots", "futures_quotes", "signals", "trade_setups", "chain_snapshots", "scout_alerts"):
             df = self.query(f"SELECT COUNT(*) AS n FROM {tbl}", target)
             counts[tbl] = int(df.iloc[0]["n"]) if not df.empty else 0
+        for kind, n in self._insert_errors.items():
+            counts[f"insert_errors_{kind}"] = n
         return counts
 
     def shutdown(self) -> None:
@@ -342,8 +348,15 @@ class IntradayDB:
             for rec in batch:
                 try:
                     self._insert(con, rec)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Count + log (first per kind, then every 500th) — a schema/column
+                    # mismatch must surface the same day, not weeks later.
+                    kind = rec[0] if rec and isinstance(rec[0], str) else "?"
+                    n = self._insert_errors.get(kind, 0) + 1
+                    self._insert_errors[kind] = n
+                    if n == 1 or n % 500 == 0:
+                        print(f"[IntradayDB] {kind} insert FAILED (x{n}): {exc}",
+                              flush=True)
             con.execute("CHECKPOINT")
             self._export_parquet(con)   # snapshot for concurrent reads
         except Exception as exc:
@@ -404,7 +417,10 @@ class IntradayDB:
             tick_vol = max(0, cum_vol - prev_vol)
             self._tick_prev_vol[sym] = cum_vol
             con.execute(
-                """INSERT INTO ticks VALUES (?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO ticks
+                       (ts, symbol, ltp, tick_vol, cum_vol,
+                        day_open, day_high, day_low, ch, chp)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO NOTHING""",
                 [ts, sym, ltp, tick_vol, cum_vol,
                  day_open if day_open else None,
@@ -421,7 +437,9 @@ class IntradayDB:
             if hasattr(ts, "tzinfo") and ts.tzinfo is None:
                 ts = ts.replace(tzinfo=IST)
             con.execute(
-                """INSERT INTO candles VALUES (?,?,?,?,?,?,?,?,?)
+                """INSERT INTO candles
+                       (ts, date, symbol, resolution, open, high, low, close, volume)
+                   VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO NOTHING""",
                 [ts, today, sym, res,
                  bar.get("open"), bar.get("high"), bar.get("low"),
@@ -435,6 +453,12 @@ class IntradayDB:
                 ts = ts.replace(tzinfo=IST)
             con.execute(
                 """INSERT INTO oi_snapshots
+                       (ts, date, symbol, spot, atm, pcr,
+                        total_call_oi, total_put_oi, atm_call_oi, atm_put_oi,
+                        atm_call_iv, atm_put_iv, atm_iv,
+                        atm_call_prem, atm_put_prem,
+                        call_wall, put_wall, max_pain,
+                        near_call_oi, near_put_oi, put_skew)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO NOTHING""",
                 [ts, today, snap.sym,
@@ -494,6 +518,9 @@ class IntradayDB:
             term     = "CONTANGO" if roll > 0 else "BACKWARDATION"
             con.execute(
                 """INSERT INTO futures_quotes
+                       (ts, date, symbol, near_ltp, next_ltp, far_ltp,
+                        near_basis, next_basis, roll_spread, term_structure,
+                        near_vol, next_vol)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO NOTHING""",
                 [now, today, sym, near_ltp, next_ltp, far_ltp,
@@ -515,6 +542,11 @@ class IntradayDB:
 
             con.execute(
                 """INSERT INTO signals
+                       (ts, date, symbol, weighted_score, overall,
+                        score_5min, score_15min, score_60min, score_daily,
+                        signal_5min, signal_15min, signal_60min, signal_daily,
+                        rsi_5min, rsi_15min, macd_hist_15m, close_price,
+                        vwap_15min, bull_tfs, bear_tfs)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO NOTHING""",
                 [now, today, sym,
@@ -536,6 +568,11 @@ class IntradayDB:
              agreement, phase, spot, atm_iv) = rec
             con.execute(
                 """INSERT INTO trade_setups
+                       (ts, date, symbol, timeframe, signal, composite_score,
+                        confidence, direction,
+                        l1_tech, l2_oi, l3_velocity, l4_inst, l5_futures,
+                        l6_iv, l7_pcr, l8_maxpain, l9_context,
+                        agreement, phase, spot, atm_iv)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT DO NOTHING""",
                 [now, today, sym, tf,
