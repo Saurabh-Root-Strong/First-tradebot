@@ -430,7 +430,13 @@ def _start_ws(token: str):
 
 
 # ── WebSocket health heartbeat (read by supervise.py) ────────────────────────
-_last_tick_wall = 0.0
+# Baseline = process start, NOT 0. With 0 the heartbeat file reads "0" until the
+# first tick, so a dashboard started PRE-OPEN aged past the supervisor's 120s
+# launch grace and got restart-killed at 09:15:00 sharp (heartbeat_age ≈ 1e9 >
+# WS_STALL_SEC) — a spurious restart in the open's first, most valuable seconds.
+# Seeding wall-clock now means "no tick yet" only goes stale WS_STALL_SEC after
+# start, which is exactly the stall semantics the supervisor wants.
+_last_tick_wall = time.time()
 HEARTBEAT_FILE = Path(__file__).parent / "data" / "ws_heartbeat.txt"
 
 
@@ -553,12 +559,21 @@ def _oi_background_poller():
                                                      e.get("volume"),
                                                      g.get("delta"), g.get("iv")))
                             idb.write_chain(sym, datetime.datetime.now(tz=IST), legs)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                        except Exception as exc:
+                            print(f"  [chain] {LABELS.get(sym, sym)} persist error: "
+                                  f"{str(exc)[:120]}", flush=True)
+                    except Exception as exc:
+                        # A RAISED exception (DNS/SSL/auth throw — not an s!="ok"
+                        # payload) must hit the same transition log, or a persistent
+                        # throw is a silent chain death with zero [chain] lines.
+                        if _oc_ok.get(sym) is not False:
+                            _oc_ok[sym] = False
+                            print(f"  [chain] {LABELS.get(sym, sym)} fetch EXCEPTION @ "
+                                  f"{datetime.datetime.now(tz=IST):%H:%M:%S} — "
+                                  f"{type(exc).__name__}: {str(exc)[:120]}", flush=True)
+        except Exception as exc:
+            print(f"  [chain] poller cycle error: {type(exc).__name__}: {str(exc)[:120]}",
+                  flush=True)
         time.sleep(POLL_FAST if datetime.datetime.now(tz=IST).time() < SLOW_AFTER else POLL_SLOW)
 
 
@@ -3773,8 +3788,10 @@ def _scout_row(r, mem=None, today=None, live=True):
             f"{'HIT ✓' if ok else 'MISS ✗'}  band {'✓' if v['band_hit'] else '✗'}",
             style={"color": "#22c55e" if ok else "#ef4444", "fontWeight": "700"}))
     else:
-        pred_kids.append(html.Span("   ⇒ pending (advance the replay clock to grade)",
-                                   style={"color": "#475569"}))
+        pred_kids.append(html.Span(
+            "   ⇒ pending — grades itself once the horizon elapses" if live else
+            "   ⇒ pending (advance the replay clock to grade)",
+            style={"color": "#475569"}))
     pred = html.Div(pred_kids, style={**MONO, "fontSize": "0.6rem",
                                       "paddingLeft": "120px", "lineHeight": "1.4"})
     why = html.Div(" · ".join(r["reasons"][:3]),
@@ -6080,7 +6097,7 @@ _CK_CHIP = {"background": "#1e293b", "color": "#fbbf24", "fontSize": "0.58rem",
             "padding": "1px 5px", "borderRadius": "4px", "marginLeft": "5px", **MONO}
 
 
-def _parse_asof(date, asof_str):
+def _parse_asof_hhmm(date, asof_str):
     """Parse an 'HH:MM' (or 'HHMM'/'HH.MM') replay time against the selected date into an
     IST datetime. Returns None on blank/garbage → live/latest. The date is the news-date
     (today if blank). Causal: read()/hour_forecast use only ts ≤ as_of, so this reconstructs
@@ -6109,7 +6126,7 @@ def _render_cockpit(date, asof_str=""):
     import datetime as _dt
     today = _dt.datetime.now(IST).date().isoformat()
     date_arg = None if (not date or date == today) else date
-    as_of = _parse_asof(date, asof_str)
+    as_of = _parse_asof_hhmm(date, asof_str)
     live = date_arg is None and as_of is None
     rows, carries = [], []
     for sym in INDEX_SYMBOLS:

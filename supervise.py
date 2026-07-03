@@ -116,7 +116,37 @@ def launch(first: bool = False) -> subprocess.Popen:
     return subprocess.Popen([str(PY), str(HERE / "dashboard.py")], cwd=str(HERE), env=env)
 
 
+def _other_supervisors() -> list[int]:
+    """PIDs of OTHER running supervise.py processes (cmdline scan, so it also sees
+    instances started before this guard existed). Empty list on any scan failure —
+    fail-open so a broken scan can't block the morning launch."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" "
+             "-ErrorAction SilentlyContinue "
+             "| ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }"],
+            capture_output=True, text=True, timeout=20)
+        pids = []
+        for line in (r.stdout or "").splitlines():
+            if "supervise.py" in line:
+                head = line.strip().split()
+                if head and head[0].isdigit() and int(head[0]) != os.getpid():
+                    pids.append(int(head[0]))
+        return pids
+    except Exception:
+        return []
+
+
 def main() -> None:
+    # SINGLE INSTANCE — a second supervisor is a port war: its launch kills the
+    # first one's dashboard (_free_port_8050), then BOTH restart loops fight over
+    # 8050 forever. Required now that a scheduled task can auto-launch this script
+    # on wake/logon while a healthy instance is already running.
+    others = _other_supervisors()
+    if others:
+        log(f"Supervisor already running (PID {others[0]}) — exiting, not a failure.")
+        return
     log("=== Supervisor start ===")
     if not ensure_token():
         log("No valid token — aborting. Run fyers_auth.py, then re-run supervise.py.")
@@ -153,8 +183,16 @@ def main() -> None:
                 proc = launch(); started = time.time()
                 continue
 
-            # 2) WS stalled during market hours → restart (after start grace)
-            if is_market_hours(now) and (time.time() - started) > START_GRACE:
+            # 2) WS stalled during market hours → restart (after start grace).
+            # ALSO require the market itself to have been open > WS_STALL_SEC: a
+            # dashboard started pre-open has (correctly) no ticks yet, so at 09:15:00
+            # sharp its heartbeat is already "stale" by wall-clock and the old check
+            # restart-killed a healthy process in the open's first seconds. The WS
+            # gets the same 90s from the OPEN as it gets from any mid-session stall.
+            open_dt = datetime.datetime.combine(now.date(), MKT_OPEN, tzinfo=IST)
+            since_open = (now - open_dt).total_seconds()
+            if (is_market_hours(now) and (time.time() - started) > START_GRACE
+                    and since_open > WS_STALL_SEC):
                 age = heartbeat_age()
                 if age > WS_STALL_SEC:
                     log(f"WS stalled — no tick for {age:.0f}s during market hours — restarting")
