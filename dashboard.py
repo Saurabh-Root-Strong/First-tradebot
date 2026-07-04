@@ -1500,7 +1500,16 @@ app.layout = dbc.Container([
                 inputStyle={"marginRight": "4px", "cursor": "pointer"},
                 style={"color": "#cbd5e1", "marginLeft": "18px"}),
         ], style={"display": "flex", "alignItems": "center", "marginTop": "6px"}),
-        html.Div(id="news-panel", style={"marginTop": "4px"}),
+        # NEWS (left, flexible — headlines need width) + MACRO RADAR (right, a
+        # narrow fixed factor table that wasted a full-width band on its own row).
+        # flexWrap stacks them again on a narrow window; minWidth:0 lets the news
+        # headlines ellipsis inside a flex child instead of forcing overflow.
+        html.Div([
+            html.Div(id="news-panel", style={"flex": "1 1 auto", "minWidth": "0"}),
+            html.Div(id="macro-radar-panel",
+                     style={"flex": "0 0 360px", "minWidth": "300px"}),
+        ], style={"display": "flex", "gap": "12px", "alignItems": "flex-start",
+                  "flexWrap": "wrap", "marginTop": "4px"}),
         # Cockpit REPLAY control — type a past time (HH:MM) to see the band/regime AS IT
         # STOOD at that instant on the selected date (causal, lookahead-free). Blank = live/
         # latest tick. Persistent (outside cockpit-panel) so the typed value survives the 30s
@@ -1518,7 +1527,6 @@ app.layout = dbc.Container([
                 "color": "#475569", "fontSize": "0.46rem", "marginLeft": "8px"}),
         ], style={"display": "flex", "alignItems": "center", "marginTop": "8px"}),
         html.Div(id="cockpit-panel", style={"marginTop": "4px"}),
-        html.Div(id="macro-radar-panel", style={"marginTop": "4px"}),
     ], style={"padding": "14px 16px 10px"}),
     html.Div(className="header-line"),
 
