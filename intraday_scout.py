@@ -573,11 +573,22 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     # loading" hang. Stepping by tf_min checks each completed bar once (~8 probes for the
     # 120-min cap): same contiguous-run logic, trigger reported to the bar (the honest
     # grain for a tf_min trade), an order of magnitude fewer builds.
+    # ABSOLUTE session grid (09:15 + k·step), NOT instants relative to as_of. A relative
+    # grid moves with the viewing clock: at 13:45 it probes 12:45/11:45, at 14:00 it
+    # probes 13:00/12:00 — a hold shorter than one bar then always reports trigger=as_of,
+    # so the displayed "triggered" time DRIFTED to the current minute on every refresh
+    # (ghost/replay made it obvious; live was masked by the alert-log overlay). Anchoring
+    # probes to the fixed bar grid makes the same instants get probed every refresh →
+    # the reported trigger is stable. A trade born on the still-forming bar honestly
+    # shows trigger=as_of until its first grid instant passes, then settles for good.
     step = max(1, int(tf_min))
+    _open_dt = as_of.replace(hour=_MKT_OPEN.hour, minute=_MKT_OPEN.minute,
+                             second=0, microsecond=0)
+    k = int((as_of - _open_dt).total_seconds() // 60) // step   # last grid idx <= as_of
     trig_t = as_of
-    for i in range(1, _TRIG_MAX_MIN // step + 1):
-        t_i = as_of - datetime.timedelta(minutes=i * step)
-        if t_i.time() < _MKT_OPEN:
+    for i in range(k, -1, -1):
+        t_i = _open_dt + datetime.timedelta(minutes=i * step)
+        if (as_of - t_i).total_seconds() / 60.0 > _TRIG_MAX_MIN:
             break
         if not_before is not None and t_i < not_before:
             break                              # never report a trigger before data-ready
