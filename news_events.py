@@ -603,32 +603,32 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None,
     if order == "time" and day == _today():
         try:
             import datetime as _dt2
-            from core.market_calendar import is_trading_day, prev_trading_day
+            from core.market_calendar import prev_trading_day
             d0 = _dt2.date.fromisoformat(day)
-            # Carry only INTO a trading day (on a weekend/holiday nothing can react
-            # today — the tape shows just that day's own filings, and Monday will
-            # pick everything up).
-            if is_trading_day(d0):
-                prev = prev_trading_day(d0)
-                have = {e.uid for e in alerts}
-                cut = datetime.time(15, 0)
-                co: "list[NewsEvent]" = []
-                # Sweep EVERY calendar day since the last trading day: the previous
-                # trading day contributes its post-15:00 filings; the weekend /
-                # holiday days in between contribute EVERYTHING (companies file on
-                # Saturdays — those stories' reaction window is also today).
-                dcur = prev
-                while dcur < d0:
-                    for e in _load_day(dcur.isoformat()):
-                        if (abs(e.score) >= min_abs and e.uid not in have
-                                and e.ts.date() >= prev
-                                and (e.ts.date() != prev or e.ts.time() >= cut)):
-                            co.append(e)
-                            have.add(e.uid)
-                    dcur += _dt2.timedelta(days=1)
-                co.sort(key=lambda e: e.ts)
-                carry_uids = {e.uid for e in co}
-                alerts = co + alerts
+            # Carry on EVERY live view — on a trading day the window is today; on a
+            # weekend/holiday the tape is the homework view and shows the whole
+            # backlog whose window is the NEXT session (hiding Friday's post-close
+            # fraud behind date-nav on a Saturday review helps nobody).
+            prev = prev_trading_day(d0)
+            have = {e.uid for e in alerts}
+            cut = datetime.time(15, 0)
+            co: "list[NewsEvent]" = []
+            # Sweep EVERY calendar day since the last trading day: the previous
+            # trading day contributes its post-15:00 filings; the weekend / holiday
+            # days in between contribute EVERYTHING (companies file on Saturdays —
+            # those stories' reaction window is the next session too).
+            dcur = prev
+            while dcur < d0:
+                for e in _load_day(dcur.isoformat()):
+                    if (abs(e.score) >= min_abs and e.uid not in have
+                            and e.ts.date() >= prev
+                            and (e.ts.date() != prev or e.ts.time() >= cut)):
+                        co.append(e)
+                        have.add(e.uid)
+                dcur += _dt2.timedelta(days=1)
+            co.sort(key=lambda e: e.ts)
+            carry_uids = {e.uid for e in co}
+            alerts = co + alerts
         except Exception:
             carry_uids = set()
     reps: "dict[str, int]" = {}

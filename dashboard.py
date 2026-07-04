@@ -786,8 +786,9 @@ def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html
                 "width": "104px", "letterSpacing": "0.03em", "cursor": "help"})
         rows.append(html.Div([
             html.Span(tm, title=(
-                "filed YESTERDAY near/after the close — news that lands late moves "
-                "the NEXT session (desk rule), so its reaction window is TODAY"
+                "filed near/after the close of the LAST session (or on a weekend/"
+                "holiday) — late news moves the NEXT session (desk rule), so its "
+                "reaction window is the next trading day"
                 if carry else ""),
                 style={"color": "#fbbf24" if carry else "#475569",
                        "fontSize": "0.5rem", "width": "40px" if carry else "34px",
