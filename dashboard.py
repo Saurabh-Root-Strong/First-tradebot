@@ -100,6 +100,7 @@ except Exception:
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 from core.constants import IST, INDEX_SYMBOLS, LABELS   # single source of truth
+from core.market_calendar import is_trading_day         # ghost-practice default
 from tradebot.adapters.broker import token as _broker_token   # single broker-token source
 from tradebot.adapters.broker import rest as _broker_rest     # single Fyers REST-fetch source
 APP_ID     = _broker_token.APP_ID
@@ -1787,7 +1788,12 @@ app.layout = dbc.Container([
                                     "value": f"{h:02d}:{m:02d}"}
                                    for h in range(9, 16) for m in range(60)
                                    if (9, 15) <= (h, m) <= (15, 30)],
-                                value=None, clearable=True, placeholder="live",
+                                # Weekend/holiday: there IS no live session, so open
+                                # straight in ghost practice (last captured day on
+                                # today's clock). A trading day still defaults to live.
+                                value=("ghost" if not is_trading_day(
+                                    datetime.datetime.now(IST)) else None),
+                                clearable=True, placeholder="live",
                                 style={"fontSize": "0.72rem", "minWidth": "110px"}),
                         ], style={"display": "flex", "alignItems": "center",
                                   "gap": "6px"}),
