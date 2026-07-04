@@ -1776,10 +1776,17 @@ app.layout = dbc.Container([
                                 "color": "#a78bfa", "whiteSpace": "nowrap"}),
                             dcc.Dropdown(
                                 id="charts-asof",
-                                options=[{"label": f"{h:02d}:{m:02d}",
-                                          "value": f"{h:02d}:{m:02d}"}
-                                         for h in range(9, 16) for m in range(60)
-                                         if (9, 15) <= (h, m) <= (15, 30)],
+                                # "ghost" = PRACTICE mode: replay the last captured
+                                # session pinned to TODAY'S wall clock (10:42 now →
+                                # 10:42 on that day), auto-advancing — paper-trade a
+                                # past day as if it were live. Verify/actual is hidden
+                                # until 15:30 so the future can't be peeked.
+                                options=[{"label": "👻 ghost live (practice)",
+                                          "value": "ghost"}]
+                                + [{"label": f"{h:02d}:{m:02d}",
+                                    "value": f"{h:02d}:{m:02d}"}
+                                   for h in range(9, 16) for m in range(60)
+                                   if (9, 15) <= (h, m) <= (15, 30)],
                                 value=None, clearable=True, placeholder="live",
                                 style={"fontSize": "0.72rem", "minWidth": "110px"}),
                         ], style={"display": "flex", "alignItems": "center",
@@ -3350,6 +3357,8 @@ def _fill_strikes(mode, sym, date, expiry, asof, cur):
     """Populate the option strike picker (Totals + open±1000) for the index/date/expiry/as-of."""
     opts = [{"label": "Totals (CE/PE)", "value": "totals"}]
     if mode == "options":
+        if asof == "ghost":                    # practice: pin to the ghost clock/day
+            date, asof = _ghost_ctx(date)
         asof_iso = f"{date}T{asof}:00+05:30" if (asof and asof != "full" and date) else None
         anchor, ks = footprint_chart.atm_strikes(sym or "NSE:NIFTY50-INDEX", date=date or None,
                                                  n=10, expiry=expiry or "weekly",
@@ -3400,6 +3409,8 @@ def _update_charts(mode, leg, strike, expiry, sym, tf, asof, date, sel, _tick):
         raise PreventUpdate
     sym, tf, date = sym or "NSE:NIFTY50-INDEX", int(tf or 15), date or None
     expiry = expiry or "weekly"
+    if asof == "ghost":                        # practice: pin to the ghost clock/day
+        date, asof = _ghost_ctx(date)          # (else empty date → full day = future leak)
     asof_iso = f"{date}T{asof}:00+05:30" if (asof and asof != "full" and date) else None
     if mode == "futures":
         return _futures_fig(sym, tf, asof_value=asof_iso, date=date, leg=leg or "near")
@@ -3960,15 +3971,52 @@ def _scout_row(r, mem=None, today=None, live=True):
                            "borderRadius": "5px", "padding": "5px 10px", "marginBottom": "4px"})
 
 
-def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None):
+# ── GHOST-LIVE practice mode ─────────────────────────────────────────────────────
+# Replay a captured past session pinned to TODAY'S wall clock: at 10:42 on a closed
+# Saturday the charts/scout show that day AS OF 10:42, advancing on the normal refresh
+# tick — paper-trade practice that feels live. Purely a READ-side view: nothing is
+# written (the alert poller / scout-seen / calibration all key off the real today),
+# so there is nothing to clean up afterwards.
+def _ghost_ctx(date):
+    """(day, 'HH:MM') for ghost mode. Day = the chosen past day, else the most recent
+    captured session before today. Clock = now clamped to [09:15, 15:30] — after the
+    real 15:30 the whole day is visible and verify grades unlock (review phase)."""
+    from core.constants import LIVE_DIR
+    today = datetime.datetime.now(IST).date().isoformat()
+    day = date if (date and date != today) else None
+    if day is None:
+        caps = sorted(p.name[:10] for p in LIVE_DIR.glob("*_ticks.parquet")
+                      if p.name[:10] < today and p.stat().st_size > 200_000)
+        day = caps[-1] if caps else today
+    now = datetime.datetime.now(IST).time()
+    t = max(datetime.time(9, 15), min(now, datetime.time(15, 30)))
+    return day, f"{t.hour:02d}:{t.minute:02d}"
+
+
+def _ghost_done():
+    """True once the real wall clock passes 15:30 — practice over, grades unlock."""
+    return datetime.datetime.now(IST).time() >= datetime.time(15, 30)
+
+
+def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=False):
     import intraday_scout as scout
     rows = scout.scan(int(tf_min or 15), date, as_of_dt)
+    # PRACTICE: the verify line grades t→t+H against the FULL captured file — on a
+    # past day that is the future. Blank it while the ghost session runs so the user
+    # can't peek; after the real 15:30 the grades unlock and the day self-scores.
+    if practice and not _ghost_done():
+        for r in rows:
+            r["verify"] = None
     # Overlay the live trade brain ONLY for the live 15m view (the alert detector that
     # fills scout-seen scans at 15m). On replay / a different TF the per-bar scan is the
     # honest source, so no overlay.
     seen = seen if (live and int(tf_min or 15) == 15) else {}
     today = datetime.datetime.now(IST).date().isoformat()
     when = ("LIVE" if live else
+            f"👻 GHOST {date} @ {as_of_dt:%H:%M} — practice, future hidden" if
+            (practice and as_of_dt and not _ghost_done()) else
+            f"👻 GHOST {date} @ {as_of_dt:%H:%M} — session over, graded" if
+            (practice and as_of_dt) else
             f"replay @ {as_of_dt:%H:%M}" if as_of_dt else f"{date} full day")
     n_trade = sum(1 for r in rows if r.get("has_data") and r["verdict"].startswith("TRADE"))
     hits = sum(1 for r in rows if r.get("verify") and r["verify"]["dir_hit"])
@@ -4026,7 +4074,11 @@ def _update_charts_scout(tf, asof, date, sel, _tick, seen):
         raise PreventUpdate
     today = datetime.datetime.now(IST).date().isoformat()
     live = False
-    if asof and asof != "full":                       # explicit Replay minute
+    practice = (asof == "ghost")
+    if practice:                                       # GHOST-LIVE practice session
+        day, hhmm = _ghost_ctx(date)
+        as_of_dt = datetime.datetime.fromisoformat(f"{day}T{hhmm}:00+05:30")
+    elif asof and asof != "full":                     # explicit Replay minute
         day = date or today
         try:
             as_of_dt = datetime.datetime.fromisoformat(f"{day}T{asof}:00+05:30")
@@ -4037,7 +4089,8 @@ def _update_charts_scout(tf, asof, date, sel, _tick, seen):
     else:                                              # LIVE now
         day, as_of_dt, live = today, datetime.datetime.now(IST), True
     try:
-        return _charts_scout_panel(tf, day, as_of_dt, live=live, seen=seen)
+        return _charts_scout_panel(tf, day, as_of_dt, live=live, seen=seen,
+                                   practice=practice)
     except Exception as exc:
         return _recon_note(f"Scout unavailable ({type(exc).__name__}: {exc}).")
 
@@ -4582,6 +4635,8 @@ def _update_charts_recon(mode, sym, asof, date, sel):
     if mode == "futures":
         return ""        # positioning map is an options-chain read
     sym, date = sym or "NSE:NIFTY50-INDEX", date or None
+    if asof == "ghost":                        # practice: pin to the ghost clock/day
+        date, asof = _ghost_ctx(date)
     as_of_dt = None
     if asof and asof != "full" and date:
         try:
