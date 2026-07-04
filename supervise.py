@@ -127,11 +127,16 @@ def _other_supervisors() -> list[int]:
              "-ErrorAction SilentlyContinue "
              "| ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }"],
             capture_output=True, text=True, timeout=20)
+        # Exclude SELF and our PARENT: the .venv python.exe is a LAUNCHER STUB that
+        # spawns the real interpreter as its child — both carry "supervise.py" in
+        # their cmdline (the two-PID-one-instance trap). Counting the parent made
+        # every fresh launch see "another supervisor" (its own stub) and exit.
+        me = {os.getpid(), os.getppid()}
         pids = []
         for line in (r.stdout or "").splitlines():
             if "supervise.py" in line:
                 head = line.strip().split()
-                if head and head[0].isdigit() and int(head[0]) != os.getpid():
+                if head and head[0].isdigit() and int(head[0]) not in me:
                     pids.append(int(head[0]))
         return pids
     except Exception:
