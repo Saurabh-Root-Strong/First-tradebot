@@ -227,14 +227,37 @@ def severe_tag(e: "NewsEvent") -> "str | None":
 
 
 # ── Scoring ──────────────────────────────────────────────────────────────────────
+# ROUTINE-FILING GUARD — paperwork that must NEVER score as a market-moving event.
+# The SAST "Disclosure under SEBI (Substantial Acquisition of Shares and Takeovers)
+# Regulations" firehose (Reg 29/30/31 promoter/trust shareholding disclosures)
+# matched the Acquisition patterns on the word "Takeover"/"Acquisition" and flooded
+# the tape at +7 (2026-07-03: Welspun family trusts, Uday S Kotak's personal
+# disclosure, a dozen holding companies). Likewise scrutinizer reports / voting
+# results / meeting proceedings are procedural outcomes of an ALREADY-KNOWN story
+# (they matched "NCLT" → Credit downgrade −8 on every re-filing). Checked FIRST,
+# short-circuits the score tables.
+_ROUTINE = _rx(
+    r"disclosure[s]?\s+under\s+(the\s+)?(reg(ulation)?[\s.]*\d+.{0,20})?sebi[\s(]*(substantial\s+acquisition|takeover)",
+    r"sebi\s+takeover\s+regulations",
+    r"regulation\s+29\s*\(", r"regulation\s+3[01]\s*\(", r"\bsast\b",
+    r"scrutini[sz]er'?s?\s+report", r"voting\s+results",
+    r"proceedings\s+of\s+the\s+.{0,50}meeting",
+    r"intimation\s+of\s+.{0,30}meeting", r"newspaper\s+(publication|advertisement)",
+)
+
+
 def score_text(text: str) -> "tuple[str, int, str]":
     """Score a headline/announcement → (event_type, score, scope).
 
-    Deterministic rule-book: scan every pattern, keep the match with the largest
-    |score| (the most market-moving interpretation). Returns ("Uncategorised", 0,
-    STOCK) when nothing matches — uncategorised events are stored but never alert.
+    Deterministic rule-book: routine-filing guard first (procedural paperwork →
+    score 0, never alerts), then scan every pattern and keep the match with the
+    largest |score| (the most market-moving interpretation). Returns
+    ("Uncategorised", 0, STOCK) when nothing matches — uncategorised events are
+    stored but never alert.
     """
     text = text or ""
+    if _ROUTINE.search(text):
+        return ("Routine filing", 0, STOCK)
     best: "tuple[str, int, str] | None" = None
     for rx, etype, sc, scope in _ALL_TABLES:
         if rx.search(text) and (best is None or abs(sc) > abs(best[1])):
@@ -471,10 +494,18 @@ def _load_day(date: "str | None" = None) -> "list[NewsEvent]":
     for _, r in df.iterrows():
         ts = pd.to_datetime(r["ts"])
         ts = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else r["ts"]
+        etype, sc = str(r["event_type"]), int(r["score"])
+        # RE-SCORE stock filings with the CURRENT rule-book — the mirror stores the
+        # capture-time classification, so a classifier fix (e.g. the SAST routine-
+        # filing guard) must apply retroactively or past days keep displaying the
+        # junk flood. RBI/MACRO rows keep their stored score (the macro-surprise
+        # injector's score is not derivable from the headline).
+        if str(r["source"]) == "NSE" and str(r["scope"]) == STOCK:
+            etype, sc, _scope = score_text(str(r["headline"]))
         out.append(NewsEvent(
             ts=ts, source=str(r["source"]), scope=str(r["scope"]), ticker=str(r.get("ticker") or ""),
-            headline=str(r["headline"]), event_type=str(r["event_type"]),
-            score=int(r["score"]), url=str(r.get("url") or ""), uid=str(r.get("uid") or "")))
+            headline=str(r["headline"]), event_type=etype,
+            score=sc, url=str(r.get("url") or ""), uid=str(r.get("uid") or "")))
     return out
 
 
@@ -627,7 +658,20 @@ def _selftest() -> None:
         ("Q4 profit misses estimates, guidance cut", "Earnings miss", -7),
         ("RBI keeps repo rate unchanged; dovish Fed expected", "Dovish Fed", 6),
         ("USFDA issues Form 483 with 5 observations", "USFDA observation", -7),
-        ("Just an ordinary intimation of board meeting", "Uncategorised", 0),
+        ("Just an ordinary intimation of board meeting", "Routine filing", 0),
+        # SAST paperwork must NOT read as an Acquisition (the 2026-07-03 tape flood)
+        ("Disclosure under SEBI Takeover Regulations — Welspun Group Master Trust "
+         "has Submitted to the Exchange", "Routine filing", 0),
+        ("Disclosure under Regulation 29(2) of SEBI (Substantial Acquisition of "
+         "Shares and Takeovers) Regulations, 2011", "Routine filing", 0),
+        # procedural insolvency-meeting outcomes must NOT re-fire Credit downgrade
+        ("Voting results and the Consolidated Scrutinizer's Report on the NCLT "
+         "convened Meeting", "Routine filing", 0),
+        # but a REAL acquisition / a REAL insolvency admission still score
+        ("Board approves acquisition of 100% stake in ABC Chemicals Ltd",
+         "Acquisition", 7),
+        ("NCLT admits company for Corporate Insolvency Resolution Process",
+         "Credit downgrade", -8),
     ]
     ok = 0
     for text, want_type, want_score in cases:

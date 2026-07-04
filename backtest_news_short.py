@@ -57,6 +57,14 @@ def load_events(score_th: int, side: str = "neg") -> pd.DataFrame:
         return pd.DataFrame()
     ev = pd.concat(rows, ignore_index=True)
     ev["ts"] = pd.to_datetime(ev["ts"], utc=True).dt.tz_convert("Asia/Kolkata")
+    # RE-SCORE stored headlines with the CURRENT rule-book — classifier fixes
+    # (e.g. the SAST routine-filing guard that killed the fake "Acquisition +7"
+    # flood) apply retroactively, so the study always measures today's classifier,
+    # not the one that happened to be deployed at capture time.
+    import news_events as ne
+    rescored = ev["headline"].map(ne.score_text)
+    ev["event_type"] = rescored.map(lambda t: t[0])
+    ev["score"] = rescored.map(lambda t: t[1])
     keep = (ev["score"] <= score_th) if side == "neg" else (ev["score"] >= score_th)
     ev = ev[(ev["scope"] == "STOCK") & keep & ev["ticker"].astype(bool)]
     ev["day"] = ev["ts"].dt.tz_localize(None).dt.normalize()   # naive midnight, matches bhavcopy dates
