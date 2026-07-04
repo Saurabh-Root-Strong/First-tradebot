@@ -4408,13 +4408,20 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
     Output("alert-badge", "style"),
     Input("setup-tick",   "n_intervals"),
     Input("scout-alerts", "data"),
+    State("charts-asof",  "value"),
 )
-def _alert_badge(_n, alerts):
+def _alert_badge(_n, alerts, asof):
     # Count the CANONICAL deduped log for today — the SAME source the panel shows, so
     # the badge and the list always agree (the browser localStorage list was dup-
     # inflated). Fall back to the browser list only very early before the mirror exists.
     today = datetime.datetime.now(IST).date().isoformat()
-    n = len(_alerts_from_mirror(today))
+    if asof == "ghost":                    # practice: badge counts the ghost day's
+        day, hhmm = _ghost_ctx(None)       # alerts up to the ghost clock
+        recs = _alerts_from_mirror(day)
+        n = len([a for a in recs if str(a.get("t", ""))[:5] <= hhmm]
+                if not _ghost_done() else recs)
+    else:
+        n = len(_alerts_from_mirror(today))
     if not n:
         n = len([a for a in (alerts or []) if a.get("d", today) == today])
     base = {"fontSize": "0.55rem", "fontWeight": "800", "color": "#0a0f1a",
@@ -4493,8 +4500,9 @@ def _alerts_from_mirror(date):
     Input("sel-sym",      "data"),
     Input("news-date",    "data"),
     Input("alert-hour",   "value"),
+    State("charts-asof",  "value"),
 )
-def _render_alerts(_tick, alerts, sel, date, hour):
+def _render_alerts(_tick, alerts, sel, date, hour, asof):
     # Re-reads the canonical log on the 30s setup-tick (same cadence as the badge), so a
     # newly fired alert appears at the TOP of the list automatically — the panel tracks
     # the system-of-record on a timer, NOT the browser's parallel detection (which could
@@ -4504,10 +4512,18 @@ def _render_alerts(_tick, alerts, sel, date, hour):
         raise PreventUpdate
     today = datetime.datetime.now(IST).date().isoformat()
     date = date or today
+    # GHOST practice: replay the ghost day's ARCHIVED alerts up to the ghost clock —
+    # each alert "fires" in the panel at the minute it fired that day; the afternoon
+    # stays hidden (future). The canonical log is read-only here, nothing is written.
+    ghost_hhmm = None
+    if asof == "ghost":
+        date, ghost_hhmm = _ghost_ctx(date)
     # Source of truth = the canonical server-side log (archived, device-independent).
     # Fall back to the per-browser localStorage list only for TODAY when the mirror is
     # not yet written (very start of session / pure replay box).
     recs = _alerts_from_mirror(date)
+    if ghost_hhmm and not _ghost_done():
+        recs = [a for a in recs if str(a.get("t", ""))[:5] <= ghost_hhmm]
     if not recs and date == today:
         recs = [a for a in (alerts or []) if a.get("d", today) == today]
 
