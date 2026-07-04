@@ -155,6 +155,9 @@ class NewsEvent:
     score: int                      # impact score, −10..+10
     url: str = ""
     uid: str = field(default="")    # stable dedupe id
+    px: float = 0.0                 # stock LTP at CAPTURE time (0 = not fetched)
+    chg: float = 0.0                # % change vs prev close at capture — the "how much
+                                    # has it ALREADY moved" gate (entry-gap buckets)
 
     @property
     def bias(self) -> Bias:
@@ -363,6 +366,37 @@ def fetch_nse_announcements() -> "list[NewsEvent]":
     return [e for e in (_row_to_event(d) for d in _nse_get(_NSE_ANN)) if e]
 
 
+_NSE_QUOTE = "https://www.nseindia.com/api/quote-equity?symbol="
+
+
+def _nse_quote(sym: str) -> "tuple[float, float]":
+    """(LTP, %chg vs prev close) for one NSE equity at this instant — the entry-gap
+    gate for a fresh severe event. NSE API first (fails 403 from most client
+    fingerprints — Akamai gates quote-equity harder than announcements), then
+    yfinance <SYM>.NS (works everywhere, ~1s warm). (0, 0) on total failure —
+    the badge then simply shows without a gap condition."""
+    global _nse_session
+    try:
+        if _nse_session is None:
+            _nse_session = _nse_new_session()
+        r = _nse_session.get(_NSE_QUOTE + requests.utils.quote(sym), timeout=8)
+        if r.status_code == 200:
+            p = (r.json() or {}).get("priceInfo") or {}
+            px, ch = float(p.get("lastPrice") or 0.0), float(p.get("pChange") or 0.0)
+            if px:
+                return px, ch
+    except Exception:
+        pass
+    try:
+        import yfinance as yf
+        fi = yf.Ticker(f"{sym}.NS").fast_info
+        px = float(fi["last_price"] or 0.0)
+        pc = float(fi["previous_close"] or 0.0)
+        return (px, (px / pc - 1.0) * 100.0) if (px and pc) else (0.0, 0.0)
+    except Exception:
+        return 0.0, 0.0
+
+
 def backfill_nse(days: int = 14) -> dict:
     """Pull NSE announcements over the last `days` (date-range API) and write per-day
     mirrors bucketed by each filing's own date — so the date-nav has real history to
@@ -449,6 +483,16 @@ def _persist_for(date: str, events: "list[NewsEvent]") -> int:
         fresh = [e for e in events if e.uid not in seen]
         if not fresh:
             return 0
+        # Entry-gap gate: stamp each NEW market-moving stock event with the LIVE
+        # price + %chg at capture — "how much has it already moved" decides whether
+        # the event is still actionable (measured: barely-reacted carries the drift;
+        # ≥3% moved = consumed). TODAY only (a historical backfill at today's price
+        # would be a lie); one quote call per fresh severe event, quota-trivial.
+        if date == _today():
+            for e in fresh:
+                if (e.source == "NSE" and e.scope == STOCK and e.ticker
+                        and abs(e.score) >= 5 and not e.px):
+                    e.px, e.chg = _nse_quote(e.ticker)
         df = pd.DataFrame([asdict(e) for e in fresh])
         df["scope"] = df["scope"].astype(str)
         if old is not None:
@@ -505,7 +549,11 @@ def _load_day(date: "str | None" = None) -> "list[NewsEvent]":
         out.append(NewsEvent(
             ts=ts, source=str(r["source"]), scope=str(r["scope"]), ticker=str(r.get("ticker") or ""),
             headline=str(r["headline"]), event_type=etype,
-            score=sc, url=str(r.get("url") or ""), uid=str(r.get("uid") or "")))
+            score=sc, url=str(r.get("url") or ""), uid=str(r.get("uid") or ""),
+            # NaN-guard: rows persisted before px/chg existed come back NaN after a
+            # concat-append (NaN is truthy — `NaN or 0` stays NaN and renders ₹nan)
+            px=float(r["px"]) if pd.notna(r.get("px")) else 0.0,
+            chg=float(r["chg"]) if pd.notna(r.get("chg")) else 0.0))
     return out
 
 

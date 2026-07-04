@@ -719,44 +719,68 @@ def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html
             tm = pd.Timestamp(e.get("ts")).strftime("%H:%M")
         except Exception:
             tm = "--:--"
-        # Severe-negative discipline badge (fraud/insolvency/audit-exit class).
-        # Copy is the MEASURED verdict (backtest_news_short.py): the drift lives in
-        # non-F&O names with no short route → discipline tag, not a short signal.
+        # Severe-event discipline badge, GAP-CONDITIONED when the capture-time move
+        # (chg = % vs prev close at news) is known. Entry-gap buckets are MEASURED
+        # (backtest_news_short.py): barely-reacted carries the drift both sides;
+        # ≥3% already moved = consumed (pos: −0.84% +1d t=−2.1; neg: bounces).
         sev = e.get("severe")
+        chg = float(e.get("chg") or 0.0)
+        has_chg = abs(chg) > 1e-9
         sev_blk = None
-        if sev == "AVOID":
-            sev_blk = html.Span("⛔ AVOID/EXIT", title=(
-                "Severe negative event. Measured (5wk): non-F&O severe negs fall "
-                "−0.85% next day, 67% down — but NO practical short route (no "
-                "futures; SLB 1-month-min; circuit/T2T risk). Discipline tag: don't "
-                "buy this dip, exit longs. NOT a validated short signal."),
-                style={"color": "#f87171", "fontSize": "0.48rem", "fontWeight": "800",
-                       "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
-        elif sev == "FUT":
-            sev_blk = html.Span("⚠ F&O·no edge", title=(
-                "Severe negative on an F&O name — futures-shortable in principle, "
-                "BUT measured (5wk, n=7): these went UP +0.86% next day (big names "
-                "get dip-bought). Short NOT supported by the data yet."),
-                style={"color": "#fbbf24", "fontSize": "0.48rem", "fontWeight": "800",
-                       "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
-        elif sev == "POS":
-            sev_blk = html.Span("🚀 don't chase", title=(
-                "Big positive event (real one — SAST/routine filings are filtered "
-                "out). Measured on the CLEAN sample (5wk, n=302): buying the NEXT "
-                "OPEN still loses −0.19% +1d, 56% down. The pop happens AT the open "
-                "('large order win' pops +0.5% day 1, 64% up — then gives it back, "
-                "−1.6% by day 5). Early entry can catch the pop; chasing after the "
-                "move buys the fade. News real, late entry isn't."),
-                style={"color": "#4ade80", "fontSize": "0.48rem", "fontWeight": "800",
-                       "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
-        elif sev == "POS_FUT":
-            sev_blk = html.Span("⚡ priced-in F&O", title=(
-                "Big positive on an F&O name — measured on the CLEAN sample (5wk, "
-                "n=85): −0.42% +1d (t=−2.3), −0.58% +3d (t=−2.0) — significantly "
-                "NEGATIVE. Large caps price public news instantly; chasing them "
-                "after good news reliably loses. Context only."),
-                style={"color": "#34d399", "fontSize": "0.48rem", "fontWeight": "800",
-                       "width": "86px", "letterSpacing": "0.03em", "cursor": "help"})
+        if sev in ("AVOID", "FUT"):
+            if sev == "AVOID":
+                label, clr_b = "⛔ AVOID/EXIT", "#f87171"
+                tt = ("Severe negative event. Measured (5wk): non-F&O severe negs fall "
+                      "−0.85% next day, 67% down — but NO practical short route (no "
+                      "futures; SLB 1-month-min; circuit/T2T risk). Don't buy this "
+                      "dip, exit longs. NOT a validated short signal.")
+            else:
+                label, clr_b = "⚠ F&O·no edge", "#fbbf24"
+                tt = ("Severe negative on an F&O name — futures-shortable in principle, "
+                      "BUT measured: these get dip-BOUGHT (+0.86% next day, n=7 thin). "
+                      "Short NOT supported by the data yet.")
+            if has_chg and chg >= -1:
+                label = f"⛔ unreacted {chg:+.1f}%"
+                tt += (" GAP: barely reacted at capture — the MEASURED danger bucket "
+                       "(unreacted severe negs fall −0.77% next day, t=−2.0). The "
+                       "avoid/exit call is at its freshest.")
+            elif has_chg and chg <= -3:
+                label = f"⛔ smashed {chg:+.1f}%"
+                tt += (" GAP: already down ≥3% at capture — reaction consumed; "
+                       "late panic exit/short historically bounces against you "
+                       "(−1..−3% bucket bounced +1.3% next day, n=5 thin).")
+            elif has_chg:
+                label = f"⛔ {chg:+.1f}% moved"
+        elif sev in ("POS", "POS_FUT"):
+            if sev == "POS":
+                label, clr_b = "🚀 don't chase", "#4ade80"
+                tt = ("Big positive event (SAST/routine filings filtered out). "
+                      "Measured (5wk, n=302): buying the next open loses −0.19% +1d "
+                      "on average; 'large order win' pops +0.5% day 1 then fades "
+                      "−1.6% by day 5. Entry timing decides everything.")
+            else:
+                label, clr_b = "⚡ priced-in F&O", "#34d399"
+                tt = ("Big positive on an F&O name — measured (n=85): −0.42% +1d "
+                      "(t=−2.3), −0.58% +3d (t=−2.0), significantly NEGATIVE. Large "
+                      "caps price public news instantly. Context only.")
+            if has_chg and chg <= 1 and sev == "POS":
+                label = f"🟢 unpriced {chg:+.1f}%"
+                tt += (" GAP: barely moved at capture — the ONLY bucket with positive "
+                       "forward drift (+0.5% +3d, +0.7% +5d, t≈1.6, n=204): short-term "
+                       "long WATCH. Unvalidated lean, size accordingly.")
+            elif has_chg and chg >= 3:
+                label = f"🔴 popped {chg:+.1f}%"
+                tt += (" GAP: already up ≥3% at capture — the news is CONSUMED "
+                       "(measured −0.84% next day t=−2.1, −1.27% +5d, 74% down). "
+                       "No purpose purchasing now.")
+            elif has_chg:
+                label = f"🚀 {chg:+.1f}% moved"
+                tt += (" GAP: +1..3% already — middle bucket measured flat-to-negative; "
+                       "no edge left.")
+        if sev:
+            sev_blk = html.Span(label, title=tt, style={
+                "color": clr_b, "fontSize": "0.48rem", "fontWeight": "800",
+                "width": "104px", "letterSpacing": "0.03em", "cursor": "help"})
         rows.append(html.Div([
             html.Span(tm, style={
                 "color": "#475569", "fontSize": "0.5rem", "width": "34px",
@@ -771,6 +795,13 @@ def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html
             html.Span((e["ticker"] or "—")[:11], style={
                 "color": "#cbd5e1", "fontSize": "0.55rem", "fontWeight": "700",
                 "width": "78px", **MONO}),
+            # LTP at capture (the price you'd see when the news hit) — 0/absent on
+            # rows captured before this field existed or on quote failure
+            html.Span(f"₹{e['px']:,.1f}" if e.get("px") else "", title=(
+                "stock price at the moment the news was captured"),
+                style={"color": "#94a3b8", "fontSize": "0.5rem", "width": "58px",
+                       "textAlign": "right", "marginRight": "6px", "cursor": "help",
+                       **MONO}),
             html.Span(e["event_type"], style={
                 "color": clr, "fontSize": "0.52rem", "width": "120px"}),
             # repeat count — same (ticker, event) re-filed N times; first shown, rest

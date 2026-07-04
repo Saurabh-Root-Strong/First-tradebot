@@ -29,6 +29,8 @@ import glob
 import sys
 from pathlib import Path
 
+import datetime as _dt
+
 import numpy as np
 import pandas as pd
 
@@ -79,7 +81,7 @@ def load_prices(symbols: list[str]) -> pd.DataFrame:
     con = duckdb.connect(str(DCM_DB), read_only=True)
     ph = ",".join("?" * len(symbols))
     px = con.execute(
-        f"SELECT trade_date, symbol, series, open_price, close_price "
+        f"SELECT trade_date, symbol, series, prev_close, open_price, close_price "
         f"FROM daily_data WHERE symbol IN ({ph}) "
         f"AND series IN ('EQ','BE','BZ') ORDER BY trade_date", symbols).df()
     fno = {r[0] for r in con.execute(
@@ -115,9 +117,22 @@ def fwd_returns(ev: pd.DataFrame, px: pd.DataFrame) -> pd.DataFrame:
         entry = g.loc[d_entry, "open_price"]
         if not entry or entry != entry:
             continue
+        # ENTRY GAP — how much the stock ALREADY moved between the last pre-news
+        # close and your first fillable price (next open). News during market hours
+        # → reference = that day's prev_close (the pre-news close); news after
+        # 15:30 → reference = that day's close. This is the user's "already up 5%
+        # = no purpose buying / only up 1-2% = maybe unpriced" filter, measured.
+        t = e["ts"].time()
+        ref_day = e["day"] if (t >= _dt.time(15, 30) or t <= _dt.time(9, 0)) else None
+        if ref_day is not None and ref_day in g.index:
+            ref_px = g.loc[ref_day, "close_price"]
+        else:
+            ref_px = g.loc[e["day"], "prev_close"] if e["day"] in g.index else (
+                g.loc[d_entry, "prev_close"])
+        gap = (entry / ref_px - 1.0) * 100.0 if (ref_px and ref_px == ref_px) else np.nan
         rec = {"ticker": e["ticker"], "event_type": e["event_type"],
                "score": e["score"], "day": e["day"], "entry_day": d_entry,
-               "entry": entry,
+               "entry": entry, "gap_entry": gap,
                "fno": e["ticker"] in px.attrs["fno"],
                "series": g.loc[d_entry, "series"]}
         fwd = cal[cal >= d_entry]
@@ -176,6 +191,22 @@ def main() -> None:
     block("non-F&O", r[~r["fno"]])
     for et, g in r.groupby("event_type"):
         block(f"[{et}]", g)
+    # ── ENTRY-GAP conditioning (the "already moved?" filter) ─────────────────────
+    # gap_entry = pre-news close → your entry open. Thesis: a big gap = the news is
+    # consumed (no purpose entering); a small gap = possibly unpriced.
+    print("\n  " + "─" * 70)
+    print("  ENTRY-GAP BUCKETS — how much it already moved by your first fill")
+    gp = r.dropna(subset=["gap_entry"])
+    if neg:
+        cuts = [("gap >= -1% (barely reacted)", gp[gp.gap_entry >= -1]),
+                ("-3% < gap < -1%", gp[(gp.gap_entry < -1) & (gp.gap_entry > -3)]),
+                ("gap <= -3% (already smashed)", gp[gp.gap_entry <= -3])]
+    else:
+        cuts = [("gap <= +1% (barely reacted)", gp[gp.gap_entry <= 1]),
+                ("+1% < gap < +3%", gp[(gp.gap_entry > 1) & (gp.gap_entry < 3)]),
+                ("gap >= +3% (already popped)", gp[gp.gap_entry >= 3])]
+    for name, g in cuts:
+        block(name, g)
     print(f"\n  join rate: {len(r)}/{len(sev)} severe events priced  ·  "
           f"F&O members: {int(r['fno'].sum())}  ·  BE/BZ (T2T/circuit): "
           f"{(r['series'] != 'EQ').sum()}")
