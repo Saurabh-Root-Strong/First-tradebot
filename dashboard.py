@@ -3868,8 +3868,9 @@ def _ghost_help():
                 "morning is already history. Full-day practice = start at 09:15."),
             _ln("• ALERTS replay too: each alert fires at the minute it really fired that "
                 "day (bell badge counts up with your clock)."),
-            _ln("• IGNORE the top ticker and the left FOOTPRINT panel — those are live-"
-                "only and show today's dead feed on a weekend.", "#fbbf24"),
+            _ln("• The cockpit + left FOOTPRINT sidebar follow the ghost clock too "
+                "(tagged 👻). Only the TOP TICKER stays live — ignore its weekend "
+                "numbers.", "#fbbf24"),
             _ln("• Nothing is written anywhere — no cleanup, the next live session is "
                 "untouched. Weekends/holidays open in ghost automatically; a trading "
                 "day always boots LIVE."),
@@ -5702,16 +5703,19 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None, leg="near") -> "g
     return _crosshair(fig)
 
 
-def _render_intraday_tf(sym, asof_value=None, snap=None, clickable=False) -> "html.Div":
+def _render_intraday_tf(sym, asof_value=None, snap=None, clickable=False,
+                        date=None) -> "html.Div":
     """Per-timeframe OI·Price·Volume matrix + divergence flags for one index.
     Shows whether each 5/10/15/60-min frame is fresh buildup or positions CLOSING,
     so a rally on closing (distribution) or hidden call-writing is visible early.
     asof_value (Trade-Book replay) reconstructs the read at a past instant; `snap`
-    is the shared MarketSnapshot so the footprint isn't recomputed per panel."""
+    is the shared MarketSnapshot so the footprint isn't recomputed per panel.
+    `date` = replay a PAST day's mirror (ghost practice) instead of today's."""
     if not _ITF_AVAILABLE:
         return html.Div()
     try:
-        r = snap.footprint(sym) if snap is not None else intraday_tf.analyze(sym, as_of=_parse_asof(asof_value))
+        r = (snap.footprint(sym) if snap is not None else
+             intraday_tf.analyze(sym, date=date, as_of=_parse_asof(asof_value)))
     except Exception:
         return html.Div("—", style={"color": "#475569", "fontSize": "0.55rem"})
     if not r.get("has_data"):
@@ -5886,6 +5890,14 @@ def update_intraday_tf(sym, _):
     # Route through the canonical snapshot so the sidebar footprint shares the
     # Trade Book's one-instant computation (live, ~1-tick TTL) instead of a
     # redundant intraday_tf.analyze recompute.
+    # Weekend/holiday: the live snapshot is the dead static-quote feed — follow the
+    # ghost-practice clock instead so the sidebar matches the CHARTS replay.
+    now = datetime.datetime.now(IST)
+    if not is_trading_day(now):
+        day, hhmm = _ghost_ctx(None)
+        if day != now.date().isoformat():
+            return _render_intraday_tf(sym or "NSE:NIFTY50-INDEX",
+                                       f"{day}T{hhmm}:00+05:30", date=day)
     snap = get_snapshot(None) if _SNAPSHOT_OK else None
     return _render_intraday_tf(sym or "NSE:NIFTY50-INDEX", None, snap)
 
@@ -6408,6 +6420,15 @@ def _render_cockpit(date, asof_str=""):
     date_arg = None if (not date or date == today) else date
     as_of = _parse_asof_hhmm(date, asof_str)
     live = date_arg is None and as_of is None
+    # Weekend/holiday "live" = the dead static-quote feed → junk bands (±3%+) and
+    # phantom gap flags that LOOK tradeable. Follow the ghost-practice clock instead
+    # (same day/instant the CHARTS section replays) so the whole page tells one story.
+    ghost = False
+    if live and not is_trading_day(_dt.datetime.now(IST)):
+        _gd, _ghh = _ghost_ctx(None)
+        if _gd != today:
+            date_arg, live, ghost = _gd, False, True
+            as_of = _dt.datetime.fromisoformat(f"{_gd}T{_ghh}:00+05:30")
     rows, carries = [], []
     for sym in INDEX_SYMBOLS:
         try:
@@ -6515,6 +6536,8 @@ def _render_cockpit(date, asof_str=""):
     ], style={"display": "inline-block", "marginLeft": "10px", "verticalAlign": "middle"})
     if live:
         _tag = "live"
+    elif ghost:
+        _tag = f"👻 ghost {as_of:%Y-%m-%d} @ {as_of:%H:%M} — practice clock"
     elif as_of is not None:
         _tag = f"replay {as_of:%Y-%m-%d %H:%M} (band as it stood then)"
     else:
