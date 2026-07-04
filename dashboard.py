@@ -1788,12 +1788,13 @@ app.layout = dbc.Container([
                                     "value": f"{h:02d}:{m:02d}"}
                                    for h in range(9, 16) for m in range(60)
                                    if (9, 15) <= (h, m) <= (15, 30)],
-                                # Weekend/holiday: there IS no live session, so open
-                                # straight in ghost practice (last captured day on
-                                # today's clock). A trading day still defaults to live.
-                                value=("ghost" if not is_trading_day(
-                                    datetime.datetime.now(IST)) else None),
-                                clearable=True, placeholder="live",
+                                # Default LIVE. The weekend ghost default is applied
+                                # per PAGE LOAD by _ghost_boot (a static layout is
+                                # built once at process start — baking the day check
+                                # in here goes stale when a Saturday-started process
+                                # survives into Monday and would boot ghost on a
+                                # LIVE trading day).
+                                value=None, clearable=True, placeholder="live",
                                 style={"fontSize": "0.72rem", "minWidth": "110px"}),
                         ], style={"display": "flex", "alignItems": "center",
                                   "gap": "6px"}),
@@ -4004,6 +4005,20 @@ def _ghost_done():
     return datetime.datetime.now(IST).time() >= datetime.time(15, 30)
 
 
+@app.callback(Output("charts-asof", "value"), Input("url", "pathname"),
+              State("charts-asof", "value"))
+def _ghost_boot(_path, cur):
+    """Weekend/holiday page load → default the Replay picker to ghost practice.
+    Evaluated PER LOAD (not baked into the static layout, which is built once at
+    process start and would go stale across a weekend→Monday process lifetime).
+    A trading day never touches the picker — live stays the default; an explicit
+    user choice (any non-None value) is never overridden."""
+    from dash import no_update
+    if cur is None and not is_trading_day(datetime.datetime.now(IST)):
+        return "ghost"
+    return no_update
+
+
 def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=False):
     import intraday_scout as scout
     rows = scout.scan(int(tf_min or 15), date, as_of_dt)
@@ -4370,7 +4385,11 @@ def _scout_alert_poller():
     while True:
         try:
             now = datetime.datetime.now(IST)
-            if datetime.time(9, 15) <= now.time() <= datetime.time(15, 30):
+            # trading-day gate: a weekend/holiday process otherwise scans the dead
+            # static quote feed every 30s with persist=True — one feed glitch away
+            # from writing junk alerts into the canonical log on a non-session day.
+            if (is_trading_day(now)
+                    and datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
                 _scout_detect(_SCOUT_ALERT_STATE, now, persist=True)
         except Exception:
             pass
@@ -4394,7 +4413,8 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
     reads the canonical log, not this list. Decision-support only (arrow negative-EV)."""
     from dash.exceptions import PreventUpdate
     now = datetime.datetime.now(IST)
-    if not (datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
+    if not (is_trading_day(now)
+            and datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
         raise PreventUpdate
     seen = dict(seen or {})
     today = now.date().isoformat()
@@ -4415,15 +4435,16 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
     Input("setup-tick",   "n_intervals"),
     Input("scout-alerts", "data"),
     State("charts-asof",  "value"),
+    State("news-date",    "data"),
 )
-def _alert_badge(_n, alerts, asof):
+def _alert_badge(_n, alerts, asof, date):
     # Count the CANONICAL deduped log for today — the SAME source the panel shows, so
     # the badge and the list always agree (the browser localStorage list was dup-
     # inflated). Fall back to the browser list only very early before the mirror exists.
     today = datetime.datetime.now(IST).date().isoformat()
     if asof == "ghost":                    # practice: badge counts the ghost day's
-        day, hhmm = _ghost_ctx(None)       # alerts up to the ghost clock
-        recs = _alerts_from_mirror(day)
+        day, hhmm = _ghost_ctx(date)       # alerts up to the ghost clock — SAME day
+        recs = _alerts_from_mirror(day)    # resolution as the panel, so they agree
         n = len([a for a in recs if str(a.get("t", ""))[:5] <= hhmm]
                 if not _ghost_done() else recs)
     else:
