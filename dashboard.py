@@ -719,6 +719,9 @@ def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html
             tm = pd.Timestamp(e.get("ts")).strftime("%H:%M")
         except Exception:
             tm = "--:--"
+        carry = bool(e.get("carry"))
+        if carry:
+            tm = f"◂{tm}"          # filed YESTERDAY post-close — reaction window TODAY
         # Severe-event discipline badge, GAP-CONDITIONED when the capture-time move
         # (chg = % vs prev close at news) is known. Entry-gap buckets are MEASURED
         # (backtest_news_short.py): barely-reacted carries the drift both sides;
@@ -782,9 +785,14 @@ def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html
                 "color": clr_b, "fontSize": "0.48rem", "fontWeight": "800",
                 "width": "104px", "letterSpacing": "0.03em", "cursor": "help"})
         rows.append(html.Div([
-            html.Span(tm, style={
-                "color": "#475569", "fontSize": "0.5rem", "width": "34px",
-                "marginRight": "4px", **MONO}),
+            html.Span(tm, title=(
+                "filed YESTERDAY near/after the close — news that lands late moves "
+                "the NEXT session (desk rule), so its reaction window is TODAY"
+                if carry else ""),
+                style={"color": "#fbbf24" if carry else "#475569",
+                       "fontSize": "0.5rem", "width": "40px" if carry else "34px",
+                       "marginRight": "4px",
+                       "cursor": "help" if carry else "default", **MONO}),
             html.Span(f"{sc:+d}", style={
                 "color": clr, "fontWeight": "800", "fontSize": "0.7rem",
                 "width": "32px", "textAlign": "right", "marginRight": "8px",

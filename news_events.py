@@ -594,6 +594,27 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None,
     day = date or _today()
     evs = _load_day(day)
     alerts = [e for e in evs if abs(e.score) >= min_abs]
+    # ── OVERNIGHT CARRY-OVER (desk rule: news moves SAME day, or NEXT day when it
+    # lands near/after the close). A filing at 22:30 lives in yesterday's mirror,
+    # but its reaction window is TODAY — the morning tape must show it or the desk
+    # reads a blank tape while yesterday's post-close story gaps the open. Live
+    # today-tape only (a past-day review shows that day as it was).
+    carry_uids: "set[str]" = set()
+    if order == "time" and day == _today():
+        try:
+            import datetime as _dt2
+            from core.market_calendar import prev_trading_day
+            prev = prev_trading_day(_dt2.date.fromisoformat(day)).isoformat()
+            have = {e.uid for e in alerts}
+            cut = datetime.time(15, 0)
+            co = [e for e in _load_day(prev)
+                  if abs(e.score) >= min_abs and e.ts.time() >= cut
+                  and e.ts.date().isoformat() == prev      # not an even-older filing
+                  and e.uid not in have]
+            carry_uids = {e.uid for e in co}
+            alerts = co + alerts
+        except Exception:
+            carry_uids = set()
     reps: "dict[str, int]" = {}
     if dedup:
         alerts, reps = _dedup_stock(alerts)
@@ -613,7 +634,8 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None,
     return {
         "alerts": [asdict(e) | {"bias": e.bias.value, "bucket": e.bucket,
                                 "severe": severe_tag(e),
-                                "n_rep": reps.get(e.uid, 1)} for e in shown],
+                                "n_rep": reps.get(e.uid, 1),
+                                "carry": e.uid in carry_uids} for e in shown],
         "macro_bias": macro_bias, "macro_net": net,
         "by_scope": by_scope, "by_bucket": by_bucket,
         "n_total": len(evs), "n_alerts": len(alerts),
