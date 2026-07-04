@@ -726,6 +726,11 @@ def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html
         # (chg = % vs prev close at news) is known. Entry-gap buckets are MEASURED
         # (backtest_news_short.py): barely-reacted carries the drift both sides;
         # ≥3% already moved = consumed (pos: −0.84% +1d t=−2.1; neg: bounces).
+        # Tooltip language is deliberately SIMPLE — plain sentences, define F&O,
+        # say what to do. The measured numbers back the advice but don't lead it.
+        _FNO_DEF = ("(F&O stock = one of ~200 big companies where NSE allows "
+                    "futures & options trading — so it CAN be shorted, and it is "
+                    "large and liquid.) ")
         sev = e.get("severe")
         chg = float(e.get("chg") or 0.0)
         has_chg = abs(chg) > 1e-9
@@ -733,57 +738,65 @@ def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html
         if sev in ("AVOID", "FUT"):
             if sev == "AVOID":
                 label, clr_b = "⛔ AVOID/EXIT", "#f87171"
-                tt = ("Severe negative event. Measured (5wk): non-F&O severe negs fall "
-                      "−0.85% next day, 67% down — but NO practical short route (no "
-                      "futures; SLB 1-month-min; circuit/T2T risk). Don't buy this "
-                      "dip, exit longs. NOT a validated short signal.")
+                tt = ("VERY BAD news (fraud / insolvency type) on a SMALL stock that "
+                      "is NOT in F&O — no futures, no options, so there is NO way to "
+                      "short it. What you can do: do NOT buy this dip, and if you "
+                      "already hold it, think about exiting. In our data such stocks "
+                      "fell about −0.9% the next day (2 of 3 fell).")
             else:
-                label, clr_b = "⚠ F&O·no edge", "#fbbf24"
-                tt = ("Severe negative on an F&O name — futures-shortable in principle, "
-                      "BUT measured: these get dip-BOUGHT (+0.86% next day, n=7 thin). "
-                      "Short NOT supported by the data yet.")
+                label, clr_b = "⚠ F&O — careful", "#fbbf24"
+                tt = ("VERY BAD news on an F&O stock. " + _FNO_DEF +
+                      "You COULD short it via futures — BUT our data says don't rush: "
+                      "big stocks usually get BOUGHT after bad news (dip buyers), and "
+                      "shorting them lost money. Careful both ways.")
             if has_chg and chg >= -1:
-                label = f"⛔ unreacted {chg:+.1f}%"
-                tt += (" GAP: barely reacted at capture — the MEASURED danger bucket "
-                       "(unreacted severe negs fall −0.77% next day, t=−2.0). The "
-                       "avoid/exit call is at its freshest.")
+                label = f"⛔ not fallen yet {chg:+.1f}%"
+                tt += (" NOTE: the price has barely moved since this news — the fall "
+                       "usually comes the NEXT day. This warning is at its most "
+                       "useful right now.")
             elif has_chg and chg <= -3:
-                label = f"⛔ smashed {chg:+.1f}%"
-                tt += (" GAP: already down ≥3% at capture — reaction consumed; "
-                       "late panic exit/short historically bounces against you "
-                       "(−1..−3% bucket bounced +1.3% next day, n=5 thin).")
+                label = f"⛔ already down {chg:+.1f}%"
+                tt += (" NOTE: the price already fell 3%+ — the damage is done. "
+                       "Panic-selling or shorting NOW is usually too late; such "
+                       "stocks often bounce the next day.")
             elif has_chg:
                 label = f"⛔ {chg:+.1f}% moved"
         elif sev in ("POS", "POS_FUT"):
             if sev == "POS":
                 label, clr_b = "🚀 don't chase", "#4ade80"
-                tt = ("Big positive event (SAST/routine filings filtered out). "
-                      "Measured (5wk, n=302): buying the next open loses −0.19% +1d "
-                      "on average; 'large order win' pops +0.5% day 1 then fades "
-                      "−1.6% by day 5. Entry timing decides everything.")
+                tt = ("GOOD news on a smaller stock (not in F&O — you can only buy "
+                      "shares). The price jump usually happens IMMEDIATELY, at or "
+                      "near the open. Buying AFTER the jump loses on average: e.g. "
+                      "'large order win' stocks jump ~+0.5% on day 1, then give it "
+                      "back (−1.6% by day 5). Only interesting if the price has NOT "
+                      "moved up yet.")
             else:
-                label, clr_b = "⚡ priced-in F&O", "#34d399"
-                tt = ("Big positive on an F&O name — measured (n=85): −0.42% +1d "
-                      "(t=−2.3), −0.58% +3d (t=−2.0), significantly NEGATIVE. Large "
-                      "caps price public news instantly. Context only.")
+                label, clr_b = "⚡ F&O — already in price", "#34d399"
+                tt = ("GOOD news on an F&O stock. " + _FNO_DEF +
+                      "For big stocks like this, good news goes into the price "
+                      "within MINUTES. By the time you read it, it is already in the "
+                      "price — buying now actually LOST money in our data (about "
+                      "−0.4% the next day). Read it as information, not a buy signal.")
             if has_chg and chg <= 1 and sev == "POS":
-                label = f"🟢 unpriced {chg:+.1f}%"
-                tt += (" GAP: barely moved at capture — the ONLY bucket with positive "
-                       "forward drift (+0.5% +3d, +0.7% +5d, t≈1.6, n=204): short-term "
-                       "long WATCH. Unvalidated lean, size accordingly.")
+                label = f"🟢 not moved yet {chg:+.1f}%"
+                tt += (" NOTE: the price has moved less than 1% since this news — "
+                       "the market may not have reacted yet. This is the ONE "
+                       "situation where a small 1–3 day buy showed profit in our "
+                       "data (+0.5% to +0.7%). Small edge, not a guarantee — keep "
+                       "position size small.")
             elif has_chg and chg >= 3:
-                label = f"🔴 popped {chg:+.1f}%"
-                tt += (" GAP: already up ≥3% at capture — the news is CONSUMED "
-                       "(measured −0.84% next day t=−2.1, −1.27% +5d, 74% down). "
-                       "No purpose purchasing now.")
+                label = f"🔴 already up {chg:+.1f}%"
+                tt += (" NOTE: the price is ALREADY up 3%+ — the move is over. "
+                       "Buying now usually loses (−0.8% next day on average; 3 of 4 "
+                       "such stocks fell). No purpose purchasing now.")
             elif has_chg:
                 label = f"🚀 {chg:+.1f}% moved"
-                tt += (" GAP: +1..3% already — middle bucket measured flat-to-negative; "
-                       "no edge left.")
+                tt += (" NOTE: already up 1–3% — most of the move is done; buying "
+                       "here showed no profit in our data.")
         if sev:
             sev_blk = html.Span(label, title=tt, style={
                 "color": clr_b, "fontSize": "0.48rem", "fontWeight": "800",
-                "width": "104px", "letterSpacing": "0.03em", "cursor": "help"})
+                "width": "118px", "letterSpacing": "0.03em", "cursor": "help"})
         rows.append(html.Div([
             html.Span(tm, title=(
                 "filed near/after the close of the LAST session (or on a weekend/"
@@ -1463,10 +1476,13 @@ app.layout = dbc.Container([
                          {"label": "🟢 Bullish", "value": "BULLISH"},
                          {"label": "🔴 Bearish", "value": "BEARISH"}],
                 className="news-tab",
+                # color set ON the label — inherited color gets overridden to
+                # near-invisible by the flex wrapper/theme (labels vanished)
                 labelStyle={"display": "inline-block", "marginRight": "12px",
-                            "cursor": "pointer", "fontSize": "0.52rem", "fontWeight": "700"},
+                            "cursor": "pointer", "fontSize": "0.6rem",
+                            "fontWeight": "700", "color": "#cbd5e1"},
                 inputStyle={"marginRight": "4px", "cursor": "pointer"},
-                style={"color": "#94a3b8"}),
+                style={"color": "#cbd5e1"}),
             # Order: ⏱ full-day chronological tape (review a whole session start-to-
             # finish, deduped, uncapped) vs ⚡ top-impact glance (old default, top 25).
             dcc.RadioItems(
@@ -1475,9 +1491,10 @@ app.layout = dbc.Container([
                          {"label": "⚡ top impact", "value": "impact"}],
                 className="news-tab",
                 labelStyle={"display": "inline-block", "marginRight": "12px",
-                            "cursor": "pointer", "fontSize": "0.52rem", "fontWeight": "700"},
+                            "cursor": "pointer", "fontSize": "0.6rem",
+                            "fontWeight": "700", "color": "#cbd5e1"},
                 inputStyle={"marginRight": "4px", "cursor": "pointer"},
-                style={"color": "#94a3b8", "marginLeft": "18px"}),
+                style={"color": "#cbd5e1", "marginLeft": "18px"}),
         ], style={"display": "flex", "alignItems": "center", "marginTop": "6px"}),
         html.Div(id="news-panel", style={"marginTop": "4px"}),
         # Cockpit REPLAY control — type a past time (HH:MM) to see the band/regime AS IT
