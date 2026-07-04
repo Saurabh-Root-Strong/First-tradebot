@@ -3845,7 +3845,43 @@ def _scout_playbook(r):
     ], style={"marginLeft": "120px", "marginTop": "4px"})
 
 
-def _scout_row(r, mem=None, today=None, live=True):
+def _ghost_help():
+    """Click-to-open guide for ghost practice — how the mode works and how to use it."""
+    _ln = lambda t, c="#94a3b8": html.Div(t, style={
+        **MONO, "fontSize": "0.6rem", "color": c, "lineHeight": "1.55"})
+    return html.Details([
+        html.Summary("👻 how ghost practice works  ·  click", style={
+            **MONO, "fontSize": "0.6rem", "color": "#a78bfa", "cursor": "pointer",
+            "fontWeight": "700", "padding": "3px 8px", "background": "#0f0a1a",
+            "border": "1px solid #4c1d95", "borderRadius": "4px",
+            "display": "inline-block", "listStyle": "none", "userSelect": "none"}),
+        html.Div([
+            _ln("WHAT: a past captured session replayed on TODAY'S wall clock — at your "
+                "real 13:29 you see that day's 13:29. A time machine for practice.", "#c4b5fd"),
+            _ln("• Advances by itself every ~30s, exactly like a live feed. No clicking."),
+            _ln("• The future is SEALED — actual/HIT/scoreboard are hidden until the real "
+                "15:30, so you cannot peek. Write your calls down; the day grades you at "
+                "the close."),
+            _ln("• PICK A DAY: scroll the date strip (bottom bar ◀ ▶) to any captured "
+                "session, keep the Replay picker on 👻. Untouched = the last session."),
+            _ln("• You join the day at your CURRENT clock time — start at 14:00 and the "
+                "morning is already history. Full-day practice = start at 09:15."),
+            _ln("• ALERTS replay too: each alert fires at the minute it really fired that "
+                "day (bell badge counts up with your clock)."),
+            _ln("• IGNORE the top ticker and the left FOOTPRINT panel — those are live-"
+                "only and show today's dead feed on a weekend.", "#fbbf24"),
+            _ln("• Nothing is written anywhere — no cleanup, the next live session is "
+                "untouched. Weekends/holidays open in ghost automatically; a trading "
+                "day always boots LIVE."),
+            _ln("• STUDY instead of practice? Pick an exact minute (e.g. 10:00) in the "
+                "same Replay picker — that scrubs freely and grades instantly."),
+        ], style={"maxHeight": "300px", "overflowY": "auto", "marginTop": "5px",
+                  "padding": "7px 10px", "background": "#060a12",
+                  "border": "1px solid #312e81", "borderRadius": "5px"}),
+    ], style={"marginTop": "6px"})
+
+
+def _scout_row(r, mem=None, today=None, live=True, practice=False):
     """One index row in the scout strip. `mem` = this index's persistent trade memory
     (scout-seen, live-only) so a held trade survives a NO-TRADE blink and a resolved
     trade shows its outcome instead of vanishing."""
@@ -3917,7 +3953,7 @@ def _scout_row(r, mem=None, today=None, live=True):
     # forward prediction over the selected horizon + (replay) grade
     pdir = r.get("pred_dir", "RANGE")
     pclr = {"UP": "#34d399", "DOWN": "#f87171"}.get(pdir, "#fbbf24")
-    _ctx = "live now" if live else "replay"
+    _ctx = "live now" if live else ("👻 ghost live" if practice else "replay")
     pred_txt = (f"↪ {_ctx} · next {r.get('horizon', r['tf'])}m: {pdir}"
                 + (f" → {r['pred_target']}" if r.get("pred_target") else "")
                 + (f"  band[{r['pred_lo']}, {r['pred_hi']}]" if r.get("pred_lo") else ""))
@@ -3943,6 +3979,7 @@ def _scout_row(r, mem=None, today=None, live=True):
     else:
         pred_kids.append(html.Span(
             "   ⇒ pending — grades itself once the horizon elapses" if live else
+            "   ⇒ hidden — grades unlock at the real 15:30" if practice else
             "   ⇒ pending (advance the replay clock to grade)",
             style={"color": "#475569"}))
     pred = html.Div(pred_kids, style={**MONO, "fontSize": "0.6rem",
@@ -4042,17 +4079,23 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
     n_trade = sum(1 for r in rows if r.get("has_data") and r["verdict"].startswith("TRADE"))
     hits = sum(1 for r in rows if r.get("verify") and r["verify"]["dir_hit"])
     graded = sum(1 for r in rows if r.get("verify"))
-    _pend = ("  ·  live — calls grade themselves once the horizon elapses"
-             if live else "  ·  predictions pending (advance the replay clock to grade)")
+    _pend = ("  ·  live — calls grade themselves once the horizon elapses" if live else
+             "  ·  practice — grades unlock at the real 15:30" if practice else
+             "  ·  predictions pending (advance the replay clock to grade)")
     sb = (html.Span(f"  ·  scoreboard {hits}/{graded} hit",
                     style={"color": "#22c55e" if hits * 2 >= graded else "#f87171",
                            "fontSize": "0.62rem", "fontWeight": "700"})
           if graded else
           html.Span(_pend, style={"color": "#475569", "fontSize": "0.58rem"}))
     title = html.Div([
-        html.Span(f"🎯 SCOUT — predict next {tf_min}m  ·  {when}  ·  ", style={
+        html.Span(f"🎯 SCOUT — predict next {tf_min}m  ·  {when}  ·  ", title=(
+            "GHOST PRACTICE: a past captured session replayed on today's wall clock — "
+            "advances by itself, the future is hidden until the real 15:30, then the "
+            "day grades your calls. Pick the day via the date strip (bottom bar). "
+            "Nothing is written — the next live session is untouched."
+            if practice else None), style={
             "color": "#34d399", "fontWeight": "700", "fontSize": "0.7rem",
-            "letterSpacing": "0.05em"}),
+            "letterSpacing": "0.05em", **({"cursor": "help"} if practice else {})}),
         html.Span(f"{n_trade} trade{'s' if n_trade != 1 else ''} on the board",
                   style={"color": "#94a3b8", "fontSize": "0.62rem"}),
         sb,
@@ -4070,8 +4113,10 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
               "background": "#1a0c0c", "border": "1px solid #7f1d1d",
               "borderRadius": "4px", "padding": "5px 8px"})
     return html.Div(
-        [title] + [_scout_row(r, mem=(seen or {}).get(r.get("sym")), today=today, live=live)
-                   for r in rows] + [note],
+        [title] + [_scout_row(r, mem=(seen or {}).get(r.get("sym")), today=today,
+                              live=live, practice=practice)
+                   for r in rows] + [note]
+        + ([_ghost_help()] if practice else []),
         style={"background": "#070d18", "border": "1px solid #1e293b",
                "borderRadius": "6px", "padding": "8px 12px"})
 
