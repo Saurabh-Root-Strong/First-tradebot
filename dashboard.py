@@ -4403,6 +4403,8 @@ def _scout_alert_poller():
     try:
         from core.mirror_io import read_mirror
         now = datetime.datetime.now(IST)
+        if not is_trading_day(now):
+            raise RuntimeError("non-trading day — no session to backfill")
         df = read_mirror("scout_alerts", today)
         existing_min = (df["ts"].min() if (df is not None and not df.empty) else None)
         # "morning covered" = the log already holds an alert from before 11:00 → the
