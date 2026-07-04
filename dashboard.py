@@ -1487,7 +1487,7 @@ app.layout = dbc.Container([
             # finish, deduped, uncapped) vs ⚡ top-impact glance (old default, top 25).
             dcc.RadioItems(
                 id="news-sort", value="time", inline=True,
-                options=[{"label": "⏱ full day (time)", "value": "time"},
+                options=[{"label": "⏱ latest first (full day)", "value": "time"},
                          {"label": "⚡ top impact", "value": "impact"}],
                 className="news-tab",
                 labelStyle={"display": "inline-block", "marginRight": "12px",

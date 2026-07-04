@@ -641,7 +641,9 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None,
     if dedup:
         alerts, reps = _dedup_stock(alerts)
     if order == "time":
-        alerts.sort(key=lambda e: e.ts)               # chronological session tape
+        # LATEST FIRST — a live tape reads newest-on-top (glance at the top for
+        # what just happened; the whole session is below as you scroll).
+        alerts.sort(key=lambda e: e.ts, reverse=True)
         limit = 0                                     # full day, no cap
     else:
         # Rank: impact magnitude first, then recency.
