@@ -582,13 +582,19 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     # the reported trigger is stable. A trade born on the still-forming bar honestly
     # shows trigger=as_of until its first grid instant passes, then settles for good.
     step = max(1, int(tf_min))
+    # Budget scales with the bar: a flat 120-min cap silently TRUNCATED long holds on
+    # coarse TFs — a 60m trade held since 13:15, viewed at 15:30, hit the cap before
+    # reaching its true trigger and reported 14:15 with the entry REPRICED there
+    # (−1% became −5%). 6 bars of budget = the whole session on 60m for 6 probes,
+    # identical behaviour on 5/15m where 120 still dominates.
+    _cap = max(_TRIG_MAX_MIN, 6 * step)
     _open_dt = as_of.replace(hour=_MKT_OPEN.hour, minute=_MKT_OPEN.minute,
                              second=0, microsecond=0)
     k = int((as_of - _open_dt).total_seconds() // 60) // step   # last grid idx <= as_of
     trig_t = as_of
     for i in range(k, -1, -1):
         t_i = _open_dt + datetime.timedelta(minutes=i * step)
-        if (as_of - t_i).total_seconds() / 60.0 > _TRIG_MAX_MIN:
+        if (as_of - t_i).total_seconds() / 60.0 > _cap:
             break
         if not_before is not None and t_i < not_before:
             break                              # never report a trigger before data-ready
