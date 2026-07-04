@@ -599,8 +599,11 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None,
     # but its reaction window is TODAY — the morning tape must show it or the desk
     # reads a blank tape while yesterday's post-close story gaps the open. Live
     # today-tape only (a past-day review shows that day as it was).
+    # Carry applies to BOTH views — the relevant-event SET is view-independent
+    # (gating it to the time view left "top impact" claiming a quiet day while
+    # Friday's post-close fraud sat one toggle away). Only ordering/cap differ.
     carry_uids: "set[str]" = set()
-    if order == "time" and day == _today():
+    if day == _today():
         try:
             import datetime as _dt2
             from core.market_calendar import prev_trading_day
