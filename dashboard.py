@@ -811,9 +811,13 @@ def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html
                 "color": clr, "fontWeight": "800", "fontSize": "0.7rem",
                 "width": "32px", "textAlign": "right", "marginRight": "8px",
                 **MONO}),
-            html.Span(e["scope"][:3], style={
-                "color": chip, "fontSize": "0.48rem", "fontWeight": "700",
-                "width": "26px", "letterSpacing": "0.05em"}),
+            html.Span(e["scope"], title=(
+                {"STOCK": "affects ONE stock (the ticker shown)",
+                 "SECTOR": "affects a whole sector basket",
+                 "MACRO": "affects the WHOLE market (RBI/Fed/CPI-type news)"}
+                .get(e["scope"], "")), style={
+                "color": chip, "fontSize": "0.44rem", "fontWeight": "700",
+                "width": "42px", "letterSpacing": "0.04em", "cursor": "help"}),
             html.Span((e["ticker"] or "—")[:11], style={
                 "color": "#cbd5e1", "fontSize": "0.55rem", "fontWeight": "700",
                 "width": "78px", **MONO}),
