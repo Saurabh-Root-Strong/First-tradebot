@@ -630,8 +630,11 @@ def analyze_news(min_abs: int = 5, limit: int = 25, date: "str | None" = None,
                         have.add(e.uid)
                 dcur += _dt2.timedelta(days=1)
             co.sort(key=lambda e: e.ts)
-            carry_uids = {e.uid for e in co}
             alerts = co + alerts
+            # The ◂ marker means "FILED before today" (the desk-facing fact), not
+            # "came from an older file": a Friday 23:14 filing captured past
+            # midnight lives in TODAY's mirror but is still yesterday's story.
+            carry_uids = {e.uid for e in alerts if e.ts.date() < d0}
         except Exception:
             carry_uids = set()
     reps: "dict[str, int]" = {}
