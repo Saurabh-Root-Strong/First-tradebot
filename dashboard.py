@@ -5054,8 +5054,19 @@ def update_sidebar(_):
     n = len(latest)
     dot_c = "#22c55e" if n == 4 else "#f59e0b" if n else "#ef4444"
     lbl   = "LIVE" if n == 4 else f"PARTIAL {n}/4" if n else "CONNECTING..."
+    # Write-health badge — a systematic DB insert failure (schema drift, the chain_snapshots
+    # bug class) is counted in idb but was otherwise only in the log. Show it RED on the
+    # header so silent data loss is impossible to miss. 0 errors → no badge (no clutter).
+    try:
+        from intraday_db import idb as _idb
+        _ierr = _idb.insert_error_count()
+    except Exception:
+        _ierr = 0
+    werr = (html.Span(f"  ⚠ WRITE ERR {_ierr}",
+                      style={"color": "#ef4444", "fontWeight": "700"})
+            if _ierr else "")
     status = html.Span([html.Span("● ", style={"color": dot_c}),
-                        html.Span(f"{lbl}  ·  {now}", style={"color": "#334155"})])
+                        html.Span(f"{lbl}  ·  {now}", style={"color": "#334155"}), werr])
     return ltps + chgs + stys + [status]
 
 
@@ -6860,6 +6871,14 @@ if __name__ == "__main__":
         print("  Refresh them from the VM with:  python sync_from_vm.py  (or --watch).")
         _viewer_seed_latest()   # immediate seed so cards aren't blank on first paint
         # (the per-date re-seed is driven by the master news-date via _seed_cards_on_date)
+        # Macro radar is network-only + in-memory (_MACRO_STATE, no mirror write) → safe
+        # to run in VIEWER too, so the local viewer shows a LIVE global risk board. (The
+        # NEWS poller stays OFF here — it writes the news_events mirror and would clobber
+        # the copy synced from the VM; news is read from that synced mirror instead.)
+        if _MACRO_AVAILABLE:
+            threading.Thread(target=lambda: _macro_radar_poller(180),
+                             daemon=True, name="macro-radar").start()
+            print("  Macro radar poller started (viewer) — 180s intervals")
     else:
         raw_token     = _validate_token()
         _access_token = raw_token

@@ -54,10 +54,10 @@ name = "Layers point downward only"
 type = "layers"
 layers = [
     "tradebot.app",
+    "tradebot.jobs",
     "tradebot.engine",
     "tradebot.signals",
     "tradebot.data",
     "tradebot.storage",
     "tradebot.adapters",
-    "tradebot.core",
 ]

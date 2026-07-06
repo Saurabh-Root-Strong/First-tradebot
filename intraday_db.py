@@ -240,6 +240,13 @@ class IntradayDB:
             counts[f"insert_errors_{kind}"] = n
         return counts
 
+    def insert_error_count(self) -> int:
+        """Total per-record insert failures this process (0 = healthy). LIGHT — reads the
+        in-memory counter, no DB query, safe to poll. Surfaced as the dashboard write-health
+        badge so a SYSTEMATIC write failure (schema drift — the chain_snapshots class of bug)
+        is visible on the header, not only buried in supervisor.log."""
+        return sum(self._insert_errors.values())
+
     def shutdown(self) -> None:
         """Flush remaining records, checkpoint, close.  Call at process exit."""
         self._q.put(_SENTINEL)

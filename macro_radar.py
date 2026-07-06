@@ -1,8 +1,8 @@
 """
 macro_radar.py — LIVE global macro risk board for the Indian market.
 
-Tracks the price-based factors that move India (crude, USD/INR, gold, silver, copper,
-DXY, US 10Y yield, S&P/Nasdaq futures, India VIX), flags SUDDEN moves (z-score vs the
+Tracks the price-based factors that move India (USD/INR, crude, gold, silver, copper),
+flags SUDDEN moves (z-score vs the
 factor's own recent daily vol), maps each to its India-equity impact sign, and prints a
 net risk-on/off tilt. Price-based = reliable, no headline-scraping hallucination.
 
@@ -27,17 +27,14 @@ if hasattr(sys.stdout, "reconfigure"):
 import yfinance as yf
 
 # (ticker, label, India-equity impact sign of a RISE, weight)
+# Commodities + rupee only — the factors the desk watches directly. DXY / US yields /
+# US equity futures / India VIX dropped (priced fast, redundant with USD-INR + crude).
 FACTORS = [
-    ("BZ=F",       "Brent crude",   -1, 1.0),   # dearer oil = bad for importer India
     ("INR=X",      "USD/INR",       -1, 1.0),   # weaker rupee = FII outflow risk
-    ("DX-Y.NYB",   "DXY dollar",    -1, 1.0),   # strong dollar = EM outflow
-    ("^TNX",       "US 10Y yield",  -1, 0.8),   # rising yields = risk-off
-    ("ES=F",       "S&P 500 fut",   +1, 1.0),   # risk-on
-    ("NQ=F",       "Nasdaq fut",    +1, 0.8),   # risk-on
-    ("HG=F",       "Copper",        +1, 0.6),   # global growth = risk-on
+    ("BZ=F",       "Crude (Brent)", -1, 1.0),   # dearer oil = bad for importer India
     ("GC=F",       "Gold",          -1, 0.5),   # safe-haven bid = mild risk-off
     ("SI=F",       "Silver",        -1, 0.3),
-    ("^INDIAVIX",  "India VIX",     -1, 0.8),   # fear gauge
+    ("HG=F",       "Copper",        +1, 0.6),   # global growth = risk-on
 ]
 SPIKE_Z = 1.5
 
