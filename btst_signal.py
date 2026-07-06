@@ -54,31 +54,79 @@ def _clr(row):
     return float((row["close"] - row["low"]) / rng) if rng > 0 else 0.5
 
 
+def _bar_from_mirror(sym, date):
+    """Session OHLC (09:15–15:30 clr + close) from the intraday TICK MIRROR — the fallback
+    for TODAY when the historical daily archive hasn't been downloaded yet (no token needed).
+    Without this, an unattended EOD emit re-emits the stale last-archived day forever."""
+    try:
+        import datetime as _dt
+        from core.mirror_io import read_mirror
+        tk = read_mirror("ticks", date.isoformat(), None, f"NSE:{FY[sym]}-INDEX")
+        if tk is None or len(tk) < 30:
+            return None
+        tk = tk[tk["ts"].dt.date == date]                          # drop cross-midnight bleed
+        m = tk[(tk["ts"].dt.time >= _dt.time(9, 15)) & (tk["ts"].dt.time <= _dt.time(15, 30))]
+        if len(m) < 30:
+            return None
+        ltp = m["ltp"].to_numpy(float)
+        hi, lo, close = float(ltp.max()), float(ltp.min()), float(m.iloc[-1]["ltp"])
+        return {"clr": (close - lo) / (hi - lo) if hi > lo else 0.5, "close": close}
+    except Exception:
+        return None
+
+
 def candidates(date):
-    """Strong-close BTST-long candidates as of `date`'s close."""
+    """Strong-close BTST-long candidates as of `date`'s close. Uses the historical daily
+    archive; falls back to the tick mirror for a not-yet-archived day (e.g. today, offline)."""
     out = []
     for s in SYMS:
-        d = _daily(s)
-        r = d[d["date"] == date]
-        if r.empty:
-            continue
-        clr = _clr(r.iloc[0])
+        try:
+            d = _daily(s)
+            r = d[d["date"] == date]
+        except Exception:
+            r = None
+        if r is not None and not r.empty:
+            clr, close = _clr(r.iloc[0]), float(r.iloc[0]["close"])
+        else:
+            bar = _bar_from_mirror(s, date)
+            if not bar:
+                continue
+            clr, close = bar["clr"], bar["close"]
         if clr >= CLR_TH:
             out.append({"date": date, "sym": s, "clr": round(clr, 3),
-                        "entry_px": float(r.iloc[0]["close"])})
+                        "entry_px": round(close, 2)})
     return out
 
 
 def _exit_px(sym, next_date):
-    """Real ~09:30 exit price on next_date (5min close ≥ 09:30), else that day's open."""
+    """Real ~09:30 exit price on next_date. Tries the historical 5min archive first; if that
+    day isn't downloaded yet (the archive lags the live capture by a day or two, which is why
+    the paper loop silently stalled with positions stuck OPEN), FALLS BACK to the lock-free
+    tick mirror. Self-healing + fully offline — the loop no longer needs a same-day download."""
     try:
         b = pd.read_parquet(MIN5.format(FY[sym]))
         b["ts"] = pd.to_datetime(b["ts"])
         g = b[b["ts"].dt.date == next_date]
-        if g.empty:
+        if not g.empty:
+            aft = g[g["ts"].dt.time >= EXIT_T]
+            return float((aft.iloc[0] if len(aft) else g.iloc[0])["close"])
+    except Exception:
+        pass
+    return _exit_px_from_mirror(sym, next_date)
+
+
+def _exit_px_from_mirror(sym, next_date):
+    """Fallback exit: first tick at/after 09:30 from the intraday tick mirror."""
+    try:
+        from core.mirror_io import read_mirror
+        msym = f"NSE:{FY[sym]}-INDEX"
+        tk = read_mirror("ticks", next_date.isoformat(), None, msym)
+        if tk is None or not len(tk):
             return None
-        aft = g[g["ts"].dt.time >= EXIT_T]
-        return float((aft.iloc[0] if len(aft) else g.iloc[0])["close"])
+        tk = tk[tk["ts"].dt.date == next_date]   # drop prior-evening bleed (mirror spans midnight)
+        aft = tk[tk["ts"].dt.time >= EXIT_T]
+        src = aft if len(aft) else tk
+        return float(src.iloc[0]["ltp"]) if len(src) else None
     except Exception:
         return None
 
@@ -116,17 +164,30 @@ def emit(date):
     return cands
 
 
+def _next_trading_day(d: dt.date) -> dt.date | None:
+    """Next NSE trading day after d (calendar-driven, capped at today). Independent of the
+    historical archive — which lags live capture, the bug that stalled reconcile."""
+    from core.market_calendar import is_trading_day
+    nxt = d + dt.timedelta(days=1)
+    today = dt.date.today()
+    while nxt <= today:
+        if is_trading_day(nxt):
+            return nxt
+        nxt += dt.timedelta(days=1)
+    return None
+
+
 def reconcile():
     led = _load_ledger()
     if led.empty:
         print("  ledger empty"); return
-    nfut = _daily("NIFTY")["date"].tolist()
     filled = 0
     for i, r in led[led["status"] == "OPEN"].iterrows():
         d = r["date"] if isinstance(r["date"], dt.date) else pd.to_datetime(r["date"]).date()
-        nxt = [x for x in nfut if x > d]
-        if not nxt:
-            continue
+        nd = _next_trading_day(d)
+        if nd is None:
+            continue                       # exit day hasn't happened yet
+        nxt = [nd]
         xp = _exit_px(r["sym"], nxt[0])
         if xp is None:
             continue
@@ -157,6 +218,31 @@ def scorecard():
         if len(cs):
             print(f"      {s:11} n={len(cs):>3}  mean {cs['net_bps'].mean():+6.1f}  "
                   f"win {100*(cs['net_bps']>0).mean():3.0f}%")
+    _health_monitor(c)
+
+
+def _health_monitor(c, window: int = 20) -> None:
+    """The HONEST memory for a LOCKED +EV rule: don't tune it — watch it for DECAY. A
+    mechanical edge dies when the regime that carried it turns (BTST rides overnight risk-on
+    drift; a risk-off month flips it). Walk-forward on the sim ledger PROVED sub-cell sizing
+    (clr bucket / per-index) is overfit noise — the only thing worth learning is whether the
+    edge is still ALIVE. Compares the trailing window vs the full history and flags decay."""
+    if "date" in c.columns:
+        c = c.sort_values("date")
+    p = c["net_bps"].to_numpy(float)
+    if len(p) < window + 5:
+        print(f"\n    edge-health: n={len(p)} (<{window+5}) — accruing, no decay read yet")
+        return
+    import numpy as np
+    full_m = p.mean()
+    rec = p[-window:]
+    rec_m, rec_wr = rec.mean(), 100 * (rec > 0).mean()
+    rec_sh = rec.mean() / rec.std() * np.sqrt(252) if rec.std() > 0 else float("nan")
+    # decay = trailing window has gone negative, or lost >60% of the full-sample edge
+    decayed = rec_m <= 0 or (full_m > 0 and rec_m < 0.4 * full_m)
+    flag = "⚠ DECAY — stand aside / re-backtest" if decayed else "✓ edge intact"
+    print(f"\n    edge-health (last {window} vs full): trailing mean {rec_m:+.1f}bps "
+          f"(full {full_m:+.1f})  win {rec_wr:.0f}%  Sharpe {rec_sh:+.2f}   {flag}")
 
 
 def simulate(n_days):
@@ -193,9 +279,23 @@ def main():
     if args.scorecard:
         scorecard()
     if not (args.reconcile or args.scorecard):
-        last = _daily("NIFTY")["date"].iloc[-1] if not args.date else dt.date.fromisoformat(args.date)
-        emit(last)
+        emit(_emit_date(args.date))
         print("\n  (paper-logged. run --reconcile next morning, --scorecard to track.)")
+
+
+def _emit_date(explicit: str) -> dt.date:
+    """The close to emit for. Explicit --date wins; else TODAY if it is a trading day (the
+    unattended EOD run's intent — uses the tick-mirror fallback if the archive lags), else the
+    most recent trading day. Never the stale last-archived date (the old re-emit-07-01 bug)."""
+    if explicit:
+        return dt.date.fromisoformat(explicit)
+    from core.market_calendar import is_trading_day
+    d = dt.date.today()
+    for _ in range(7):
+        if is_trading_day(d):
+            return d
+        d -= dt.timedelta(days=1)
+    return d
 
 
 if __name__ == "__main__":
