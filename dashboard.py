@@ -1826,9 +1826,22 @@ app.layout = dbc.Container([
                 # (since 09:35 post-warmup) + a live cross-check. Surfaces the sticky
                 # holds that make the strip read as contradictory across indices.
                 dbc.Modal([
-                    dbc.ModalHeader(dbc.ModalTitle(
-                        "📋 Scout day ledger — open + closed (since 09:35)")),
-                    dbc.ModalBody(html.Div(id="scout-openpos-body")),
+                    dbc.ModalHeader(html.Div([
+                        dbc.ModalTitle(
+                            "📋 Scout day ledger — open + closed (since 09:35)"),
+                        dcc.Input(
+                            id="scout-search", type="search", autoComplete="off",
+                            placeholder="🔍 search rows…", debounce=False,
+                            style={"width": "190px", "fontSize": "0.72rem",
+                                   "padding": "4px 8px", "borderRadius": "6px",
+                                   "border": "1px solid #334155",
+                                   "background": "#0b1220", "color": "#e2e8f0"}),
+                    ], style={"display": "flex", "alignItems": "center",
+                              "justifyContent": "space-between", "width": "100%",
+                              "gap": "12px"}), close_button=True),
+                    dbc.ModalBody(dcc.Loading(
+                        html.Div(id="scout-openpos-body"),
+                        type="circle", color="#67e8f9")),
                 ], id="scout-openpos-modal", is_open=False, size="lg", scrollable=True),
                 dcc.Loading(dcc.Graph(
                     id="charts-graph",
@@ -3395,6 +3408,7 @@ def _open_help_modal(_n):
 
 @app.callback(Output("scout-openpos-modal", "is_open"),
               Output("scout-openpos-body", "children"),
+              Output("scout-search", "value"),
               Input("scout-openpos-btn", "n_clicks"),
               State("charts-asof", "value"), State("news-date", "data"),
               prevent_initial_call=True)
@@ -3410,7 +3424,36 @@ def _open_scout_openpos(_n, asof, date):
             day, as_of = today, datetime.datetime.now(IST)
     else:
         day, as_of = today, datetime.datetime.now(IST)
-    return True, _scout_openpos_body(day, as_of)
+    return True, _scout_openpos_body(day, as_of), ""
+
+
+# One search box (modal top-right) filters BOTH ledger tables across every column, client
+# side (no server round-trip). Empty query restores the full rows from the per-table Stores.
+app.clientside_callback(
+    """
+    function(q, openData, closedData) {
+        function filt(rows) {
+            if (!rows) return [];
+            if (!q) return rows;
+            var s = q.toLowerCase();
+            return rows.filter(function(r) {
+                return Object.keys(r).some(function(k) {
+                    var v = r[k];
+                    return (v === null || v === undefined ? "" : String(v))
+                        .toLowerCase().indexOf(s) !== -1;
+                });
+            });
+        }
+        return [filt(openData), filt(closedData)];
+    }
+    """,
+    Output("scout-open-table", "data"),
+    Output("scout-closed-table", "data"),
+    Input("scout-search", "value"),
+    State("scout-open-store", "data"),
+    State("scout-closed-store", "data"),
+    prevent_initial_call=True,
+)
 
 
 @app.callback(Output("charts-help-box", "children"), Output("charts-help-title", "children"),
@@ -4154,82 +4197,199 @@ def _scout_openpos_body(today: str, as_of):
                         style={"color": "#94a3b8", "fontSize": "0.8rem", "padding": "10px"})
 
     # ── OPEN section — live cross-check + unrealized P&L ─────────────────────────
-    open_rows = []
-    for o in opens:
-        sym, d, k, entry = o["sym"], o.get("dir"), o.get("strike"), o.get("entry")
+    # Each open row needs a live premium read + a fresh verdict scan (heavy, IO-bound
+    # mirror reads). Run the ≤4 rows CONCURRENTLY so the popup opens in ~one scan's time
+    # instead of stacking 4 serially (was the ~1.5s "loading" lag).
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _open_cross(o):
+        sym, d, k = o["sym"], o.get("dir"), o.get("strike")
         try:
             cur = scout._opt_premium(sym, today, as_of, k, d) if k else None
         except Exception:
             cur = None
-        cur = round(cur, 2) if cur else None
-        pnl = round((cur / entry - 1.0) * 100.0, 1) if (cur and entry) else None
         try:
             v = scout.scan_index(sym, _ALERT_TF, date=today, as_of=as_of,
                                  with_lifecycle=False, verdict_only=True)
             verdict, vdir = v.get("verdict"), v.get("direction")
         except Exception:
             verdict, vdir = None, None
-        if verdict == "NO-TRADE":
-            flag, fc = "⚠ board flat — stale", "#f59e0b"
-        elif vdir and vdir != d:
-            flag, fc = f"⚠ board now {vdir} — contradicts", "#f87171"
-        elif vdir == d:
-            flag, fc = "✓ board confirms", "#22c55e"
-        else:
-            flag, fc = "—", "#94a3b8"
-        pnl_c = "#22c55e" if (pnl or 0) >= 0 else "#f87171"
-        open_rows.append(html.Tr([
-            html.Td(o["label"], style={"fontWeight": "700"}),
-            html.Td(d, style={"color": "#34d399" if d == "CE" else "#f87171",
-                              "fontWeight": "700"}),
-            html.Td(k), html.Td(o.get("open_t")),
-            html.Td(f"₹{entry}" if entry else "—"),
-            html.Td(f"₹{cur}" if cur else "—"),
-            html.Td(f"{pnl:+.1f}%" if pnl is not None else "—",
-                    style={"color": pnl_c, "fontWeight": "700"}),
-            html.Td("broke" if o.get("bb") else "—",
-                    style={"color": "#f59e0b" if o.get("bb") else "#475569"}),
-            html.Td(flag, style={"color": fc, "fontWeight": "600"}),
-        ]))
-    open_head = html.Thead(html.Tr([html.Th(h) for h in
-        ("Index", "Side", "Strike", "Since", "Entry", "Now", "P&L (unreal.)", "Band",
-         "Live check")],
-        style={"color": "#94a3b8", "fontSize": "0.62rem", "textTransform": "uppercase"}))
-    open_tbl = (dbc.Table([open_head, html.Tbody(open_rows)], bordered=False, hover=True,
-                          color="dark", size="sm",
-                          style={"fontSize": "0.72rem", "marginBottom": "6px"})
-                if open_rows else
-                html.Div("No open positions.", style={"color": "#64748b",
-                         "fontSize": "0.66rem", "marginBottom": "6px"}))
+        return cur, verdict, vdir
 
-    # ── CLOSED section — outcome + realized P&L ──────────────────────────────────
-    closed_rows = []
+    if opens:
+        with ThreadPoolExecutor(max_workers=min(4, len(opens))) as _ex:
+            _cross = list(_ex.map(_open_cross, opens))
+    else:
+        _cross = []
+
+    # Both tables render as sortable/filterable DataTables sharing one style helper.
+    # Numeric cols (Strike/Entry/Now/Exit/P&L) sort by VALUE not text; P&L is stored as
+    # a fraction + percentage-formatted so its sort key is the true number.
+    from dash import dash_table
+    from dash.dash_table.Format import Format, Scheme, Sign, Symbol
+    _rupee = Format(precision=2, scheme=Scheme.fixed).symbol(Symbol.yes).symbol_prefix("₹")
+    _pctf = Format(precision=1, scheme=Scheme.percentage).sign(Sign.positive)
+    _ledger_side_pnl_cond = [
+        {"if": {"filter_query": "{side} = CE", "column_id": "side"},
+         "color": "#34d399", "fontWeight": "700"},
+        {"if": {"filter_query": "{side} = PE", "column_id": "side"},
+         "color": "#f87171", "fontWeight": "700"},
+        {"if": {"filter_query": "{pnl} < 0", "column_id": "pnl"},
+         "color": "#f87171", "fontWeight": "700"},
+        {"if": {"filter_query": "{pnl} >= 0", "column_id": "pnl"},
+         "color": "#22c55e", "fontWeight": "700"},
+    ]
+
+    def _ledger_table(data, columns, extra_cond, tips=None, header_tips=None, tbl_id=None):
+        return dash_table.DataTable(
+            id=tbl_id, data=data, columns=columns,
+            sort_action="native", sort_mode="single", page_action="none",
+            style_as_list_view=True,
+            style_table={"marginBottom": "6px", "overflowX": "auto"},
+            style_header={"backgroundColor": "#1e293b", "color": "#e2e8f0",
+                          "fontSize": "0.62rem", "textTransform": "uppercase",
+                          "border": "none", "fontWeight": "700", "cursor": "pointer"},
+            style_filter={"backgroundColor": "#0b1220", "color": "#e2e8f0",
+                          "border": "none"},
+            style_cell={"backgroundColor": "#0f172a", "color": "#e2e8f0",
+                        "fontSize": "0.72rem", "border": "none", "padding": "4px 8px",
+                        "textAlign": "left"},
+            style_data_conditional=_ledger_side_pnl_cond + extra_cond,
+            # hover help: per-state cell tooltips + per-column header tooltips
+            tooltip_conditional=tips or [],
+            tooltip_header=header_tips or {},
+            tooltip_delay=150, tooltip_duration=None,
+            css=[{"selector": ".dash-table-tooltip",
+                  "rule": "background-color:#0f172a; color:#e2e8f0; "
+                          "border:1px solid #334155; font-size:0.68rem; "
+                          "max-width:260px; padding:6px 8px;"}],
+        )
+
+    def _tip(col, word, text):
+        return {"if": {"column_id": col,
+                       "filter_query": f'{{{col}}} contains "{word}"'},
+                "value": text, "type": "markdown"}
+
+    open_records = []
+    for o, (cur, verdict, vdir) in zip(opens, _cross):
+        d, entry = o.get("dir"), o.get("entry")
+        cur = round(cur, 2) if cur else None
+        pnl = round((cur / entry - 1.0) * 100.0, 1) if (cur and entry) else None
+        if verdict is None:
+            flag = "· no board data"                 # scan failed / index has no data
+        elif verdict == "NO-TRADE":
+            flag = "⚠ board flat — stale"             # arrow gone, position orphaned
+        elif vdir and vdir != d:
+            flag = f"⚠ board now {vdir} — contradicts"  # board leans the OPPOSITE side
+        elif vdir == d:
+            flag = "✓ board confirms"                 # board still on this side
+        else:
+            flag = "· indeterminate"                  # TRADE but no clear direction
+        open_records.append({
+            "index": o["label"], "side": d, "strike": o.get("strike"),
+            "since": o.get("open_t"), "entry": entry, "now": cur,
+            "pnl": (pnl / 100.0) if pnl is not None else None,
+            "band": "broke" if o.get("bb") else "—", "check": flag,
+        })
+    open_cols = [
+        {"name": "Index", "id": "index"},
+        {"name": "Side", "id": "side"},
+        {"name": "Strike", "id": "strike", "type": "numeric"},
+        {"name": "Since", "id": "since"},
+        {"name": "Entry", "id": "entry", "type": "numeric", "format": _rupee},
+        {"name": "Now", "id": "now", "type": "numeric", "format": _rupee},
+        {"name": "P&L (unreal.)", "id": "pnl", "type": "numeric", "format": _pctf},
+        {"name": "Band", "id": "band"},
+        {"name": "Live check", "id": "check"},
+    ]
+    open_extra_cond = [
+        {"if": {"filter_query": '{check} contains "confirms"', "column_id": "check"},
+         "color": "#22c55e", "fontWeight": "600"},
+        {"if": {"filter_query": '{check} contains "stale"', "column_id": "check"},
+         "color": "#f59e0b", "fontWeight": "600"},
+        {"if": {"filter_query": '{check} contains "contradicts"', "column_id": "check"},
+         "color": "#f87171", "fontWeight": "600"},
+        {"if": {"filter_query": '{check} contains "no board"', "column_id": "check"},
+         "color": "#64748b", "fontWeight": "600"},
+        {"if": {"filter_query": '{check} contains "indeterminate"', "column_id": "check"},
+         "color": "#64748b", "fontWeight": "600"},
+        {"if": {"filter_query": '{band} contains "broke"', "column_id": "band"},
+         "color": "#f59e0b", "fontWeight": "600"},
+    ]
+    open_tips = [
+        _tip("check", "confirms", "Board still leans your side — thesis intact."),
+        _tip("check", "stale", "Board went NO-TRADE — arrow gone. An orphan the live "
+             "strip no longer shows; held until it flips or hits SL / target."),
+        _tip("check", "contradicts", "Board now leans the OPPOSITE side — the live arrow "
+             "reversed against this position."),
+        _tip("check", "no board", "Scan failed / this index has no data right now."),
+        _tip("check", "indeterminate", "Board shows a trade but no clear direction."),
+        _tip("band", "broke", "Index moved BEYOND the forward σ-range band since entry — "
+             "a bigger move than the band expected."),
+    ]
+    open_header_tips = {
+        "side": "CE = call (bullish lean) · PE = put (bearish lean)",
+        "strike": "ATM strike at the moment the position opened.",
+        "since": "When this position opened (HH:MM).",
+        "entry": "Option premium paid at entry.",
+        "now": "Live option premium.",
+        "pnl": "Unrealised P&L = now / entry − 1.",
+        "band": "'broke' = index broke the forward σ-range band since entry.",
+        "check": "Live board vs your held side — is the arrow still with you?",
+    }
+    open_tbl = _ledger_table(open_records, open_cols, open_extra_cond,
+                             open_tips, open_header_tips, tbl_id="scout-open-table")
+
+    # ── CLOSED section — same sortable/filterable ledger (shared _ledger_table) ──
+    closed_records = []
     for e in closed:
-        d = e.get("dir")
-        badge, bc = _OUTCOME_BADGE.get(e.get("outcome"), ("—", "#94a3b8"))
+        badge, _bc = _OUTCOME_BADGE.get(e.get("outcome"), ("—", "#94a3b8"))
         pnl = e.get("pnl")
-        pnl_c = "#22c55e" if (pnl or 0) >= 0 else "#f87171"
-        closed_rows.append(html.Tr([
-            html.Td(e["label"], style={"fontWeight": "700"}),
-            html.Td(d, style={"color": "#34d399" if d == "CE" else "#f87171",
-                              "fontWeight": "700"}),
-            html.Td(e.get("strike")),
-            html.Td(f"{e.get('open_t')}→{e.get('close_t') or '—'}"),
-            html.Td(f"₹{e.get('entry')}" if e.get("entry") else "—"),
-            html.Td(f"₹{e.get('exit')}" if e.get("exit") else "—"),
-            html.Td(f"{pnl:+.1f}%" if pnl is not None else "—",
-                    style={"color": pnl_c, "fontWeight": "700"}),
-            html.Td(badge, style={"color": bc, "fontWeight": "600"}),
-        ]))
-    closed_head = html.Thead(html.Tr([html.Th(h) for h in
-        ("Index", "Side", "Strike", "Held", "Entry", "Exit", "P&L (real.)", "Outcome")],
-        style={"color": "#94a3b8", "fontSize": "0.62rem", "textTransform": "uppercase"}))
-    closed_tbl = (dbc.Table([closed_head, html.Tbody(closed_rows)], bordered=False,
-                            hover=True, color="dark", size="sm",
-                            style={"fontSize": "0.72rem", "marginBottom": "6px"})
-                  if closed_rows else
-                  html.Div("No closed episodes yet.", style={"color": "#64748b",
-                           "fontSize": "0.66rem", "marginBottom": "6px"}))
+        closed_records.append({
+            "index": e["label"], "side": e.get("dir"), "strike": e.get("strike"),
+            "held": f"{e.get('open_t')}→{e.get('close_t') or '—'}",
+            "entry": e.get("entry"), "exit": e.get("exit"),
+            "pnl": (pnl / 100.0) if pnl is not None else None,
+            "outcome": badge,
+        })
+    closed_cols = [
+        {"name": "Index", "id": "index"},
+        {"name": "Side", "id": "side"},
+        {"name": "Strike", "id": "strike", "type": "numeric"},
+        {"name": "Held", "id": "held"},
+        {"name": "Entry", "id": "entry", "type": "numeric", "format": _rupee},
+        {"name": "Exit", "id": "exit", "type": "numeric", "format": _rupee},
+        {"name": "P&L (real.)", "id": "pnl", "type": "numeric", "format": _pctf},
+        {"name": "Outcome", "id": "outcome"},
+    ]
+    closed_extra_cond = [
+        {"if": {"filter_query": '{outcome} contains "SL"', "column_id": "outcome"},
+         "color": "#f87171", "fontWeight": "600"},
+        {"if": {"filter_query": '{outcome} contains "target"', "column_id": "outcome"},
+         "color": "#22c55e", "fontWeight": "600"},
+        {"if": {"filter_query": '{outcome} contains "flipped"', "column_id": "outcome"},
+         "color": "#f59e0b", "fontWeight": "600"},
+        {"if": {"filter_query": '{outcome} contains "unresolved"', "column_id": "outcome"},
+         "color": "#64748b", "fontWeight": "600"},
+    ]
+    closed_tips = [
+        _tip("outcome", "target", "Premium hit the +65% target."),
+        _tip("outcome", "flipped", "Arrow reversed to the other side → position exited "
+             "(the dominant exit at 60m — SL / target rarely bind)."),
+        _tip("outcome", "SL", "Premium hit the −35% stop."),
+        _tip("outcome", "unresolved", "Defensive: a prior NEW that never recorded a close."),
+    ]
+    closed_header_tips = {
+        "side": "CE = call (bullish lean) · PE = put (bearish lean)",
+        "strike": "ATM strike at entry.",
+        "held": "Open → close time span (HH:MM→HH:MM).",
+        "entry": "Option premium at entry.",
+        "exit": "Option premium at close.",
+        "pnl": "Realised P&L = exit / entry − 1.",
+        "outcome": "How the episode closed.",
+    }
+    closed_tbl = _ledger_table(closed_records, closed_cols, closed_extra_cond,
+                               closed_tips, closed_header_tips, tbl_id="scout-closed-table")
 
     # ── day summary — realized win-rate + avg (reinforces negative-EV arrow) ──────
     rp = [e["pnl"] for e in closed if e.get("pnl") is not None]
@@ -4246,13 +4406,17 @@ def _scout_openpos_body(today: str, as_of):
     ], style={"fontSize": "0.68rem", "marginBottom": "8px"})
 
     note = html.Div(
-        "One stance per index. OPEN holds through NO-TRADE blinks until it flips / hits "
-        "SL / target — a ⚠ stale row is an orphan the live strip no longer shows, ⚠ "
-        "contradicts leans opposite the current arrow. CLOSED P&L is realized "
-        f"(entry→exit on the arrow's option). Alert-log state, tf={_ALERT_TF}m. Decision-support "
-        "only — the arrow is negative-EV; trade the range band, not the arrow.",
+        "Hover any cell or header for what it means. Click a header to sort ⇕; use the "
+        "search box (top-right) to filter both tables across all columns (e.g. NIFTY, PE, "
+        "flipped, contradicts). One stance per index; OPEN holds through NO-TRADE blinks "
+        "until it flips / hits SL / target. CLOSED P&L is realized (entry→exit on the "
+        f"arrow's option). Alert-log state, tf={_ALERT_TF}m. Decision-support only — the "
+        "arrow is negative-EV; trade the range band, not the arrow.",
         style={"color": "#64748b", "fontSize": "0.58rem", "lineHeight": "1.4"})
     return html.Div([
+        # full unfiltered rows — the search box filters the tables FROM these
+        dcc.Store(id="scout-open-store", data=open_records),
+        dcc.Store(id="scout-closed-store", data=closed_records),
         summary,
         html.Div("● OPEN", style={"color": "#34d399", "fontSize": "0.6rem",
                  "fontWeight": "700", "marginBottom": "3px"}),
@@ -6851,23 +7015,105 @@ def _viewer_seed_loop() -> None:
         _t.sleep(15)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Portable 'is this PID still running?' — Windows via OpenProcess+exit-code, POSIX
+    via signal-0. Used to tell a live capture lock from a stale one."""
+    import os
+    if not pid or pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            ctypes.windll.kernel32.CloseHandle(h)
+            return code.value == 259                     # STILL_ACTIVE
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_role() -> str:
+    """Capturer vs viewer — SAFE BY DEFAULT. This box CAPTURES (holds the Fyers WS,
+    runs the pollers, WRITES the mirrors) only when it is the DESIGNATED capturer —
+    a `.capture_host` marker beside the mirror dir — or capture is explicitly forced
+    (TRADEBOT_CAPTURE=1). Anything else, including a bare `python dashboard.py`, runs
+    as a read-only VIEWER, so a laptop can NEVER accidentally clobber the VM's synced
+    mirrors. DASH_VIEWER=1 always forces viewer. Returns 'viewer' | 'capturer'."""
+    import os
+    from core.constants import LIVE_DIR
+    if os.environ.get("DASH_VIEWER") == "1":
+        return "viewer"
+    forced = os.environ.get("TRADEBOT_CAPTURE") == "1"
+    marked = (LIVE_DIR.parent / ".capture_host").exists()
+    return "capturer" if (forced or marked) else "viewer"
+
+
+def _acquire_capture_lock():
+    """Enforce ONE capturer per box (the single-writer invariant, not by convention).
+    Atomically create LIVE_DIR/.capture.lock with our PID (O_CREAT|O_EXCL). If it is
+    already held by a LIVE pid → REFUSE loudly and exit (two capturers double-write /
+    clobber the mirrors). A stale lock (dead pid) is taken over. Returns the lock Path."""
+    import os, sys
+    from core.constants import LIVE_DIR
+    LIVE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = LIVE_DIR / ".capture.lock"
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            try:
+                held = int((lock.read_text() or "0").strip() or "0")
+            except Exception:
+                held = 0
+            if held and held != os.getpid() and _pid_alive(held):
+                print(SEP)
+                print(f"  REFUSING to capture — another capturer (PID {held}) already "
+                      f"holds {lock.name}.")
+                print("  Two capturers would double-write and clobber the mirrors.")
+                print("  Run the read-only viewer instead:")
+                print("      DASH_VIEWER=1 python dashboard.py")
+                print(SEP)
+                sys.exit(1)
+            try:                                         # stale lock → reclaim, retry once
+                lock.unlink()
+            except Exception:
+                pass
+    print("  WARN: could not acquire capture lock; proceeding.", file=sys.stderr)
+    return lock
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import os, webbrowser
-    # VIEWER MODE (DASH_VIEWER=1): a read-only client. Starts NO capture threads —
-    # no WebSocket, no pollers, no mirror writes — so it never CLOBBERS the parquet
-    # mirrors synced from the VM (sync_from_vm.py). This splits the capturer role
-    # (VM, 24/7) from the viewer role (a part-time laptop), so the laptop sees the
-    # VM's full session instead of overwriting it with its own partial capture.
-    VIEWER = os.environ.get("DASH_VIEWER") == "1"
+    # ROLE IS SAFE BY DEFAULT (see _resolve_role): a bare launch on a non-capture box
+    # runs as a read-only VIEWER — no WebSocket, no pollers, no mirror writes — so it
+    # can never CLOBBER the parquet mirrors synced from the VM (sync_from_vm.py). The
+    # capturer role (VM, 24/7) is opted into via a `.capture_host` marker or
+    # TRADEBOT_CAPTURE=1; a second capturer on the same box is refused by a PID lock.
+    role = _resolve_role()
+    VIEWER = role == "viewer"
+    _explicit_viewer = os.environ.get("DASH_VIEWER") == "1"
 
     print(SEP)
     print("  NSE INDEX " + ("VIEWER (read-only, synced mirrors)" if VIEWER
-                            else "LIVE DASHBOARD  +  OPTION CHAIN"))
+                            else "LIVE DASHBOARD  +  OPTION CHAIN  [CAPTURER]"))
     print(SEP)
 
     if VIEWER:
         print("  VIEWER MODE — capture disabled. Reading data/intraday/live/ mirrors.")
+        if not _explicit_viewer:
+            print("  (default-safe: no .capture_host marker → viewer. To CAPTURE on this "
+                  "box, create data/intraday/.capture_host or set TRADEBOT_CAPTURE=1.)")
         print("  Refresh them from the VM with:  python sync_from_vm.py  (or --watch).")
         _viewer_seed_latest()   # immediate seed so cards aren't blank on first paint
         # (the per-date re-seed is driven by the master news-date via _seed_cards_on_date)
@@ -6880,6 +7126,9 @@ if __name__ == "__main__":
                              daemon=True, name="macro-radar").start()
             print("  Macro radar poller started (viewer) — 180s intervals")
     else:
+        # single-writer guard — refuse if another capturer already owns this box's mirrors
+        _acquire_capture_lock()
+        print(f"  CAPTURER — mirror lock held (PID {os.getpid()}). Writing mirrors.")
         raw_token     = _validate_token()
         _access_token = raw_token
 

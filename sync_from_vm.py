@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -43,29 +44,60 @@ def _today() -> str:
 
 
 def pull(date: str, host: str, key: str, remote_dir: str) -> bool:
-    """scp the VM's <date>_*.parquet mirrors into the local LIVE_DIR. Returns ok."""
+    """scp the VM's <date>_*.parquet mirrors down, then ATOMICALLY publish each into
+    LIVE_DIR. scp writes into a staging dir first; each finished file is os.replace()'d
+    onto its live path (atomic on the same volume). A reader (the dashboard) therefore
+    always sees a COMPLETE old-or-new file — never the half-written / locked target that
+    an in-place scp exposes (which caused 10-15s retry stalls + torn 'not full' reads).
+    Returns ok."""
     LIVE_DIR.mkdir(parents=True, exist_ok=True)
     if not Path(key).exists():
         print(f"  SSH key not found: {key}", file=sys.stderr)
         return False
+    # staging lives beside LIVE_DIR (same volume → os.replace is atomic) and OUTSIDE it
+    # so the dashboard's mirror glob never sees a half-synced file.
+    stage = LIVE_DIR.parent / f".sync_staging_{date}"
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
     remote = f"{host}:{remote_dir}/{date}_*.parquet"
     cmd = ["scp", "-q", "-o", "ConnectTimeout=20", "-o", "StrictHostKeyChecking=accept-new",
-           "-i", key, remote, str(LIVE_DIR)]
+           "-i", key, remote, str(stage)]
     t0 = time.time()
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     except Exception as exc:
         print(f"  scp failed: {exc}", file=sys.stderr)
+        shutil.rmtree(stage, ignore_errors=True)
         return False
     if r.returncode != 0:
         # No matching files yet (pre-open) is not a hard error — report softly.
         msg = (r.stderr or "").strip()
         print(f"  scp rc={r.returncode} {msg}", file=sys.stderr)
+        shutil.rmtree(stage, ignore_errors=True)
         return False
-    pulled = sorted(p.name for p in LIVE_DIR.glob(f"{date}_*.parquet"))
-    mb = sum(p.stat().st_size for p in LIVE_DIR.glob(f"{date}_*.parquet")) / 1e6
-    print(f"  synced {len(pulled)} mirrors ({mb:.1f} MB) for {date} in {time.time()-t0:.1f}s")
-    return True
+    # atomically publish: os.replace each staged file onto its live path. Retry on the
+    # brief PermissionError a reader can cause by having the old file open at that instant.
+    published, mb = 0, 0.0
+    for src in sorted(stage.glob(f"{date}_*.parquet")):
+        dst = LIVE_DIR / src.name
+        for _ in range(6):
+            try:
+                os.replace(src, dst)
+                published += 1
+                mb += dst.stat().st_size / 1e6
+                break
+            except PermissionError:
+                time.sleep(0.2)
+        else:
+            try:                                   # last resort so we don't drop the update
+                shutil.copy2(src, dst)
+                published += 1
+                mb += dst.stat().st_size / 1e6
+            except Exception as exc:
+                print(f"  publish failed for {src.name}: {exc}", file=sys.stderr)
+    shutil.rmtree(stage, ignore_errors=True)
+    print(f"  synced {published} mirrors ({mb:.1f} MB) for {date} in {time.time()-t0:.1f}s")
+    return published > 0
 
 
 def main() -> None:
