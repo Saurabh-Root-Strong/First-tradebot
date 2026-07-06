@@ -1822,6 +1822,14 @@ app.layout = dbc.Container([
                                                    id="charts-help-title"), close_button=True),
                     dbc.ModalBody(html.Div(_charts_help("options"), id="charts-help-box")),
                 ], id="charts-help-modal", is_open=False, size="lg", scrollable=True),
+                # Open-positions popup — every stance the alert log is still holding
+                # (since 09:35 post-warmup) + a live cross-check. Surfaces the sticky
+                # holds that make the strip read as contradictory across indices.
+                dbc.Modal([
+                    dbc.ModalHeader(dbc.ModalTitle(
+                        "📋 Scout day ledger — open + closed (since 09:35)")),
+                    dbc.ModalBody(html.Div(id="scout-openpos-body")),
+                ], id="scout-openpos-modal", is_open=False, size="lg", scrollable=True),
                 dcc.Loading(dcc.Graph(
                     id="charts-graph",
                     config={
@@ -3385,6 +3393,26 @@ def _open_help_modal(_n):
     return True
 
 
+@app.callback(Output("scout-openpos-modal", "is_open"),
+              Output("scout-openpos-body", "children"),
+              Input("scout-openpos-btn", "n_clicks"),
+              State("charts-asof", "value"), State("news-date", "data"),
+              prevent_initial_call=True)
+def _open_scout_openpos(_n, asof, date):
+    """Populate + open the open-positions popup at the strip's current clock (respects an
+    explicit Replay minute; else live now). Reconstructs held state fresh on each click."""
+    today = datetime.datetime.now(IST).date().isoformat()
+    if asof and asof not in ("full", "ghost"):
+        day = date or today
+        try:
+            as_of = datetime.datetime.fromisoformat(f"{day}T{asof}:00+05:30")
+        except Exception:
+            day, as_of = today, datetime.datetime.now(IST)
+    else:
+        day, as_of = today, datetime.datetime.now(IST)
+    return True, _scout_openpos_body(day, as_of)
+
+
 @app.callback(Output("charts-help-box", "children"), Output("charts-help-title", "children"),
               Input("charts-mode", "value"))
 def _swap_charts_help(mode):
@@ -4057,6 +4085,183 @@ def _ghost_boot(_path, cur):
     return no_update
 
 
+# Timeframe the ALERT poller runs at (NEW/FLIP/BAND detection + the forward band the
+# RANGE-BREAK checks against). Set to 60 to match the charts-tf UI default (60m band =
+# the validated RANGE product). The poller is a headless server loop and CANNOT read the
+# per-browser charts-tf dropdown, so its tf lives here as the single source of truth —
+# threaded into scan(), the "broke the {tf}m band" label, and the live-overlay gate.
+# 60m structure flips far less than 15m (kills the whipsaw churn) and the wider band
+# breaks less often (each RANGE BREAK more meaningful).
+_ALERT_TF = 60
+
+
+def _scout_episodes(today: str):
+    """Replay the persisted scout_alerts log into per-index EPISODES: each NEW → close
+    (FLIP / SL / TARGET) pair, plus any still-open tail. Returns (open, closed): open is
+    the held tail per index; closed is every resolved episode, newest-first. Realized P&L
+    on a close = exit(cur) / entry − 1 (the arrow's option, entry→exit). Leak-safe — pure
+    replay of what the poller already wrote."""
+    import pandas as pd
+    from core.mirror_io import read_mirror
+    opens, closed = [], []
+    df = read_mirror("scout_alerts", today)
+    if df is None or df.empty:
+        return opens, closed
+
+    def _v(x):
+        return None if x is None or (isinstance(x, float) and pd.isna(x)) else x
+
+    for sym, g in df.groupby("symbol"):                  # df is ts-ascending
+        ep = None
+        for _, r in g.iterrows():
+            kind = str(r.get("kind") or "")
+            if kind == "NEW":
+                if ep:                                   # defensive: prior NEW never closed
+                    closed.append({**ep, "close_t": None, "outcome": "?",
+                                   "exit": None, "pnl": None})
+                strike = _v(r.get("strike"))
+                ep = {"sym": sym, "label": _v(r.get("label")) or str(sym),
+                      "dir": _v(r.get("side")),
+                      "strike": int(strike) if strike is not None else None,
+                      "entry": _v(r.get("entry")), "open_t": r["ts"].strftime("%H:%M"),
+                      "bb": False}
+            elif kind == "BAND" and ep:
+                ep["bb"] = True
+            elif kind in ("FLIP", "SL", "TARGET") and ep:
+                exit_p, entry = _v(r.get("cur")), ep.get("entry")
+                pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
+                closed.append({**ep, "close_t": r["ts"].strftime("%H:%M"),
+                               "outcome": kind, "exit": exit_p, "pnl": pnl})
+                ep = None
+        if ep:
+            opens.append(ep)
+    closed.sort(key=lambda e: e.get("close_t") or "", reverse=True)
+    return opens, closed
+
+
+_OUTCOME_BADGE = {"FLIP": ("↺ flipped", "#f59e0b"), "SL": ("🛑 SL hit", "#f87171"),
+                  "TARGET": ("🎯 target", "#22c55e"), "?": ("? unresolved", "#94a3b8")}
+
+
+def _scout_openpos_body(today: str, as_of):
+    """Popup body: the day's scout ledger — OPEN positions (with a live cross-check +
+    unrealized P&L) on top, then CLOSED episodes (outcome + realized P&L), newest-first.
+    All reconstructed from the persisted alert log (tf = _ALERT_TF)."""
+    import intraday_scout as scout
+    opens, closed = _scout_episodes(today)
+    if not opens and not closed:
+        return html.Div("No scout episodes yet — the alert log is empty.",
+                        style={"color": "#94a3b8", "fontSize": "0.8rem", "padding": "10px"})
+
+    # ── OPEN section — live cross-check + unrealized P&L ─────────────────────────
+    open_rows = []
+    for o in opens:
+        sym, d, k, entry = o["sym"], o.get("dir"), o.get("strike"), o.get("entry")
+        try:
+            cur = scout._opt_premium(sym, today, as_of, k, d) if k else None
+        except Exception:
+            cur = None
+        cur = round(cur, 2) if cur else None
+        pnl = round((cur / entry - 1.0) * 100.0, 1) if (cur and entry) else None
+        try:
+            v = scout.scan_index(sym, _ALERT_TF, date=today, as_of=as_of,
+                                 with_lifecycle=False, verdict_only=True)
+            verdict, vdir = v.get("verdict"), v.get("direction")
+        except Exception:
+            verdict, vdir = None, None
+        if verdict == "NO-TRADE":
+            flag, fc = "⚠ board flat — stale", "#f59e0b"
+        elif vdir and vdir != d:
+            flag, fc = f"⚠ board now {vdir} — contradicts", "#f87171"
+        elif vdir == d:
+            flag, fc = "✓ board confirms", "#22c55e"
+        else:
+            flag, fc = "—", "#94a3b8"
+        pnl_c = "#22c55e" if (pnl or 0) >= 0 else "#f87171"
+        open_rows.append(html.Tr([
+            html.Td(o["label"], style={"fontWeight": "700"}),
+            html.Td(d, style={"color": "#34d399" if d == "CE" else "#f87171",
+                              "fontWeight": "700"}),
+            html.Td(k), html.Td(o.get("open_t")),
+            html.Td(f"₹{entry}" if entry else "—"),
+            html.Td(f"₹{cur}" if cur else "—"),
+            html.Td(f"{pnl:+.1f}%" if pnl is not None else "—",
+                    style={"color": pnl_c, "fontWeight": "700"}),
+            html.Td("broke" if o.get("bb") else "—",
+                    style={"color": "#f59e0b" if o.get("bb") else "#475569"}),
+            html.Td(flag, style={"color": fc, "fontWeight": "600"}),
+        ]))
+    open_head = html.Thead(html.Tr([html.Th(h) for h in
+        ("Index", "Side", "Strike", "Since", "Entry", "Now", "P&L (unreal.)", "Band",
+         "Live check")],
+        style={"color": "#94a3b8", "fontSize": "0.62rem", "textTransform": "uppercase"}))
+    open_tbl = (dbc.Table([open_head, html.Tbody(open_rows)], bordered=False, hover=True,
+                          color="dark", size="sm",
+                          style={"fontSize": "0.72rem", "marginBottom": "6px"})
+                if open_rows else
+                html.Div("No open positions.", style={"color": "#64748b",
+                         "fontSize": "0.66rem", "marginBottom": "6px"}))
+
+    # ── CLOSED section — outcome + realized P&L ──────────────────────────────────
+    closed_rows = []
+    for e in closed:
+        d = e.get("dir")
+        badge, bc = _OUTCOME_BADGE.get(e.get("outcome"), ("—", "#94a3b8"))
+        pnl = e.get("pnl")
+        pnl_c = "#22c55e" if (pnl or 0) >= 0 else "#f87171"
+        closed_rows.append(html.Tr([
+            html.Td(e["label"], style={"fontWeight": "700"}),
+            html.Td(d, style={"color": "#34d399" if d == "CE" else "#f87171",
+                              "fontWeight": "700"}),
+            html.Td(e.get("strike")),
+            html.Td(f"{e.get('open_t')}→{e.get('close_t') or '—'}"),
+            html.Td(f"₹{e.get('entry')}" if e.get("entry") else "—"),
+            html.Td(f"₹{e.get('exit')}" if e.get("exit") else "—"),
+            html.Td(f"{pnl:+.1f}%" if pnl is not None else "—",
+                    style={"color": pnl_c, "fontWeight": "700"}),
+            html.Td(badge, style={"color": bc, "fontWeight": "600"}),
+        ]))
+    closed_head = html.Thead(html.Tr([html.Th(h) for h in
+        ("Index", "Side", "Strike", "Held", "Entry", "Exit", "P&L (real.)", "Outcome")],
+        style={"color": "#94a3b8", "fontSize": "0.62rem", "textTransform": "uppercase"}))
+    closed_tbl = (dbc.Table([closed_head, html.Tbody(closed_rows)], bordered=False,
+                            hover=True, color="dark", size="sm",
+                            style={"fontSize": "0.72rem", "marginBottom": "6px"})
+                  if closed_rows else
+                  html.Div("No closed episodes yet.", style={"color": "#64748b",
+                           "fontSize": "0.66rem", "marginBottom": "6px"}))
+
+    # ── day summary — realized win-rate + avg (reinforces negative-EV arrow) ──────
+    rp = [e["pnl"] for e in closed if e.get("pnl") is not None]
+    wins = sum(1 for x in rp if x > 0)
+    avg = round(sum(rp) / len(rp), 1) if rp else None
+    summ_c = "#22c55e" if (avg or 0) >= 0 else "#f87171"
+    summary = html.Div([
+        html.Span(f"{len(opens)} open  ·  {len(closed)} closed", style={"color": "#e2e8f0",
+                  "fontWeight": "700"}),
+        html.Span(f"   realized: {wins}/{len(rp)} win", style={"color": "#94a3b8"})
+        if rp else html.Span(""),
+        html.Span(f"  ·  avg {avg:+.1f}%" if avg is not None else "",
+                  style={"color": summ_c, "fontWeight": "700"}),
+    ], style={"fontSize": "0.68rem", "marginBottom": "8px"})
+
+    note = html.Div(
+        "One stance per index. OPEN holds through NO-TRADE blinks until it flips / hits "
+        "SL / target — a ⚠ stale row is an orphan the live strip no longer shows, ⚠ "
+        "contradicts leans opposite the current arrow. CLOSED P&L is realized "
+        f"(entry→exit on the arrow's option). Alert-log state, tf={_ALERT_TF}m. Decision-support "
+        "only — the arrow is negative-EV; trade the range band, not the arrow.",
+        style={"color": "#64748b", "fontSize": "0.58rem", "lineHeight": "1.4"})
+    return html.Div([
+        summary,
+        html.Div("● OPEN", style={"color": "#34d399", "fontSize": "0.6rem",
+                 "fontWeight": "700", "marginBottom": "3px"}),
+        open_tbl,
+        html.Div("○ CLOSED", style={"color": "#94a3b8", "fontSize": "0.6rem",
+                 "fontWeight": "700", "margin": "8px 0 3px"}),
+        closed_tbl, note])
+
+
 def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=False):
     import intraday_scout as scout
     rows = scout.scan(int(tf_min or 15), date, as_of_dt)
@@ -4069,7 +4274,7 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
     # Overlay the live trade brain ONLY for the live 15m view (the alert detector that
     # fills scout-seen scans at 15m). On replay / a different TF the per-bar scan is the
     # honest source, so no overlay.
-    seen = seen if (live and int(tf_min or 15) == 15) else {}
+    seen = seen if (live and int(tf_min or _ALERT_TF) == _ALERT_TF) else {}
     today = datetime.datetime.now(IST).date().isoformat()
     when = ("LIVE" if live else
             f"👻 GHOST {date} @ {as_of_dt:%H:%M} — practice, future hidden" if
@@ -4088,6 +4293,19 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
                            "fontSize": "0.62rem", "fontWeight": "700"})
           if graded else
           html.Span(_pend, style={"color": "#475569", "fontSize": "0.58rem"}))
+    if live:
+        _op, _cl = _scout_episodes(today)
+        n_open, n_closed = len(_op), len(_cl)
+    else:
+        n_open = n_closed = 0
+    openbtn = (html.Button(
+        f"📋 {n_open} open · {n_closed} closed",
+        id="scout-openpos-btn", n_clicks=0, title="the day's scout ledger — open positions "
+        "(with a live cross-check) + closed episodes (SL / target / flipped) with realized P&L",
+        style={"marginLeft": "10px", "fontSize": "0.58rem", "color": "#67e8f9",
+               "background": "#0b2530", "border": "1px solid #164e63",
+               "borderRadius": "4px", "padding": "1px 8px", "cursor": "pointer"})
+        if live else None)
     title = html.Div([
         html.Span(f"🎯 SCOUT — predict next {tf_min}m  ·  {when}  ·  ", title=(
             "GHOST PRACTICE: a past captured session replayed on today's wall clock — "
@@ -4099,7 +4317,7 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
             "letterSpacing": "0.05em", **({"cursor": "help"} if practice else {})}),
         html.Span(f"{n_trade} trade{'s' if n_trade != 1 else ''} on the board",
                   style={"color": "#94a3b8", "fontSize": "0.62rem"}),
-        sb,
+        sb, openbtn,
     ], style={"marginBottom": "5px"})
     note = html.Div([
         html.Span("⛔ MEASURED OPTION P&L (backtest_scout, 8d, n=73): buying the ATM "
@@ -4191,7 +4409,7 @@ def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
         color = "#f59e0b"
     else:                                                 # BAND
         head = f"📊 RANGE BREAK {band_dir} · {label}"
-        body = (f"index {spot} broke the 15m band [{pos.get('bl')}, {pos.get('bh')}]"
+        body = (f"index {spot} broke the {_ALERT_TF}m band [{pos.get('bl')}, {pos.get('bh')}]"
                 " — move bigger than expected")
         color = "#60a5fa"
     return {"t": now.strftime("%H:%M"), "d": now.date().isoformat(),
@@ -4233,7 +4451,7 @@ def _scout_detect(state, now, persist):
     today = now.date().isoformat()
     events: list = []
     try:
-        rows = scout.scan(15, today, now)
+        rows = scout.scan(_ALERT_TF, today, now)
     except Exception:
         return events
 
