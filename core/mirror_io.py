@@ -27,6 +27,34 @@ def _load_processed(path_str: str, _mtime_ns: int, _size: int) -> "pd.DataFrame"
     return df.sort_values("ts").reset_index(drop=True)
 
 
+# TODAY's mirror is re-read on every scout/render pass (4 idx × many lookbacks × 34
+# callbacks) — an uncached read re-parsed a growing multi-MB ticks file hundreds of
+# times per render. Cache it too, keyed on (mtime, size): the file only changes when
+# the writer exports (~every 10 s = the mirror's existing staleness bound), so a hit is
+# never staler than a fresh read would have been. Bounded to ONE frame per live file
+# (replaced on change, whole dict cleared past ~2 sessions' worth of tables) so it can't
+# balloon the capture VM's RAM the way an unbounded lru would at day rollover.
+_LIVE_CACHE: dict = {}   # path_str -> ((mtime_ns, size), df)
+_LIVE_CACHE_CAP = 16     # ~8 live tables; slack for one day rollover before a full clear
+
+
+def _load_live(p) -> "pd.DataFrame":
+    """mtime/size-cached parse of TODAY's growing mirror (never stale, RAM-bounded)."""
+    st = p.stat()
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _LIVE_CACHE.get(str(p))
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    df = pd.read_parquet(p)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
+    df = df[df["ts"] >= pd.Timestamp("2000-01-01", tz=IST)]
+    df = df.sort_values("ts").reset_index(drop=True)
+    if len(_LIVE_CACHE) > _LIVE_CACHE_CAP:   # guard the capture VM's RAM at date rollover
+        _LIVE_CACHE.clear()
+    _LIVE_CACHE[str(p)] = (key, df)
+    return df
+
+
 def read_mirror(tbl: str, date: str | None = None,
                 as_of: "datetime.datetime | None" = None,
                 symbol: str | None = None) -> "pd.DataFrame | None":
@@ -43,12 +71,9 @@ def read_mirror(tbl: str, date: str | None = None,
         return None
     try:
         if day == today_iso():
-            # LIVE file grows all session — read fresh (never cache: avoids stale
-            # reads + unbounded cache growth on the capture box).
-            df = pd.read_parquet(p)
-            df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-            df = df[df["ts"] >= pd.Timestamp("2000-01-01", tz=IST)]
-            df = df.sort_values("ts").reset_index(drop=True)
+            # LIVE file grows all session — mtime/size-cached parse (see _load_live):
+            # fresh on every export, but dedupes the hundreds of same-render re-reads.
+            df = _load_live(p)
         else:
             # PAST day = static file → cached parse (mtime/size-keyed, never stale).
             st = p.stat()

@@ -4276,15 +4276,15 @@ def _scout_openpos_body(today: str, as_of):
         cur = round(cur, 2) if cur else None
         pnl = round((cur / entry - 1.0) * 100.0, 1) if (cur and entry) else None
         if verdict is None:
-            flag = "· no board data"                 # scan failed / index has no data
+            flag = "· no data"                       # scan failed / index has no data
         elif verdict == "NO-TRADE":
-            flag = "⚠ board flat — stale"             # arrow gone, position orphaned
+            flag = "⚠ stale"                          # arrow gone, position orphaned
         elif vdir and vdir != d:
-            flag = f"⚠ board now {vdir} — contradicts"  # board leans the OPPOSITE side
+            flag = "⚠ flipped"                        # board leans the OPPOSITE side
         elif vdir == d:
-            flag = "✓ board confirms"                 # board still on this side
+            flag = "✓ confirms"                       # board still on this side
         else:
-            flag = "· indeterminate"                  # TRADE but no clear direction
+            flag = "· unclear"                        # TRADE but no clear direction
         open_records.append({
             "index": o["label"], "side": d, "strike": o.get("strike"),
             "since": o.get("open_t"), "entry": entry, "now": cur,
@@ -4307,25 +4307,22 @@ def _scout_openpos_body(today: str, as_of):
          "color": "#22c55e", "fontWeight": "600"},
         {"if": {"filter_query": '{check} contains "stale"', "column_id": "check"},
          "color": "#f59e0b", "fontWeight": "600"},
-        {"if": {"filter_query": '{check} contains "contradicts"', "column_id": "check"},
+        {"if": {"filter_query": '{check} contains "flipped"', "column_id": "check"},
          "color": "#f87171", "fontWeight": "600"},
-        {"if": {"filter_query": '{check} contains "no board"', "column_id": "check"},
+        {"if": {"filter_query": '{check} contains "no data"', "column_id": "check"},
          "color": "#64748b", "fontWeight": "600"},
-        {"if": {"filter_query": '{check} contains "indeterminate"', "column_id": "check"},
+        {"if": {"filter_query": '{check} contains "unclear"', "column_id": "check"},
          "color": "#64748b", "fontWeight": "600"},
         {"if": {"filter_query": '{band} contains "broke"', "column_id": "band"},
          "color": "#f59e0b", "fontWeight": "600"},
     ]
     open_tips = [
-        _tip("check", "confirms", "Board still leans your side — thesis intact."),
-        _tip("check", "stale", "Board went NO-TRADE — arrow gone. An orphan the live "
-             "strip no longer shows; held until it flips or hits SL / target."),
-        _tip("check", "contradicts", "Board now leans the OPPOSITE side — the live arrow "
-             "reversed against this position."),
-        _tip("check", "no board", "Scan failed / this index has no data right now."),
-        _tip("check", "indeterminate", "Board shows a trade but no clear direction."),
-        _tip("band", "broke", "Index moved BEYOND the forward σ-range band since entry — "
-             "a bigger move than the band expected."),
+        _tip("check", "confirms", "Board still on your side."),
+        _tip("check", "stale", "Board went NO-TRADE. Held till it flips or hits SL / target."),
+        _tip("check", "flipped", "Board now leans the other way."),
+        _tip("check", "no data", "Scan failed / no data now."),
+        _tip("check", "unclear", "Board shows a trade but no clear side."),
+        _tip("band", "broke", "Moved past the σ-range band since entry."),
     ]
     open_header_tips = {
         "side": "CE = call (bullish lean) · PE = put (bearish lean)",
@@ -5219,11 +5216,12 @@ def update_sidebar(_):
     dot_c = "#22c55e" if n == 4 else "#f59e0b" if n else "#ef4444"
     lbl   = "LIVE" if n == 4 else f"PARTIAL {n}/4" if n else "CONNECTING..."
     # Write-health badge — a systematic DB insert failure (schema drift, the chain_snapshots
-    # bug class) is counted in idb but was otherwise only in the log. Show it RED on the
-    # header so silent data loss is impossible to miss. 0 errors → no badge (no clutter).
+    # bug class) OR a frozen parquet export (mirror stops advancing) is counted in idb but was
+    # otherwise only in the log. Show it RED on the header so silent data loss is impossible to
+    # miss. 0 errors → no badge (no clutter).
     try:
         from intraday_db import idb as _idb
-        _ierr = _idb.insert_error_count()
+        _ierr = _idb.insert_error_count() + _idb.export_error_count()
     except Exception:
         _ierr = 0
     werr = (html.Span(f"  ⚠ WRITE ERR {_ierr}",

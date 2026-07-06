@@ -31,6 +31,7 @@ Architecture
 from __future__ import annotations
 
 import datetime
+import os
 import queue
 import threading
 import time
@@ -91,6 +92,10 @@ class IntradayDB:
         # died for weeks because per-record errors were swallowed — count every one,
         # log the first per kind (+ every 500th), expose via session_stats().
         self._insert_errors: dict[str, int] = {}
+        # Per-table PARQUET-EXPORT failures. Same rule, same reason: a persistent export
+        # failure FREEZES the lock-free mirror (readers see stale data) — must not be
+        # silent. Counted here, folded into the write-health badge via export_error_count().
+        self._export_errors: dict[str, int] = {}
 
         # Per-symbol throttle — futures API fires every 2 s; we persist every 30 s
         self._fut_last: dict[str, float] = {}
@@ -238,6 +243,8 @@ class IntradayDB:
             counts[tbl] = int(df.iloc[0]["n"]) if not df.empty else 0
         for kind, n in self._insert_errors.items():
             counts[f"insert_errors_{kind}"] = n
+        for tbl, n in self._export_errors.items():
+            counts[f"export_errors_{tbl}"] = n
         return counts
 
     def insert_error_count(self) -> int:
@@ -246,6 +253,12 @@ class IntradayDB:
         badge so a SYSTEMATIC write failure (schema drift — the chain_snapshots class of bug)
         is visible on the header, not only buried in supervisor.log."""
         return sum(self._insert_errors.values())
+
+    def export_error_count(self) -> int:
+        """Total parquet-export failures this process (0 = healthy). LIGHT in-memory counter.
+        Nonzero = the lock-free mirror is not advancing → readers see FROZEN data. Folded into
+        the write-health badge alongside insert errors so a stalled export can't stay silent."""
+        return sum(self._export_errors.values())
 
     def shutdown(self) -> None:
         """Flush remaining records, checkpoint, close.  Call at process exit."""
@@ -378,6 +391,14 @@ class IntradayDB:
         These files are plain files — no DuckDB lock — so session_replay.py can read
         them while the dashboard's write connection holds the exclusive .duckdb lock.
 
+        Written ATOMICALLY: COPY to a per-table .tmp, then os.replace onto the live path
+        (same dir → same volume → atomic rename). A concurrent reader therefore always
+        sees a COMPLETE file, never the torn/truncated mid-COPY snapshot an in-place write
+        exposes. Per-table failures are COUNTED + throttle-logged (not swallowed): a silent
+        export freeze — mirror stops advancing with nothing on the header — is the exact
+        chain_snapshots silent-death class. A failed table keeps its PREVIOUS good file
+        (replace didn't fire) and self-heals next flush.
+
         Staleness: up to FLUSH_EVERY (10 s).  Acceptable for market analysis.
         Cost: ~100–200 ms per flush (negligible vs 10-second interval).
         """
@@ -385,15 +406,33 @@ class IntradayDB:
             return
         try:
             _LIVE_DIR.mkdir(parents=True, exist_ok=True)
-            today = str(self._date)
-            for tbl in _PARQUET_TABLES:
-                pq = _LIVE_DIR / f"{today}_{tbl}.parquet"
+        except Exception as exc:
+            self._note_export_error("mkdir", exc)
+            return
+        today = str(self._date)
+        for tbl in _PARQUET_TABLES:
+            pq  = _LIVE_DIR / f"{today}_{tbl}.parquet"
+            tmp = _LIVE_DIR / f"{today}_{tbl}.parquet.tmp"
+            try:
                 # Use forward slashes — DuckDB COPY TO needs POSIX paths on Windows
                 con.execute(
-                    f"COPY {tbl} TO '{pq.as_posix()}' (FORMAT PARQUET, CODEC SNAPPY)"
+                    f"COPY {tbl} TO '{tmp.as_posix()}' (FORMAT PARQUET, CODEC SNAPPY)"
                 )
-        except Exception:
-            pass   # Parquet export is best-effort — never block trading
+                os.replace(tmp, pq)          # atomic publish (never a torn read)
+            except Exception as exc:
+                self._note_export_error(tbl, exc)
+                try:
+                    tmp.unlink()             # don't leak a half-written temp
+                except OSError:
+                    pass
+
+    def _note_export_error(self, tbl: str, exc: Exception) -> None:
+        """Count + throttle-log a parquet-export failure (first per table, then every
+        500th). Surfaced on the write-health badge so a frozen mirror can't stay silent."""
+        n = self._export_errors.get(tbl, 0) + 1
+        self._export_errors[tbl] = n
+        if n == 1 or n % 500 == 0:
+            print(f"[IntradayDB] {tbl} parquet export FAILED (x{n}): {exc}", flush=True)
 
     def _exec_query(self, req: _QueryReq) -> None:
         import pandas as pd
