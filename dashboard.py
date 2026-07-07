@@ -5251,8 +5251,29 @@ def update_sidebar(_):
     werr = (html.Span(f"  ⚠ WRITE ERR {_ierr}",
                       style={"color": "#ef4444", "fontWeight": "700"})
             if _ierr else "")
+    # Capture-freshness badge — presence-based LIVE/PARTIAL/CONNECTING can't see a FROZEN
+    # feed: a stale _latest (VM capture died, or in viewer mode the sync stopped) still reads
+    # "● LIVE". During a live session only, if the freshest tick has aged past the tolerance
+    # (sync 60s + mirror-export lag → a healthy viewer can trail ~2min; 240s avoids false
+    # alarms, catches a real death within 4min), surface it RED so a silent gap is impossible
+    # to miss. Outside the session / on a past day it stays hidden (no clutter after close).
+    stale = ""
+    try:
+        from core.market_calendar import is_trading_day
+        _nowdt = datetime.datetime.now(tz=IST)
+        if (is_trading_day(_nowdt.date())
+                and datetime.time(9, 15) <= _nowdt.time() <= datetime.time(15, 31)):
+            _fts = [float((t or {}).get("exch_feed_time") or 0) for t in latest.values()]
+            _newest = max(_fts) if _fts else 0.0
+            _age = (_nowdt.timestamp() - _newest) if _newest else 1e9
+            if _age > 240:
+                stale = html.Span(f"  ⚠ CAPTURE STALE {int(_age)}s",
+                                  style={"color": "#ef4444", "fontWeight": "700"})
+    except Exception:
+        stale = ""
     status = html.Span([html.Span("● ", style={"color": dot_c}),
-                        html.Span(f"{lbl}  ·  {now}", style={"color": "#334155"}), werr])
+                        html.Span(f"{lbl}  ·  {now}", style={"color": "#334155"}),
+                        werr, stale])
     return ltps + chgs + stys + [status]
 
 
@@ -7017,6 +7038,9 @@ def _viewer_seed_latest(date=None) -> None:
                     "high_price": float(row.get("day_high", 0) or 0),
                     "low_price":  float(row.get("day_low", 0) or 0),
                     "prev_close_price": ltp - ch,   # not in tick feed; derive
+                    # last tick's exchange time → lets the header freshness badge detect a
+                    # stale feed in viewer mode (sync stopped, or VM capture died upstream).
+                    "exch_feed_time": row["ts"].timestamp(),
                 }
         except Exception:
             continue
