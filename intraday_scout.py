@@ -529,7 +529,7 @@ def _verify(sym: str, date, as_of, horizon_min: int, spot0: float,
 
 
 def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
-               cur_strength, not_before=None) -> Optional[dict]:
+               cur_strength, not_before=None, anchor=None) -> Optional[dict]:
     """Trade lifecycle for an OPEN directional call: when it TRIGGERED (scan back to
     the first contiguous same-direction TRADE bar), the entry strike/premium it would
     have been taken at, SL/target on the premium, live P&L, and a CLOSE/HOLD manage
@@ -590,18 +590,31 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     _cap = max(_TRIG_MAX_MIN, 6 * step)
     _open_dt = as_of.replace(hour=_MKT_OPEN.hour, minute=_MKT_OPEN.minute,
                              second=0, microsecond=0)
-    k = int((as_of - _open_dt).total_seconds() // 60) // step   # last grid idx <= as_of
     trig_t = as_of
-    for i in range(k, -1, -1):
-        t_i = _open_dt + datetime.timedelta(minutes=i * step)
-        if (as_of - t_i).total_seconds() / 60.0 > _cap:
-            break
-        if not_before is not None and t_i < not_before:
-            break                              # never report a trigger before data-ready
-        if _is_trade(t_i):
-            trig_t = t_i
-        else:
-            break
+    # ── POLLER ANCHOR: the alert poller (authoritative, sticky, holds a position through
+    # a forming-bar NO-TRADE flicker) already logged when THIS position first fired. When
+    # the caller hands us that instant, FREEZE the trigger there and skip the bar-grid walk.
+    # Why it matters: on the coarse 60m board a trade born mid-bar has no completed TRADE
+    # bar behind it, so the grid walk breaks at the first step and reports trigger=as_of —
+    # entry re-priced to NOW on every 30s refresh → perpetual +0% and the trigger clock
+    # drifting with the wall clock (14:44→14:50→14:53), while the ledger correctly holds
+    # "since 14:44". The anchor collapses the two clocks: one frozen entry, honest running
+    # P&L, board == ledger. Only live passes it (the poller log is a live artifact); replay
+    # keeps the grid walk. Clamp to as_of so a just-logged anchor never sits in the future. ─
+    if anchor is not None and anchor <= as_of:
+        trig_t = anchor
+    else:
+        k = int((as_of - _open_dt).total_seconds() // 60) // step   # last grid idx <= as_of
+        for i in range(k, -1, -1):
+            t_i = _open_dt + datetime.timedelta(minutes=i * step)
+            if (as_of - t_i).total_seconds() / 60.0 > _cap:
+                break
+            if not_before is not None and t_i < not_before:
+                break                          # never report a trigger before data-ready
+            if _is_trade(t_i):
+                trig_t = t_i
+            else:
+                break
     # ── entry strike = the ATM at trigger (what you'd actually have bought) ───────
     spot_trig = _spot_at(sym, date, trig_t)
     trig_atm = _atm(spot_trig, sym) if spot_trig else None
@@ -669,7 +682,7 @@ def _forward(direction: str, spot, range_pct_60, horizon_min: int) -> dict:
 
 def scan_index(sym: str, tf_min: int, date=None, as_of=None,
                horizon_min: Optional[int] = None, with_lifecycle: bool = True,
-               verdict_only: bool = False) -> dict:
+               verdict_only: bool = False, anchor=None) -> dict:
     """Per-index structural read at instant t + forward prediction over horizon_min
     (defaults to the bar timeframe) + verify (replay only) + trade lifecycle
     (trigger time / SL / target / CLOSE-HOLD). with_lifecycle=False inside the
@@ -852,8 +865,13 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     bcov = hf.band_coverage(sym, horizon_min)          # HONEST measured coverage for this cell
     verify = _verify(sym, date, as_of, horizon_min, spot,
                      fwd["pdir"], fwd["pred_lo"], fwd["pred_hi"], atm=atm)
+    # Honor the poller anchor only when its side matches the live leg — a genuine flip
+    # closes the poller episode (no open anchor), so a mismatch is stale/transient: fall
+    # back to the grid walk rather than freeze entry on the wrong side.
+    _anchor_t = (anchor.get("t") if isinstance(anchor, dict)
+                 and anchor.get("dir") == direction else None)
     lifecycle = (_lifecycle(sym, tf_min, date, as_of, direction, horizon_min, strength,
-                            not_before=ready_at)
+                            not_before=ready_at, anchor=_anchor_t)
                  if (with_lifecycle and direction) else None)
     return {
         "opening": opening,
@@ -882,9 +900,13 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
 
 
 def scan(tf_min: int, date=None, as_of=None,
-         horizon_min: Optional[int] = None) -> list[dict]:
-    """Scan all four indices; rank tradables first by |strength|·agreement."""
-    rows = [scan_index(s, tf_min, date, as_of, horizon_min) for s in INDEX_SYMBOLS]
+         horizon_min: Optional[int] = None, anchors=None) -> list[dict]:
+    """Scan all four indices; rank tradables first by |strength|·agreement.
+    `anchors` = {sym: frozen-trigger datetime} from the live poller ledger, so an OPEN
+    position's lifecycle freezes its entry at the true first-fire minute instead of
+    re-walking the coarse bar grid (see _lifecycle). None → per-index grid walk."""
+    rows = [scan_index(s, tf_min, date, as_of, horizon_min,
+                       anchor=(anchors or {}).get(s)) for s in INDEX_SYMBOLS]
 
     def _rank(r):
         if not r.get("has_data"):

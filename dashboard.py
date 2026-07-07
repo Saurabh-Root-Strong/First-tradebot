@@ -4429,7 +4429,28 @@ def _scout_openpos_body(today: str, as_of):
 
 def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=False):
     import intraday_scout as scout
-    rows = scout.scan(int(tf_min or 15), date, as_of_dt)
+    today = datetime.datetime.now(IST).date().isoformat()
+    # Freeze each OPEN position's lifecycle at the poller's true first-fire minute (the
+    # ledger's "since"), so the board stops re-stamping entry=now / +0% on the forming 60m
+    # bar and reads the SAME entry the ledger does. Live only — the poller log is a live
+    # artifact; replay/ghost keep the per-bar grid walk. Built once, passed into scan.
+    anchors = None
+    if live:
+        try:
+            _op0, _ = _scout_episodes(today)
+            anchors = {}
+            for e in _op0:
+                try:
+                    _h, _m = (e.get("open_t") or "").split(":")
+                    anchors[e["sym"]] = {
+                        "t": datetime.datetime(*map(int, date.split("-")),
+                                               int(_h), int(_m), tzinfo=IST),
+                        "dir": e.get("dir")}
+                except Exception:
+                    continue
+        except Exception:
+            anchors = None
+    rows = scout.scan(int(tf_min or 15), date, as_of_dt, anchors=anchors)
     # PRACTICE: the verify line grades t→t+H against the FULL captured file — on a
     # past day that is the future. Blank it while the ghost session runs so the user
     # can't peek; after the real 15:30 the grades unlock and the day self-scores.
@@ -4440,7 +4461,6 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
     # fills scout-seen scans at 15m). On replay / a different TF the per-bar scan is the
     # honest source, so no overlay.
     seen = seen if (live and int(tf_min or _ALERT_TF) == _ALERT_TF) else {}
-    today = datetime.datetime.now(IST).date().isoformat()
     when = ("LIVE" if live else
             f"👻 GHOST {date} @ {as_of_dt:%H:%M} — practice, future hidden" if
             (practice and as_of_dt and not _ghost_done()) else
