@@ -3634,9 +3634,13 @@ _TIP_BAND = ("FORWARD prediction made RIGHT NOW for the NEXT timeframe — it ha
              "than the 60m range above). It self-grades once the window elapses: "
              "⇒ pending → then HIT/MISS on direction and band ✓ (closed inside, ~77%) "
              "/ band ✗ (broke out, the big-move tail). HOW FAR, not which way.")
-_TIP_TRIG = ("Trade lifecycle: the EXACT minute the gate first fired, the INDEX level "
-             "and ATM option premium at that instant, SL/target on the premium, live "
-             "P&L, and the manage call (CLOSE / HOLD / BOOK).")
+_TIP_TRIG = ("Trade lifecycle for the CURRENT unbroken TRADE run: the minute THIS run "
+             "began, the INDEX level + ATM premium then, SL/target, live P&L, and the "
+             "manage call (CLOSE / HOLD / BOOK). This time RESETS if the gate blinked "
+             "NO-TRADE, and can shift while the newest bar is still forming. NOTE: the "
+             "day-ledger's 'since' is the ORIGINAL open, held THROUGH NO-TRADE gaps, so "
+             "it reads earlier. Same position, two clocks — this = current leg, "
+             "ledger = first entry.")
 
 
 def _scout_mem_block(mem, today):
@@ -3970,7 +3974,7 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
     # confusing (headline 14500 vs entry 14525). Fresh/no-trade rows show current ATM.
     lc = r.get("lifecycle")
     if lc and lc.get("entry_strike"):
-        inst = f" · {lc['entry_strike']} {side} (held since {lc['trigger']})"
+        inst = f" · {lc['entry_strike']} {side} (this leg since {lc['trigger']})"
     else:
         inst = (f" · {r['instrument']}" if r.get("instrument") else "")
     # expiry label on EVERY strike-bearing row (holding OR trade), not just TRADE — a
@@ -4011,7 +4015,7 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
         idx_seg = (f"@ index {lc.get('entry_spot')}→{lc.get('cur_spot')}  "
                    if lc.get("entry_spot") is not None else "")
         trade_blk = html.Div([
-            html.Span(f"⏱ triggered {lc['trigger']} ", title=_TIP_TRIG,
+            html.Span(f"⏱ leg triggered {lc['trigger']} ", title=_TIP_TRIG,
                       style={"color": "#fbbf24", "fontWeight": "700", "cursor": "help"}),
             html.Span(idx_seg, style={"color": "#93c5fd"}),   # INDEX level at trigger → now
             html.Span(f"entry {lc.get('entry_strike')} {side} ₹{lc.get('entry_prem')} "
