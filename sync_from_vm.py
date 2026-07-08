@@ -55,8 +55,10 @@ def pull(date: str, host: str, key: str, remote_dir: str) -> bool:
         print(f"  SSH key not found: {key}", file=sys.stderr)
         return False
     # staging lives beside LIVE_DIR (same volume → os.replace is atomic) and OUTSIDE it
-    # so the dashboard's mirror glob never sees a half-synced file.
-    stage = LIVE_DIR.parent / f".sync_staging_{date}"
+    # so the dashboard's mirror glob never sees a half-synced file. PID-scoped so two
+    # concurrent syncs (a --watch loop + a manual pull, or two dev.bat windows) don't
+    # rmtree each other's staging mid-publish (FileNotFoundError on os.replace).
+    stage = LIVE_DIR.parent / f".sync_staging_{date}_{os.getpid()}"
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True, exist_ok=True)
     remote = f"{host}:{remote_dir}/{date}_*.parquet"
@@ -88,6 +90,8 @@ def pull(date: str, host: str, key: str, remote_dir: str) -> bool:
                 break
             except PermissionError:
                 time.sleep(0.2)
+            except FileNotFoundError:
+                break            # src vanished (another sync cleaned up) — skip, not fatal
         else:
             try:                                   # last resort so we don't drop the update
                 shutil.copy2(src, dst)
