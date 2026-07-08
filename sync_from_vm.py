@@ -114,7 +114,7 @@ def main() -> None:
     ok = pull(args.date, args.host, args.key, args.remote_dir)
     if not args.watch:
         sys.exit(0 if ok else 1)
-    print(f"  watching — re-pull every {args.watch}s (Ctrl+C to stop)")
+    print(f"  watching - re-pull every {args.watch}s (Ctrl+C to stop)")
     try:
         while True:
             time.sleep(args.watch)
