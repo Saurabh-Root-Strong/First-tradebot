@@ -476,6 +476,35 @@ def _opt_premium(sym: str, date, t, strike, side: str, expiry="weekly") -> Optio
     return float(v) if pd.notna(v) and float(v) > 0 else None
 
 
+def _opt_stats(sym: str, date, t, strike, side: str, since=None,
+               expiry="weekly") -> Optional[dict]:
+    """{'now','peak'} option premium for (strike, side) over [since, t] — same expiry
+    filter as _opt_premium, so it is the SAME instrument as entry/exit. `now` = last
+    premium at/before t, `peak` = max premium since `since` (entry time). Lets the scout
+    ledger show a live trajectory (running / pullback) in one chain read. Leak-safe: only
+    rows with ts <= t are considered (never reads the future)."""
+    if not strike:
+        return None
+    try:
+        ch = _read_mirror("chain_snapshots", date, t, sym)
+    except Exception:
+        return None
+    if ch is None or not len(ch) or "ltp" not in ch.columns:
+        return None
+    ch, ok = fc._filter_expiry(ch, expiry)
+    if not ok or ch is None or not len(ch):
+        return None
+    sub = ch[(ch["side"] == side) & (ch["strike"] == strike)
+             & (ch["ts"] <= pd.Timestamp(t))]
+    if since is not None:
+        sub = sub[sub["ts"] >= pd.Timestamp(since)]
+    sub = sub[pd.notna(sub["ltp"]) & (sub["ltp"] > 0)]
+    if not len(sub):
+        return None
+    sub = sub.sort_values("ts")
+    return {"now": float(sub.iloc[-1]["ltp"]), "peak": float(sub["ltp"].max())}
+
+
 def _verify(sym: str, date, as_of, horizon_min: int, spot0: float,
             pdir: str, lo, hi, atm=None) -> Optional[dict]:
     """Grade the forward call against what ACTUALLY happened horizon_min after t.

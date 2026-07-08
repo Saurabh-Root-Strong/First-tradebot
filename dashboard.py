@@ -4158,9 +4158,12 @@ def _scout_episodes(today: str):
                       "dir": _v(r.get("side")),
                       "strike": int(strike) if strike is not None else None,
                       "entry": _v(r.get("entry")), "open_t": r["ts"].strftime("%H:%M"),
-                      "bb": False}
+                      "open_ts": r["ts"],
+                      "sl": _v(r.get("sl")), "tgt": _v(r.get("tgt")),
+                      "bb": False, "band_dir": None}
             elif kind == "BAND" and ep:
                 ep["bb"] = True
+                ep["band_dir"] = _v(r.get("band_dir")) or ep.get("band_dir")
             elif kind in ("FLIP", "SL", "TARGET") and ep:
                 exit_p, entry = _v(r.get("cur")), ep.get("entry")
                 pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
@@ -4175,6 +4178,28 @@ def _scout_episodes(today: str):
 
 _OUTCOME_BADGE = {"FLIP": ("↺ flipped", "#f59e0b"), "SL": ("🛑 SL hit", "#f87171"),
                   "TARGET": ("🎯 target", "#22c55e"), "?": ("? unresolved", "#94a3b8")}
+
+
+def _scout_trade_status(entry, now, sl, tgt, peak) -> str:
+    """Live trajectory of an OPEN scout position on its option premium (NOT a close —
+    the poller alone closes on SL/TARGET/FLIP). Shows WHY a position is still open:
+      🎯/🛑  = already past target/SL (close pending on the next poll)
+      ↩ pullback = ran up >=20% then gave back >=15pts of that gain
+      ▲ / ▼  = running toward target / drawing toward SL, with the current premium move
+    entry/sl/tgt are the alert-logged premium levels (SL −35%, target +65% of entry)."""
+    if not entry or now is None:
+        return "· no data"
+    g = now / entry - 1.0                                  # current premium move
+    if tgt and now >= tgt:
+        return f"🎯 target {g:+.0%}"
+    if sl and now <= sl:
+        return f"🛑 SL {g:+.0%}"
+    gp = (peak / entry - 1.0) if peak else g               # best since entry
+    if gp >= 0.20 and (gp - g) >= 0.15:
+        return f"↩ pullback {g:+.0%} (pk {gp:+.0%})"
+    if g >= 0:
+        return f"▲ {g:+.0%} → tgt +65%"
+    return f"▼ {g:+.0%} → SL −35%"
 
 
 def _scout_openpos_body(today: str, as_of):
@@ -4195,17 +4220,21 @@ def _scout_openpos_body(today: str, as_of):
 
     def _open_cross(o):
         sym, d, k = o["sym"], o.get("dir"), o.get("strike")
+        cur = peak = None
         try:
-            cur = scout._opt_premium(sym, today, as_of, k, d) if k else None
+            if k:
+                st = scout._opt_stats(sym, today, as_of, k, d, since=o.get("open_ts"))
+                if st:
+                    cur, peak = st["now"], st["peak"]
         except Exception:
-            cur = None
+            cur = peak = None
         try:
             v = scout.scan_index(sym, _ALERT_TF, date=today, as_of=as_of,
                                  with_lifecycle=False, verdict_only=True)
             verdict, vdir = v.get("verdict"), v.get("direction")
         except Exception:
             verdict, vdir = None, None
-        return cur, verdict, vdir
+        return cur, peak, verdict, vdir
 
     if opens:
         with ThreadPoolExecutor(max_workers=min(4, len(opens))) as _ex:
@@ -4262,8 +4291,9 @@ def _scout_openpos_body(today: str, as_of):
                 "value": text, "type": "markdown"}
 
     open_records = []
-    for o, (cur, verdict, vdir) in zip(opens, _cross):
+    for o, (cur, peak, verdict, vdir) in zip(opens, _cross):
         d, entry = o.get("dir"), o.get("entry")
+        sl, tgt = o.get("sl"), o.get("tgt")
         cur = round(cur, 2) if cur else None
         pnl = round((cur / entry - 1.0) * 100.0, 1) if (cur and entry) else None
         if verdict is None:
@@ -4276,11 +4306,16 @@ def _scout_openpos_body(today: str, as_of):
             flag = "✓ confirms"                       # board still on this side
         else:
             flag = "· unclear"                        # TRADE but no clear direction
+        # Band that broke: band_dir 'above' = spot cleared the UPPER σ-band, 'below' = LOWER.
+        bd = o.get("band_dir")
+        band = ("↑ upper" if bd == "above" else "↓ lower" if bd == "below"
+                else "broke" if o.get("bb") else "—")
         open_records.append({
             "index": o["label"], "side": d, "strike": o.get("strike"),
             "since": o.get("open_t"), "entry": entry, "now": cur,
             "pnl": (pnl / 100.0) if pnl is not None else None,
-            "band": "broke" if o.get("bb") else "—", "check": flag,
+            "band": band, "status": _scout_trade_status(entry, cur, sl, tgt, peak),
+            "check": flag,
         })
     open_cols = [
         {"name": "Index", "id": "index"},
@@ -4291,6 +4326,7 @@ def _scout_openpos_body(today: str, as_of):
         {"name": "Now", "id": "now", "type": "numeric", "format": _rupee},
         {"name": "P&L (unreal.)", "id": "pnl", "type": "numeric", "format": _pctf},
         {"name": "Band", "id": "band"},
+        {"name": "Trade status", "id": "status"},
         {"name": "Live check", "id": "check"},
     ]
     open_extra_cond = [
@@ -4306,6 +4342,20 @@ def _scout_openpos_body(today: str, as_of):
          "color": "#64748b", "fontWeight": "600"},
         {"if": {"filter_query": '{band} contains "broke"', "column_id": "band"},
          "color": "#f59e0b", "fontWeight": "600"},
+        {"if": {"filter_query": '{band} contains "upper"', "column_id": "band"},
+         "color": "#f59e0b", "fontWeight": "600"},
+        {"if": {"filter_query": '{band} contains "lower"', "column_id": "band"},
+         "color": "#f59e0b", "fontWeight": "600"},
+        {"if": {"filter_query": '{status} contains "target"', "column_id": "status"},
+         "color": "#22c55e", "fontWeight": "700"},
+        {"if": {"filter_query": '{status} contains "SL"', "column_id": "status"},
+         "color": "#f87171", "fontWeight": "700"},
+        {"if": {"filter_query": '{status} contains "pullback"', "column_id": "status"},
+         "color": "#f59e0b", "fontWeight": "600"},
+        {"if": {"filter_query": '{status} contains "▲"', "column_id": "status"},
+         "color": "#34d399", "fontWeight": "600"},
+        {"if": {"filter_query": '{status} contains "▼"', "column_id": "status"},
+         "color": "#fca5a5", "fontWeight": "600"},
     ]
     open_tips = [
         _tip("check", "confirms", "Board still on your side."),
@@ -4313,7 +4363,14 @@ def _scout_openpos_body(today: str, as_of):
         _tip("check", "flipped", "Board now leans the other way."),
         _tip("check", "no data", "Scan failed / no data now."),
         _tip("check", "unclear", "Board shows a trade but no clear side."),
+        _tip("band", "upper", "Index cleared the UPPER σ-range band (broke above)."),
+        _tip("band", "lower", "Index broke the LOWER σ-range band (broke below)."),
         _tip("band", "broke", "Moved past the σ-range band since entry."),
+        _tip("status", "target", "Premium reached the +65% target — close pending on the next poll."),
+        _tip("status", "SL", "Premium hit the −35% stop — close pending on the next poll."),
+        _tip("status", "pullback", "Ran up ≥20% then gave back ≥15pts of that gain (peak → now)."),
+        _tip("status", "▲", "In profit, running toward the +65% target."),
+        _tip("status", "▼", "Underwater, drawing toward the −35% stop."),
     ]
     open_header_tips = {
         "side": "CE = call (bullish lean) · PE = put (bearish lean)",
@@ -4322,7 +4379,9 @@ def _scout_openpos_body(today: str, as_of):
         "entry": "Option premium paid at entry.",
         "now": "Live option premium.",
         "pnl": "Unrealised P&L = now / entry − 1.",
-        "band": "'broke' = index broke the forward σ-range band since entry.",
+        "band": "Which σ-range band the index broke since entry: ↑ upper / ↓ lower.",
+        "status": "Live trajectory on the option premium vs SL (−35%) / target (+65%): "
+                  "running ▲ / drawdown ▼ / pullback / hit. Poller closes on SL/target/flip.",
         "check": "Live board vs your held side — is the arrow still with you?",
     }
     open_tbl = _ledger_table(open_records, open_cols, open_extra_cond,
