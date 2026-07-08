@@ -4176,7 +4176,8 @@ def _scout_episodes(today: str):
     return opens, closed
 
 
-_OUTCOME_BADGE = {"FLIP": ("↺ flipped", "#f59e0b"), "SL": ("🛑 SL hit", "#f87171"),
+_OUTCOME_BADGE = {"FLIP": ("↺ flipped · reversed out", "#f59e0b"),
+                  "SL": ("🛑 SL hit", "#f87171"),
                   "TARGET": ("🎯 target", "#22c55e"), "?": ("? unresolved", "#94a3b8")}
 
 
