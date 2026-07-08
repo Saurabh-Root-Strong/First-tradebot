@@ -39,7 +39,7 @@ if errorlevel 1 (
 )
 
 echo [3/4] verifying capture health (polls fresh logs up to ~40s)...
-ssh -i "%KEY%" -o ConnectTimeout=25 %VM% "cd ~/tradebot && for i in $(seq 1 8); do sleep 5; if docker compose logs --since 90s tradebot 2>&1 | grep -q 'All 4 indices live'; then echo VERIFY_OK_TICKS; break; fi; done; echo '----- fresh capturer log -----'; docker compose logs --since 90s tradebot 2>&1 | grep -iE 'CAPTURER|VIEWER|Token|WS|indices' | tail -14"
+ssh -i "%KEY%" -o ConnectTimeout=25 %VM% "cd ~/tradebot && for i in $(seq 1 8); do sleep 5; if docker compose logs --since 90s tradebot 2>&1 | grep -q 'All 4 indices live'; then echo VERIFY_OK_TICKS; break; fi; done; echo '----- fresh capturer log -----'; docker compose logs --since 90s tradebot 2>&1 | grep -iE 'CAPTURER|VIEWER|Token  |\[WS\]|indices live' | tail -14"
 
 echo.
 echo [4/4] deploy finished %time%.  Read the lines above:
