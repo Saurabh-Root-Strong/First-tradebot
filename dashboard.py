@@ -4472,7 +4472,9 @@ def _scout_openpos_body(today: str, as_of):
     rp = [e["pnl"] for e in closed if e.get("pnl") is not None]
     wins = sum(1 for x in rp if x > 0)
     avg = round(sum(rp) / len(rp), 1) if rp else None
+    total = round(sum(rp), 1) if rp else None          # equal-weight cumulative %
     summ_c = "#22c55e" if (avg or 0) >= 0 else "#f87171"
+    tot_c = "#22c55e" if (total or 0) >= 0 else "#f87171"
     summary = html.Div([
         html.Span(f"{len(opens)} open  ·  {len(closed)} closed", style={"color": "#e2e8f0",
                   "fontWeight": "700"}),
@@ -4480,6 +4482,14 @@ def _scout_openpos_body(today: str, as_of):
         if rp else html.Span(""),
         html.Span(f"  ·  avg {avg:+.1f}%" if avg is not None else "",
                   style={"color": summ_c, "fontWeight": "700"}),
+        # Σ = sum of the per-trade realized %s. Only rupee-meaningful under EQUAL stake
+        # per trade (then Σ = N·avg); it is NOT compounded and NOT a rupee total, since
+        # each % sits on a different option premium. Titled so it can't be misread.
+        html.Span(f"  ·  Σ {total:+.1f}%" if total is not None else "",
+                  title="Sum of the per-trade realized %s (equal-weight — assumes the "
+                        "same stake per trade; = trades × avg). Not compounded, not a "
+                        "rupee total; the arrow is negative-EV over large samples.",
+                  style={"color": tot_c, "fontWeight": "700", "cursor": "help"}),
     ], style={"fontSize": "0.68rem", "marginBottom": "8px"})
 
     note = html.Div(
