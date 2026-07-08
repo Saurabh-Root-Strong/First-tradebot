@@ -2,8 +2,9 @@
 REM ============================================================================
 REM  morning_token.bat  --  one-click daily Fyers token refresh for the cloud VM
 REM
-REM  Fyers tokens die at midnight IST, and Fyers' unattended TOTP API login is
-REM  anti-bot blocked, so each trading morning run this once on your laptop:
+REM  Fyers tokens die at a fixed ~06:00-IST cutoff (NOT 24h from issue), and its
+REM  unattended TOTP API login is anti-bot blocked, so each trading morning run
+REM  this once on your laptop:
 REM    1. Opens a browser, you log into Fyers (FY_ID / PIN / TOTP)
 REM    2. Saves the fresh access_token.txt locally
 REM    3. Uploads it to the VM over SSH (key-only)
