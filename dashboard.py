@@ -4933,6 +4933,16 @@ def _scout_alert_poller():
         _time.sleep(30)
 
 
+# Server ROLE, set once in __main__ (_resolve_role). Callbacks read it at runtime to
+# pick the authoritative alert source: capturer = local browser detector (fresh data),
+# viewer = the synced scout_alerts log (avoids phantom re-strike notifications).
+_ROLE_VIEWER = False
+# Per-day seed for viewer notifications: adopt the day's already-logged alerts silently
+# on first sight, then fire only on a genuinely NEW synced row. Per-process (resets on
+# restart → re-seeds silently, correct); day-keyed so a new session doesn't misfire.
+_VIEWER_ALERT_SEED = {"day": None, "n": 0}
+
+
 @app.callback(
     Output("scout-seen",       "data"),
     Output("scout-alerts",     "data"),
@@ -4959,6 +4969,30 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
     # purge any prior-day alerts on the first tick of a new session (local store persists
     # across days) so the panel only ever shows TODAY's trade history.
     log = [a for a in (alerts or []) if a.get("d") == today]
+
+    if _ROLE_VIEWER:
+        # VIEWER: the VM is the sole authoritative detector. Notify off newly-SYNCED
+        # scout_alerts rows (what the ledger shows), NOT the local re-scan above — a
+        # viewer re-scan runs on lagged mirrors with its OWN state, re-strikes the ATM
+        # independently, and pops PHANTOM trades that exist in no log (the 56700-PE
+        # confusion). The local scan still refreshed `seen` for the board overlay only.
+        recs = _alerts_from_mirror(today) or []
+        s = _VIEWER_ALERT_SEED
+        prev_n = s["n"] if s["day"] == today else None
+        s["day"] = today
+        if prev_n is None:                         # first sight of the day → adopt history
+            s["n"] = len(recs)                     # silently (no notification burst on load)
+            return seen, recs[:50], no_update
+        if len(recs) > prev_n:                      # a genuinely new authoritative alert
+            s["n"] = len(recs)
+            return seen, recs[:50], int(fire or 0) + 1
+        if len(recs) != prev_n or recs[:50] != log:  # shrank/deduped → resync list, no fire
+            s["n"] = len(recs)
+            return seen, recs[:50], no_update
+        return seen, no_update, no_update
+
+    # CAPTURER (incl. anyone viewing the VM URL): the browser detector runs on the same
+    # host's FRESH data + mirrors the poller, so its local events are authoritative here.
     if events:
         return seen, (events + log)[:50], int(fire or 0) + 1
     if log != list(alerts or []):                # purged stale rows → write back
@@ -7234,6 +7268,7 @@ if __name__ == "__main__":
     # TRADEBOT_CAPTURE=1; a second capturer on the same box is refused by a PID lock.
     role = _resolve_role()
     VIEWER = role == "viewer"
+    _ROLE_VIEWER = VIEWER          # expose to callbacks: viewer notifies off the synced log
     _explicit_viewer = os.environ.get("DASH_VIEWER") == "1"
 
     print(SEP)
