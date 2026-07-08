@@ -4136,6 +4136,7 @@ def _scout_episodes(today: str):
     on a close = exit(cur) / entry − 1 (the arrow's option, entry→exit). Leak-safe — pure
     replay of what the poller already wrote."""
     import pandas as pd
+    import intraday_scout as scout
     from core.mirror_io import read_mirror
     opens, closed = [], []
     df = read_mirror("scout_alerts", today)
@@ -4162,8 +4163,25 @@ def _scout_episodes(today: str):
                       "sl": _v(r.get("sl")), "tgt": _v(r.get("tgt")),
                       "bb": False, "band_dir": None}
             elif kind == "BAND" and ep:
+                # A σ-band break RESOLVES the episode (range exceeded) → CLOSE it here,
+                # like SL/TARGET/FLIP. Exit = the arrow's premium at the band-break minute;
+                # the BAND row carries no cur, so look it up (leak-safe, ts = band time).
                 ep["bb"] = True
-                ep["band_dir"] = _v(r.get("band_dir")) or ep.get("band_dir")
+                bd = _v(r.get("band_dir")) or ep.get("band_dir")
+                ep["band_dir"] = bd
+                exit_p = _v(r.get("cur"))
+                if exit_p is None:
+                    try:
+                        exit_p = scout._opt_premium(sym, today, r["ts"],
+                                                    ep.get("strike"), ep.get("dir"))
+                    except Exception:
+                        exit_p = None
+                entry = ep.get("entry")
+                pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
+                closed.append({**ep, "close_t": r["ts"].strftime("%H:%M"),
+                               "outcome": "BAND", "band_dir": bd,
+                               "exit": round(exit_p, 2) if exit_p else None, "pnl": pnl})
+                ep = None
             elif kind in ("FLIP", "SL", "TARGET") and ep:
                 exit_p, entry = _v(r.get("cur")), ep.get("entry")
                 pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
@@ -4380,7 +4398,8 @@ def _scout_openpos_body(today: str, as_of):
         "entry": "Option premium paid at entry.",
         "now": "Live option premium.",
         "pnl": "Unrealised P&L = now / entry − 1.",
-        "band": "Which σ-range band the index broke since entry: ↑ upper / ↓ lower.",
+        "band": "'—' = still inside the σ-range band. A break (↑ upper / ↓ lower) closes "
+                "the episode → it moves to the CLOSED table below.",
         "status": "Live trajectory on the option premium vs SL (−35%) / target (+65%): "
                   "running ▲ / drawdown ▼ / pullback / hit. Poller closes on SL/target/flip.",
         "check": "Live board vs your held side — is the arrow still with you?",
@@ -4391,7 +4410,13 @@ def _scout_openpos_body(today: str, as_of):
     # ── CLOSED section — same sortable/filterable ledger (shared _ledger_table) ──
     closed_records = []
     for e in closed:
-        badge, _bc = _OUTCOME_BADGE.get(e.get("outcome"), ("—", "#94a3b8"))
+        oc = e.get("outcome")
+        if oc == "BAND":                              # directional: which σ-band broke
+            bd = e.get("band_dir")
+            badge = ("⚡ band ↑ upper" if bd == "above" else
+                     "⚡ band ↓ lower" if bd == "below" else "⚡ band broke")
+        else:
+            badge, _bc = _OUTCOME_BADGE.get(oc, ("—", "#94a3b8"))
         pnl = e.get("pnl")
         closed_records.append({
             "index": e["label"], "side": e.get("dir"), "strike": e.get("strike"),
@@ -4417,6 +4442,8 @@ def _scout_openpos_body(today: str, as_of):
          "color": "#22c55e", "fontWeight": "600"},
         {"if": {"filter_query": '{outcome} contains "flipped"', "column_id": "outcome"},
          "color": "#f59e0b", "fontWeight": "600"},
+        {"if": {"filter_query": '{outcome} contains "band"', "column_id": "outcome"},
+         "color": "#f59e0b", "fontWeight": "700"},
         {"if": {"filter_query": '{outcome} contains "unresolved"', "column_id": "outcome"},
          "color": "#64748b", "fontWeight": "600"},
     ]
@@ -4425,6 +4452,8 @@ def _scout_openpos_body(today: str, as_of):
         _tip("outcome", "flipped", "Arrow reversed to the other side → position exited "
              "(the dominant exit at 60m — SL / target rarely bind)."),
         _tip("outcome", "SL", "Premium hit the −35% stop."),
+        _tip("outcome", "band", "Spot broke the σ-range band (↑ upper / ↓ lower) — range "
+             "exceeded, episode closed at the arrow's premium then."),
         _tip("outcome", "unresolved", "Defensive: a prior NEW that never recorded a close."),
     ]
     closed_header_tips = {
@@ -4457,7 +4486,7 @@ def _scout_openpos_body(today: str, as_of):
         "Hover any cell or header for what it means. Click a header to sort ⇕; use the "
         "search box (top-right) to filter both tables across all columns (e.g. NIFTY, PE, "
         "flipped, contradicts). One stance per index; OPEN holds through NO-TRADE blinks "
-        "until it flips / hits SL / target. CLOSED P&L is realized (entry→exit on the "
+        "until it flips / hits SL / target / breaks the σ-band. CLOSED P&L is realized (entry→exit on the "
         f"arrow's option). Alert-log state, tf={_ALERT_TF}m. Decision-support only — the "
         "arrow is negative-EV; trade the range band, not the arrow.",
         style={"color": "#64748b", "fontSize": "0.58rem", "lineHeight": "1.4"})
