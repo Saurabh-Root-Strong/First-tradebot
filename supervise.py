@@ -17,9 +17,7 @@ Morning flow:  .venv\\Scripts\\python.exe supervise.py
 Stop with Ctrl+C.
 """
 
-import base64
 import datetime
-import json
 import os
 import subprocess
 import sys
@@ -31,7 +29,9 @@ from core.market_calendar import is_trading_day   # NSE holidays + weekends
 HERE = Path(__file__).parent
 PY   = HERE / ".venv" / "Scripts" / "python.exe"
 PY   = PY if PY.exists() else Path(sys.executable)
-from tradebot.adapters.broker.token import TOKEN_FILE   # single broker-token source
+from tradebot.adapters.broker.token import (   # single broker-token source
+    TOKEN_FILE, describe as token_describe, is_usable as token_usable,
+)
 HEARTBEAT  = HERE / "data" / "ws_heartbeat.txt"
 LOG        = HERE / "logs" / "supervisor.log"
 
@@ -54,29 +54,28 @@ def log(msg: str) -> None:
 
 
 def token_valid() -> bool:
-    try:
-        raw = TOKEN_FILE.read_text(encoding="utf-8").strip()
-        p = raw.split(".")[1]; p += "=" * (4 - len(p) % 4)
-        exp = json.loads(base64.urlsafe_b64decode(p)).get("exp", 0)
-        return (exp - time.time()) > 0
-    except Exception:
-        return False
+    # Single validity gate lives in the broker-token adapter — includes the
+    # near-expiry refresh margin, so a token about to die counts as invalid and
+    # we re-auth proactively rather than starting a session that 401s seconds in.
+    return token_usable()
 
 
 def ensure_token() -> bool:
     if token_valid():
+        log(token_describe())          # surface issued→expires so the daily cutoff is visible
         return True
+    log(token_describe())              # log WHY (expired/missing/malformed) before re-auth
     # On a headless server (FYERS_HEADLESS=1) use the TOTP auth — no browser.
     headless = os.environ.get("FYERS_HEADLESS") == "1"
     auth_script = "fyers_auth_headless.py" if headless else "fyers_auth.py"
-    log(f"Token missing/expired — launching {auth_script}"
+    log(f"Token not usable — launching {auth_script}"
         + ("" if headless else " (log in via the browser)") + "…")
     try:
         subprocess.run([str(PY), str(HERE / auth_script)], cwd=str(HERE))
     except Exception as exc:
         log(f"{auth_script} failed: {exc}")
     ok = token_valid()
-    log("Token OK." if ok else "Token still invalid after auth attempt.")
+    log("Token OK — " + token_describe() if ok else "Token still invalid after auth attempt.")
     return ok
 
 

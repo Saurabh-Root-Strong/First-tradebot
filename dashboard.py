@@ -133,11 +133,6 @@ _seen:  set[str] = set()
 
 
 # ── Token validation ───────────────────────────────────────────────────────────
-def _token_remaining(raw: str) -> "float | None":
-    """Seconds left on the JWT, or None if unparseable."""
-    return _broker_token.token_remaining(raw)
-
-
 def _run_auth() -> None:
     """Launch the Fyers auth flow (browser login, or headless TOTP if FYERS_HEADLESS=1)
     and block until it finishes writing access_token.txt."""
@@ -156,27 +151,19 @@ def _run_auth() -> None:
 def _validate_token() -> str:
     # On a missing/expired token, auto-run the auth flow once and re-check, instead
     # of erroring out — so launching dashboard.py directly self-heals like supervise.py.
+    # Validity + human summary come from the broker-token adapter (is_usable/describe),
+    # the single source of truth — no inline JWT decode here.
     for attempt in (1, 2):
-        if not TOKEN_FILE.exists():
-            print("\n  Token  missing (access_token.txt not found).")
-        else:
-            raw = TOKEN_FILE.read_text(encoding="utf-8").strip()
-            rem = _token_remaining(raw)
-            if rem is None:
-                print("  Token  WARNING: could not parse — proceeding with stored token.")
-                return raw
-            if rem > 0:
-                claims_fy = ""
-                try:
-                    p = raw.split(".")[1]; p += "=" * (4 - len(p) % 4)
-                    claims_fy = json.loads(base64.urlsafe_b64decode(p)).get("fy_id", "?")
-                except Exception:
-                    pass
-                h, m = int(rem // 3600), int((rem % 3600) // 60)
-                print(f"  Token  OK  —  fy_id: {claims_fy}  expires in {h}h {m}m")
-                return raw
-            exp_dt = datetime.datetime.fromtimestamp(time.time() + rem, tz=IST)
-            print(f"\n  Token  EXPIRED  ({exp_dt:%Y-%m-%d %H:%M IST})")
+        raw = TOKEN_FILE.read_text(encoding="utf-8").strip() if TOKEN_FILE.exists() else ""
+        if raw and _broker_token.token_remaining(raw) is None:
+            # A token exists but our decoder can't parse it — fail OPEN: a real Fyers
+            # token we simply can't read shouldn't block trading (REST 401s if truly bad).
+            print("  Token  WARNING: could not parse — proceeding with stored token.")
+            return raw
+        if _broker_token.is_usable(raw):
+            print("  Token  OK  —  " + _broker_token.describe(raw))
+            return raw
+        print("\n  Token  NOT USABLE  —  " + _broker_token.describe(raw))
         if attempt == 1:
             _run_auth()      # try once, then re-loop to re-validate
             continue

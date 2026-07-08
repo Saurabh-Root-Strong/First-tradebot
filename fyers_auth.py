@@ -2,7 +2,8 @@
 fyers_auth.py: Daily Fyers access-token generator with auto-capture.
 
 Run this ONCE before starting TradeBot each trading day.
-Tokens are valid until midnight IST on the day they are issued.
+Fyers tokens expire at a fixed ~06:00-IST cutoff the morning after issue (NOT 24h
+from issue), so run this each trading morning before the session.
 
 Requirements: only 'requests' (already installed)
 
