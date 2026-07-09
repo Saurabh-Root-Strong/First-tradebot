@@ -44,8 +44,12 @@ addopts = "-q"
 
 # ---------------------------------------------------------------------------
 # Import-linter: the 7-layer law (ARCHITECTURE_AUDIT.md §2). Imports point DOWN only.
-# NOT yet active — prod modules are still flat in root. Activated once code moves under
-# tradebot/ (Phase B onward). Kept here as the executable spec of the target.
+# ASPIRATIONAL — this governs only the tradebot/ package (~575 of ~36k LOC); most code is
+# still flat in root, so "contract kept" is a TARGET SPEC for the layered lift, not proof
+# the real code is clean. The boundaries that actually hold TODAY on the flat modules
+# (legacy stays dead · core is a leaf · the live-serve path imports no backtest/audit code)
+# are ENFORCED continuously in tests/test_unit_architecture.py. Fold contracts in here as
+# modules move under tradebot/ (Phase B onward).
 [tool.importlinter]
 root_package = "tradebot"
 
