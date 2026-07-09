@@ -76,10 +76,12 @@ def _grid(day: str, step_min: int) -> list[datetime.datetime]:
 
 
 def _resolve_exit(ticks: pd.DataFrame, t, entry: float, lo: float, hi: float,
-                  direction: str) -> dict:
-    """First-touch barrier exit on the tick path in (t, t+HORIZON]. Returns exit instant,
-    exit spot, outcome (TARGET/SL/TIMEOUT_WIN/TIMEOUT_LOSS) and minutes held."""
-    t_end = t + datetime.timedelta(minutes=HORIZON)
+                  direction: str, max_hold: int = HORIZON) -> dict:
+    """First-touch barrier exit on the tick path in (t, t+max_hold]. Barrier = the fixed
+    60m band edges (the validated product); max_hold is a SEPARATE hard time cap = the
+    user's 'close on band/SL/target ELSE timeout at max_hold' rule. Returns exit instant,
+    exit spot, outcome (TARGET/SL/TIMEOUT_WIN/TIMEOUT_LOSS), minutes held."""
+    t_end = t + datetime.timedelta(minutes=max_hold)
     w = ticks[(ticks["ts"] > pd.Timestamp(t)) & (ticks["ts"] <= pd.Timestamp(t_end))]
     if not len(w):
         return {}
@@ -108,6 +110,9 @@ def _resolve_exit(ticks: pd.DataFrame, t, entry: float, lo: float, hi: float,
 
 # hold horizons for the THETA-DECAY CURVE (minutes). ≤120 = the user's 2-hour ceiling.
 _HOLDS = (20, 30, 45, 60, 75, 90, 120)
+# MAX-HOLD CAPS to sweep (minutes) — band/SL/target exit ELSE timeout at cap. 135 = the
+# user's proposed 2h15m ceiling; 45/60/90/120 bracket it to find the least-bad cap.
+_CAPS = (45, 60, 90, 120, 135)
 
 
 def _exit_variants(sym, day, t, atm, d, e_prem) -> dict:
@@ -184,6 +189,16 @@ def simulate(days: list[str], tf: int, step: int) -> pd.DataFrame:
                            if (e_prem and x_prem) else np.nan)
                 # ── EXIT-POLICY VARIANTS (the monetization test) — same entry, diff exit ──
                 var = _exit_variants(sym, day, t, atm, d, e_prem)
+                # MAX-HOLD SWEEP — the user's exact rule (band/SL/target exit ELSE hard
+                # timeout at the cap), band fixed at 60m, cap swept. Same entry; each cap
+                # just moves the timeout window. opt-net per cap = the money grade.
+                caps = {}
+                for cap in _CAPS:
+                    cx = _resolve_exit(ticks, t, spot, lo, hi, d, max_hold=cap)
+                    xp = (scout._opt_premium(sym, day, cx["exit_t"].to_pydatetime(), atm, d)
+                          if cx else None)
+                    caps[f"cap{cap}"] = (((xp / e_prem - 1.0) * 100.0 - scout._OPT_RT_COST)
+                                         if (e_prem and xp) else np.nan)
                 rg = r.get("regime") or {}
                 rows.append({
                     "date": day, "sym": sym, "entry_t": t.strftime("%H:%M"),
@@ -192,7 +207,7 @@ def simulate(days: list[str], tf: int, step: int) -> pd.DataFrame:
                     "band_pct": round((hi - lo) / 2 / spot * 100, 3),
                     "outcome": ex["outcome"], "held_min": round(ex["held"], 1),
                     "idx_ret": round(idx_ret, 3), "rng60": rng60, "flat": flat,
-                    "opt_entry": e_prem, "opt_net": opt_net, **var,
+                    "opt_entry": e_prem, "opt_net": opt_net, **var, **caps,
                     "mood": r.get("mood_full") or "", "trend": rg.get("trend") or "",
                 })
                 open_until = ex["exit_t"]      # block this index until the trade closes
@@ -339,6 +354,16 @@ def report(df: pd.DataFrame, rng, reps: int, tf: int, step: int, days: list[str]
               f"{_cell(sub_mv,c):>18s}")
     print(f"    FLAT trades = {len(sub_flat)}/{len(df)} ({100*len(sub_flat)/max(len(df),1):.0f}%) — "
           "index went nowhere in 60m; each extra hold minute is pure premium bleed.")
+
+    # ── MAX-HOLD CAP SWEEP — the user's rule: band/SL/target ELSE timeout at cap ────
+    print("\n  MAX-HOLD CAP SWEEP  (band/SL/target exit ELSE hard timeout at cap; band=60m)")
+    print(f"    {'cap':>6s} | {'ALL':>20s} | {'FLAT idx':>18s} | {'MOVED idx':>18s}   "
+          "(mean option-net %, net 3% RT)")
+    for cap in _CAPS:
+        c = f"cap{cap}"
+        tag = "  <- your 2h15m" if cap == 135 else ""
+        print(f"    {cap:>4d}m  | {_cell(df,c):>20s} | {_cell(df[df['flat']],c):>18s} | "
+              f"{_cell(df[~df['flat'].astype(bool)],c):>18s}{tag}")
 
     # ── INDEX × ENTRY-HOUR MATRIX — the dynamic time-performance grid (option-net) ──
     print("\n  INDEX × ENTRY-HOUR  (mean band-touch option-net %, n) — the time matrix")

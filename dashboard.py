@@ -4128,8 +4128,19 @@ def _ghost_boot(_path, cur):
 # breaks less often (each RANGE BREAK more meaningful).
 _ALERT_TF = 60
 
+# Max-hold TIMEOUT (minutes): a scout position that never hit SL/target/band/flip is
+# force-CLOSED in the ledger once it has been open this long — the poller itself holds a
+# dangling position all day (2026-07-09 BANK CE opened 10:02, still open 15:56, ~6h of
+# theta bleed). 90m is the chosen cap (user pref within the data-optimal zone): the max-hold
+# sweep over 9 sessions (band/SL/target ELSE timeout at cap) put net P&L flat and best across
+# 45-90m (90m = −7.0% ALL, the marginal best) and STRICTLY WORSE at 120/135m (FLAT-index
+# danglers bleed −6.2%@45m → −11.7%@135m). The user's first-guess 2h15m was the worst swept
+# cap; 90m gives movers a little more runway while still guillotining all-day rot.
+# Ledger-only (no poller change).
+_SCOUT_MAX_HOLD_MIN = 90
 
-def _scout_episodes(today: str):
+
+def _scout_episodes(today: str, as_of=None):
     """Replay the persisted scout_alerts log into per-index EPISODES: each NEW → close
     (FLIP / SL / TARGET) pair, plus any still-open tail. Returns (open, closed): open is
     the held tail per index; closed is every resolved episode, newest-first. Realized P&L
@@ -4189,14 +4200,34 @@ def _scout_episodes(today: str):
                                "outcome": kind, "exit": exit_p, "pnl": pnl})
                 ep = None
         if ep:
-            opens.append(ep)
+            # MAX-HOLD TIMEOUT — a dangling position (never hit SL/target/band/flip) that
+            # has been open past _SCOUT_MAX_HOLD_MIN is force-closed here as TIMEOUT, priced
+            # at the arrow's premium at the cap minute (leak-safe: cap_t <= as_of). Without
+            # this a no-trigger position bleeds theta all day (poller holds it indefinitely).
+            cap_t = ep["open_ts"] + pd.Timedelta(minutes=_SCOUT_MAX_HOLD_MIN)
+            if as_of is not None and pd.Timestamp(as_of) >= cap_t:
+                exit_p = None
+                try:
+                    exit_p = scout._opt_premium(sym, today, cap_t.to_pydatetime(),
+                                                ep.get("strike"), ep.get("dir"))
+                except Exception:
+                    exit_p = None
+                entry = ep.get("entry")
+                pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
+                closed.append({**ep, "close_t": cap_t.strftime("%H:%M"),
+                               "outcome": "TIMEOUT",
+                               "exit": round(exit_p, 2) if exit_p else None, "pnl": pnl})
+            else:
+                opens.append(ep)
     closed.sort(key=lambda e: e.get("close_t") or "", reverse=True)
     return opens, closed
 
 
 _OUTCOME_BADGE = {"FLIP": ("↺ flipped · reversed out", "#f59e0b"),
                   "SL": ("🛑 SL hit", "#f87171"),
-                  "TARGET": ("🎯 target", "#22c55e"), "?": ("? unresolved", "#94a3b8")}
+                  "TARGET": ("🎯 target", "#22c55e"),
+                  "TIMEOUT": (f"⌛ timed out ({_SCOUT_MAX_HOLD_MIN}m)", "#a78bfa"),
+                  "?": ("? unresolved", "#94a3b8")}
 
 
 def _scout_trade_status(entry, now, sl, tgt, peak) -> str:
@@ -4226,7 +4257,7 @@ def _scout_openpos_body(today: str, as_of):
     unrealized P&L) on top, then CLOSED episodes (outcome + realized P&L), newest-first.
     All reconstructed from the persisted alert log (tf = _ALERT_TF)."""
     import intraday_scout as scout
-    opens, closed = _scout_episodes(today)
+    opens, closed = _scout_episodes(today, as_of=as_of)
     if not opens and not closed:
         return html.Div("No scout episodes yet — the alert log is empty.",
                         style={"color": "#94a3b8", "fontSize": "0.8rem", "padding": "10px"})
@@ -4472,6 +4503,8 @@ def _scout_openpos_body(today: str, as_of):
          "color": "#f59e0b", "fontWeight": "600"},
         {"if": {"filter_query": '{outcome} contains "band"', "column_id": "outcome"},
          "color": "#f59e0b", "fontWeight": "700"},
+        {"if": {"filter_query": '{outcome} contains "timed out"', "column_id": "outcome"},
+         "color": "#a78bfa", "fontWeight": "700"},
         {"if": {"filter_query": '{outcome} contains "unresolved"', "column_id": "outcome"},
          "color": "#64748b", "fontWeight": "600"},
     ]
@@ -4482,6 +4515,10 @@ def _scout_openpos_body(today: str, as_of):
         _tip("outcome", "SL", "Premium hit the −35% stop."),
         _tip("outcome", "band", "Spot broke the σ-range band (↑ upper / ↓ lower) — range "
              "exceeded, episode closed at the arrow's premium then."),
+        _tip("outcome", "timed out", f"Held {_SCOUT_MAX_HOLD_MIN}m without hitting SL / target "
+             "/ band / flip → force-closed (max-hold cap). Beyond the band's 60m forecast "
+             "window a no-touch position is just bleeding theta; 9-day sweep: >90m caps only "
+             "deepen the loss."),
         _tip("outcome", "unresolved", "Defensive: a prior NEW that never recorded a close."),
     ]
     closed_header_tips = {
