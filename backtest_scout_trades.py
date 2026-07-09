@@ -35,8 +35,9 @@ import pandas as pd
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from core.constants import IST, INDEX_SYMBOLS, LIVE_DIR
+from core.constants import IST, INDEX_SYMBOLS, LIVE_DIR, NIFTY
 from core.mirror_io import read_mirror as _read
+from core import market_calendar as _mktcal
 from backtest_continuity import _boot_ci
 import intraday_scout as scout
 
@@ -62,6 +63,43 @@ def _target_week(n: int = 8) -> list[str]:
             continue
         days.append(stem)
     return days[-n:]
+
+
+def _dte(sym: str, day: str) -> int:
+    """Calendar days-to-expiry of the arrow's option on `day`. NIFTY trades WEEKLY options
+    (nearest Tuesday >= day, holiday-rolled back to the prior trading day); BANK/FIN/MIDCAP
+    are MONTHLY-only (last-Tuesday, via market_calendar). DTE is the theta axis — near 0 the
+    ATM premium decays fastest (theta ~ 1/sqrt(T)), which is the 'premium eaten by writers'
+    effect. Best-effort; -1 if the calendar can't resolve."""
+    try:
+        d = datetime.date.fromisoformat(day)
+        if sym == NIFTY:                              # weekly = nearest Tue on/after `day`
+            tue = d + datetime.timedelta(days=(1 - d.weekday()) % 7)  # Tue = weekday 1
+            while not _mktcal.is_trading_day(tue):    # holiday Tue → roll BACK to prior day
+                tue -= datetime.timedelta(days=1)
+            if tue < d:                               # rolled before entry → take next week
+                nxt = d + datetime.timedelta(days=(1 - d.weekday()) % 7 + 7)
+                while not _mktcal.is_trading_day(nxt):
+                    nxt -= datetime.timedelta(days=1)
+                tue = nxt
+            e = tue
+        else:                                          # monthly last-Tuesday
+            e = _mktcal.index_future_expiries(d, 1)[0]
+        return (e - d).days
+    except Exception:
+        return -1
+
+
+def _dte_bkt(dte: int) -> str:
+    if dte < 0:
+        return "?"
+    if dte == 0:
+        return "0 EXPIRY"
+    if dte <= 2:
+        return "1-2 near"
+    if dte <= 7:
+        return "3-7 mid"
+    return "8+ far"
 
 
 def _grid(day: str, step_min: int) -> list[datetime.datetime]:
@@ -200,9 +238,11 @@ def simulate(days: list[str], tf: int, step: int) -> pd.DataFrame:
                     caps[f"cap{cap}"] = (((xp / e_prem - 1.0) * 100.0 - scout._OPT_RT_COST)
                                          if (e_prem and xp) else np.nan)
                 rg = r.get("regime") or {}
+                dte = _dte(sym, day)
                 rows.append({
                     "date": day, "sym": sym, "entry_t": t.strftime("%H:%M"),
-                    "entry_hr": t.hour, "dir": d, "strength": r.get("strength"),
+                    "entry_hr": t.hour, "dte": dte, "dte_bkt": _dte_bkt(dte),
+                    "dir": d, "strength": r.get("strength"),
                     "spot": round(spot, 2), "lo": lo, "hi": hi, "atm": atm,
                     "band_pct": round((hi - lo) / 2 / spot * 100, 3),
                     "outcome": ex["outcome"], "held_min": round(ex["held"], 1),
@@ -334,6 +374,22 @@ def report(df: pd.DataFrame, rng, reps: int, tf: int, step: int, days: list[str]
     print("\n  BY MOOD (regime)")
     for m in sorted(x for x in df["mood"].unique() if x):
         _block(df[df["mood"] == m], m, rng, reps)
+
+    # ── BY DTE — the THETA / expiry-proximity axis (mechanistic, not noise-mined) ──
+    # theta ~ 1/sqrt(T): near expiry the ATM premium the arrow BUYS decays fastest (the
+    # 'writers eat the premium' effect). Also the tiny-premium mirage — near-0 DTE gives
+    # huge % swings on small ₹. NIFTY = weekly (DTE 0-4); BANK/FIN/MIDCAP = monthly (0-25).
+    print("\n  BY DTE BUCKET (days-to-expiry — the theta axis)")
+    for b in ("0 EXPIRY", "1-2 near", "3-7 mid", "8+ far", "?"):
+        sub = df[df["dte_bkt"] == b]
+        if len(sub):
+            _block(sub, b, rng, reps)
+    print("\n  BY DTE × INDEX  (expiry-proximity per index; weekly NIFTY vs monthly others)")
+    for s in INDEX_SYMBOLS:
+        for b in ("0 EXPIRY", "1-2 near", "3-7 mid", "8+ far"):
+            sub = df[(df.sym == s) & (df.dte_bkt == b)]
+            if len(sub):
+                _block(sub, f"{s.split(':')[1][:10]:10s} {b}", rng, reps)
 
     # ── THETA-DECAY CURVE — buy ATM at entry, hold NN min, sell (net cost) ──────────
     # The tsNN columns ARE the decay curve. Split by whether the index actually moved:
