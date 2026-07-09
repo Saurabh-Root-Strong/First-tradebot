@@ -106,21 +106,28 @@ def _resolve_exit(ticks: pd.DataFrame, t, entry: float, lo: float, hi: float,
             "held": (ts_ - pd.Timestamp(t)).total_seconds() / 60.0}
 
 
+# hold horizons for the THETA-DECAY CURVE (minutes). ≤120 = the user's 2-hour ceiling.
+_HOLDS = (20, 30, 45, 60, 75, 90, 120)
+
+
 def _exit_variants(sym, day, t, atm, d, e_prem) -> dict:
     """Option-net under alternative EXIT policies, same entry. Tests whether the theta
     bleed on the 56% timeouts is fixable by cutting earlier / options-native stops:
-      • ts20 / ts30 / ts45 — hard TIME-STOP at 20/30/45m (exit regardless of band)
+      • tsNN — hard TIME-STOP at NN minutes (exit regardless of band); NN in _HOLDS.
+               The tsNN series across _HOLDS IS the theta-decay curve (buy-and-hold the
+               ATM option NN minutes, net of cost) — answers "how long can I hold?".
       • pbar — PREMIUM barrier: TP +45% / SL -25% on the option, else time-stop 30m
                (options-native, walks the premium path at 5-min steps)
     All net of one _OPT_RT_COST round-trip. nan when premiums missing."""
     cost = scout._OPT_RT_COST
-    out = {"ts20": np.nan, "ts30": np.nan, "ts45": np.nan, "pbar": np.nan}
+    out = {f"ts{m}": np.nan for m in _HOLDS}
+    out["pbar"] = np.nan
     if not e_prem:
         return out
-    for tag, mins in (("ts20", 20), ("ts30", 30), ("ts45", 45)):
-        x = scout._opt_premium(sym, day, t + datetime.timedelta(minutes=mins), atm, d)
+    for m in _HOLDS:
+        x = scout._opt_premium(sym, day, t + datetime.timedelta(minutes=m), atm, d)
         if x:
-            out[tag] = (x / e_prem - 1.0) * 100.0 - cost
+            out[f"ts{m}"] = (x / e_prem - 1.0) * 100.0 - cost
     # premium barrier — first 5-min checkpoint that breaches TP/SL, else 30m time-stop
     tp, sl, last = 45.0, -25.0, np.nan
     for m in range(5, 31, 5):
@@ -162,6 +169,14 @@ def simulate(days: list[str], tf: int, step: int) -> pd.DataFrame:
                     continue
                 up = d == "CE"
                 idx_ret = (ex["exit_spot"] / spot - 1.0) * 100.0 * (1 if up else -1)
+                # Did the index actually GO anywhere in the first 60m? peak-to-trough
+                # realized range as % of spot. <0.25% = range-bound/dead → the pure
+                # theta-bleed case the user is worried about (hold a flat index → decay).
+                w60 = ticks[(ticks["ts"] > pd.Timestamp(t)) &
+                            (ticks["ts"] <= pd.Timestamp(t + datetime.timedelta(minutes=60)))]
+                rng60 = round((w60["ltp"].max() - w60["ltp"].min()) / spot * 100, 3) \
+                    if len(w60) else np.nan
+                flat = bool(rng60 == rng60 and rng60 < 0.25)
                 # option P&L — the honest money grade (band-touch exit)
                 e_prem = scout._opt_premium(sym, day, t, atm, d)
                 x_prem = scout._opt_premium(sym, day, ex["exit_t"].to_pydatetime(), atm, d)
@@ -176,7 +191,7 @@ def simulate(days: list[str], tf: int, step: int) -> pd.DataFrame:
                     "spot": round(spot, 2), "lo": lo, "hi": hi, "atm": atm,
                     "band_pct": round((hi - lo) / 2 / spot * 100, 3),
                     "outcome": ex["outcome"], "held_min": round(ex["held"], 1),
-                    "idx_ret": round(idx_ret, 3),
+                    "idx_ret": round(idx_ret, 3), "rng60": rng60, "flat": flat,
                     "opt_entry": e_prem, "opt_net": opt_net, **var,
                     "mood": r.get("mood_full") or "", "trend": rg.get("trend") or "",
                 })
@@ -273,9 +288,9 @@ def report(df: pd.DataFrame, rng, reps: int, tf: int, step: int, days: list[str]
 
     # ── EXIT-POLICY SHOOTOUT — does any exit rescue the arrow to net-positive? ──────
     print("\n  EXIT-POLICY SHOOTOUT (same entries, mean option-net per exit rule)")
-    pol = [("band-touch", "opt_net"), ("time-stop 20m", "ts20"),
-           ("time-stop 30m", "ts30"), ("time-stop 45m", "ts45"),
-           ("prem-barrier TP45/SL25", "pbar")]
+    pol = ([("band-touch", "opt_net")]
+           + [(f"time-stop {m}m", f"ts{m}") for m in _HOLDS]
+           + [("prem-barrier TP45/SL25", "pbar")])
     for name, col in pol:
         if col not in df.columns:
             continue
@@ -304,6 +319,37 @@ def report(df: pd.DataFrame, rng, reps: int, tf: int, step: int, days: list[str]
     print("\n  BY MOOD (regime)")
     for m in sorted(x for x in df["mood"].unique() if x):
         _block(df[df["mood"] == m], m, rng, reps)
+
+    # ── THETA-DECAY CURVE — buy ATM at entry, hold NN min, sell (net cost) ──────────
+    # The tsNN columns ARE the decay curve. Split by whether the index actually moved:
+    #   FLAT (peak-to-trough <0.25% in 60m) = the pure bleed case the user asked about.
+    #   MOVED = the index went somewhere → is there a hold that banks it before decay?
+    print("\n  THETA-DECAY / HOLD CURVE  (mean option-net %, buy ATM & hold NN min)")
+    print(f"    {'hold':>6s} | {'ALL':>18s} | {'FLAT idx (<0.25%)':>20s} | {'MOVED idx':>18s}")
+    sub_all, sub_flat, sub_mv = df, df[df["flat"]], df[~df["flat"].astype(bool)]
+
+    def _cell(s, col):
+        v = s[col].dropna().to_numpy(float) if col in s else np.empty(0)
+        if len(v) < 3:
+            return f"{'n<3':>18s}"
+        return f"n={len(v):<3d} {v.mean():+5.1f}% W{100*(v>0).mean():3.0f}%"
+    for m in _HOLDS:
+        c = f"ts{m}"
+        print(f"    {m:>4d}m  | {_cell(sub_all,c):>18s} | {_cell(sub_flat,c):>20s} | "
+              f"{_cell(sub_mv,c):>18s}")
+    print(f"    FLAT trades = {len(sub_flat)}/{len(df)} ({100*len(sub_flat)/max(len(df),1):.0f}%) — "
+          "index went nowhere in 60m; each extra hold minute is pure premium bleed.")
+
+    # ── INDEX × ENTRY-HOUR MATRIX — the dynamic time-performance grid (option-net) ──
+    print("\n  INDEX × ENTRY-HOUR  (mean band-touch option-net %, n) — the time matrix")
+    hrs = sorted(df.entry_hr.unique())
+    print("    " + "index      " + "".join(f"{h:02d}:xx        " for h in hrs))
+    for s in INDEX_SYMBOLS:
+        cells = []
+        for h in hrs:
+            v = df[(df.sym == s) & (df.entry_hr == h)]["opt_net"].dropna().to_numpy(float)
+            cells.append(f"{v.mean():+4.0f}%/{len(v):<2d}    " if len(v) else f"{'·':>6s}     ")
+        print(f"    {s:10s} " + "".join(cells))
 
     print("\n" + "=" * 92)
     print("READ: barrier win% and option mean-net CI vs the null (50% / 0%) are the verdict.")
