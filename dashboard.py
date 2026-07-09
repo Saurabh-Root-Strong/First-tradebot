@@ -16,6 +16,7 @@ from dash import dcc, html, Input, Output, State, no_update, ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from dashboard_ui import _fmt_contracts, _fmt_cr, _scout_trade_status, _slug  # pure UI leaf helpers
 import footprint_chart   # full-session OI/Volume/ATM-premium series for the popup chart
 import hour_forecast     # next-60-min zone + directional lean (accumulating, unproven)
 try:
@@ -666,10 +667,6 @@ BG      = "#080d14"
 BG_CARD = "#0f1623"
 BG_SIDE = "#0a1020"
 MONO    = {"fontFamily": "'Courier New', Courier, monospace"}
-
-def _slug(sym: str) -> str:
-    return sym.replace(":", "-").replace(".", "-")
-
 
 # ── Live news / event-impact panel ──────────────────────────────────────────────
 def _render_news_panel(data: dict, tab: str = "ALL", tape: bool = False) -> html.Div:
@@ -1892,42 +1889,6 @@ app.layout = dbc.Container([
 
 
 # ── Compact number formatters ─────────────────────────────────────────────────
-
-def _fmt_cr(v) -> str:
-    """Format a ₹Cr value compactly for narrow chips: 12345 → +12.3K, -2500 → -2.5K."""
-    if v is None:
-        return "—"
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        return "—"
-    sign = "+" if v >= 0 else ""
-    a    = abs(v)
-    if a >= 1_00_000:                    # ≥ 1 lakh Cr → show in L
-        return f"{sign if v >= 0 else '-'}{a/1_00_000:.1f}L"
-    if a >= 10_000:                      # ≥ 10,000 Cr → "12.3K"
-        return f"{sign if v >= 0 else '-'}{a/1_000:.0f}K"
-    if a >= 1_000:                       # ≥ 1,000 Cr  → "1.2K"
-        return f"{sign if v >= 0 else '-'}{a/1_000:.1f}K"
-    return f"{v:+.0f}"
-
-
-def _fmt_contracts(v) -> str:
-    """Format FAO net contracts compactly: -259253 → -259K, 12000000 → +12M."""
-    if v is None:
-        return "—"
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
-        return "—"
-    a    = abs(v)
-    sign = "+" if v >= 0 else "-"
-    if a >= 1_000_000:
-        return f"{sign}{a/1_000_000:.1f}M"
-    if a >= 1_000:
-        return f"{sign}{a/1_000:.0f}K"
-    return f"{v:+,d}"
-
 
 # ── Sidebar prediction block ──────────────────────────────────────────────────
 
@@ -4296,28 +4257,6 @@ _OUTCOME_BADGE = {"FLIP": ("↺ flipped · reversed out", "#f59e0b"),
                   "TARGET": ("🎯 target", "#22c55e"),
                   "TIMEOUT": (f"⌛ timed out ({_SCOUT_MAX_HOLD_MIN}m)", "#a78bfa"),
                   "?": ("? unresolved", "#94a3b8")}
-
-
-def _scout_trade_status(entry, now, sl, tgt, peak) -> str:
-    """Live trajectory of an OPEN scout position on its option premium (NOT a close —
-    the poller alone closes on SL/TARGET/FLIP). Shows WHY a position is still open:
-      🎯/🛑  = already past target/SL (close pending on the next poll)
-      ↩ pullback = ran up >=20% then gave back >=15pts of that gain
-      ▲ / ▼  = running toward target / drawing toward SL, with the current premium move
-    entry/sl/tgt are the alert-logged premium levels (SL −35%, target +65% of entry)."""
-    if not entry or now is None:
-        return "· no data"
-    g = now / entry - 1.0                                  # current premium move
-    if tgt and now >= tgt:
-        return f"🎯 target {g:+.0%}"
-    if sl and now <= sl:
-        return f"🛑 SL {g:+.0%}"
-    gp = (peak / entry - 1.0) if peak else g               # best since entry
-    if gp >= 0.20 and (gp - g) >= 0.15:
-        return f"↩ pullback {g:+.0%} (pk {gp:+.0%})"
-    if g >= 0:
-        return f"▲ {g:+.0%} → tgt +65%"
-    return f"▼ {g:+.0%} → SL −35%"
 
 
 def _scout_openpos_body(today: str, as_of):
