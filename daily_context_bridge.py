@@ -42,6 +42,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from core.obs import warn_once   # observe silently-swallowed field-computation failures
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 DB_PATH      = Path(r"D:\Python Projects\Daily_Cash_Market\data\market_data.duckdb")
 LOCAL_DB     = Path(__file__).parent / "data" / "tradebot_context.db"
@@ -468,8 +470,8 @@ class DailyContextBridge:
                 "SELECT MAX(trade_date) FROM index_data WHERE index_name = 'Nifty 50'"
             ).fetchone()
             r["latest_date"] = row[0] if row else None
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # India VIX — level + 5-day change
         try:
@@ -486,8 +488,8 @@ class DailyContextBridge:
                     float(df["close_val"].iloc[0]) -
                     float(df["close_val"].iloc[min(5, len(df) - 1)]), 2
                 )
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # Market breadth: % of stocks with close > prev_close, grouped by sector
         # Uses latest daily_data + sector_master
@@ -512,8 +514,8 @@ class DailyContextBridge:
                     r["heavy_breadth_pct"] = round(
                         float((heavy["adv"] / heavy["total"] * 100).mean()), 1
                     )
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # FII aggregate flow (all index futures combined, 5D + 10D)
         try:
@@ -535,8 +537,8 @@ class DailyContextBridge:
                 r["fii_market_5d_cr"]  = round(float(df["net_cr"].head(5).sum()), 1)
                 r["fii_market_10d_cr"] = round(float(df["net_cr"].head(10).sum()), 1)
                 r["fii_market_5d_pos"] = int((df["net_cr"].head(5) > 0).sum())
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # Large-cap delivery quality (institutional conviction indicator)
         try:
@@ -554,8 +556,8 @@ class DailyContextBridge:
             if not df.empty:
                 r["avg_deliv_pct"]    = round(float(df["deliv_per"].mean()), 1)
                 r["high_deliv_count"] = int((df["deliv_per"] > 60).sum())
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         return r
 
@@ -613,8 +615,8 @@ class DailyContextBridge:
                     "expected_move_pts": float(move_pts) if move_pts else None,
                     "spot_close":       float(spot_cl)  if spot_cl  else None,
                 })
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # ── prediction accuracy (last 30 filled predictions) ─────────────────
         # IMPORTANT: LIMIT on an aggregate query is a no-op — it limits the
@@ -640,8 +642,8 @@ class DailyContextBridge:
                 r["pred_acc_30d"]      = round((row[1] or 0) / row[0] * 100, 1)
                 r["pred_hi_conf_acc"]  = (round(row[2] * 100, 1) if row[2] is not None else None)
                 r["pred_sample"]       = row[0]
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # ── index_data: daily OHLCV → key levels ─────────────────────────────
         idx_name = _IDX_NAME.get(dcm_sym)
@@ -682,8 +684,8 @@ class DailyContextBridge:
                         else:
                             break
                     r["up_streak"] = streak
-            except Exception:
-                pass
+            except Exception as _e:
+                warn_once(_e)
 
         # ── fno_bhavcopy (max pain) — inline computation for DuckDB live path ──
         # nightly_sync pre-computes this; in the DuckDB live fallback we do it here.
@@ -742,8 +744,8 @@ class DailyContextBridge:
                             if np_.empty: np_ = pe_rows_mp
                             r["top_put_strike"] = float(
                                 np_.loc[np_["open_interest"].idxmax(), "strike_price"])
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # ── fii_derivatives_stats: per-symbol FII futures flow ────────────────
         fii_cat = _FII_CAT.get(dcm_sym)
@@ -765,8 +767,8 @@ class DailyContextBridge:
                     r["fii_10d_cr"]      = round(float(df["net_cr"].head(10).sum()), 1)
                     r["fii_5d_pos_days"] = int((df["net_cr"].head(5) > 0).sum())
                     r["fii_oi"]          = int(df["oi_contracts"].iloc[0])
-            except Exception:
-                pass
+            except Exception as _e:
+                warn_once(_e)
 
         # ── fao_participant: FII net + 1D change for ADD/COV display ─────────────
         try:
@@ -806,8 +808,8 @@ class DailyContextBridge:
                 net_today = by_date[dates[0]].get("FII", {}).get("fut_net", 0)
                 net_prev  = by_date[dates[1]].get("FII", {}).get("fut_net", 0)
                 r["fii_net_change_1d"] = net_today - net_prev
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # ── fpi_nsdl_flows: FPI equity flows (macro B7 signal) ───────────────────
         try:
@@ -823,8 +825,8 @@ class DailyContextBridge:
                 r["fpi_equity_5d_cr"]    = round(float(df["net_investment_cr"].head(5).sum()), 1)
                 r["fpi_equity_10d_cr"]   = round(float(df["net_investment_cr"].head(10).sum()), 1)
                 r["fpi_5d_pos_days"]     = int((df["net_investment_cr"].head(5) > 0).sum())
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # ── fii_derivatives_stats: add fii_today_cts (daily net contracts) ───
         # (already computed in the fii_5d block above — refetch for today only)
@@ -839,8 +841,8 @@ class DailyContextBridge:
                 """, [fii_cat]).fetchone()
                 if row_cts and row_cts[0] is not None:
                     r["fii_today_cts"] = int(row_cts[0])
-            except Exception:
-                pass
+            except Exception as _e:
+                warn_once(_e)
 
         # ── fno_bhavcopy: EOD option chain OI + OI change (2-day delta) ─────────
         # NSE bhavcopy chg_in_oi column is often 0; compute change by diffing
@@ -873,8 +875,8 @@ class DailyContextBridge:
                 r["eod_pcr"]      = round(p_oi / c_oi, 3) if c_oi else 0.0
                 r["eod_call_chg"] = c_chg
                 r["eod_put_chg"]  = p_chg
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         return r
 
