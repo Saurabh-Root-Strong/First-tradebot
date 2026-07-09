@@ -4224,7 +4224,10 @@ def _scout_episodes(today: str, as_of=None):
     import intraday_scout as scout
     from core.mirror_io import read_mirror
     opens, closed = [], []
-    df = read_mirror("scout_alerts", today)
+    # as_of caps the log so a REPLAY view can't see FLIP/SL/BAND closes that fire AFTER the
+    # viewed minute (a future leak). None (the anchors caller) = full day, unchanged. This
+    # also keeps the 90m TIMEOUT (below, cap_t <= as_of) consistent with the other closes.
+    df = read_mirror("scout_alerts", today, as_of=as_of)
     if df is None or df.empty:
         return opens, closed
 
@@ -4279,7 +4282,10 @@ def _scout_episodes(today: str, as_of=None):
             # at the arrow's premium at the cap minute (leak-safe: cap_t <= as_of). Without
             # this a no-trigger position bleeds theta all day (poller holds it indefinitely).
             cap_t = ep["open_ts"] + pd.Timedelta(minutes=_SCOUT_MAX_HOLD_MIN)
-            if as_of is not None and pd.Timestamp(as_of) >= cap_t:
+            _asof_ts = pd.Timestamp(as_of) if as_of is not None else None
+            if _asof_ts is not None and _asof_ts.tzinfo is None:
+                _asof_ts = _asof_ts.tz_localize(IST)   # defensive: match read_mirror
+            if _asof_ts is not None and _asof_ts >= cap_t:
                 exit_p = None
                 try:
                     exit_p = scout._opt_premium(sym, today, cap_t.to_pydatetime(),

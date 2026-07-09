@@ -218,7 +218,12 @@ class IntradayDB:
         target = date or datetime.datetime.now(tz=IST).date()
         today  = datetime.datetime.now(tz=IST).date()
 
-        if target == today and self._ok and self._thread.is_alive():
+        # Today's file is routed through the writer thread — but ONLY on the capturer.
+        # A VIEWER has no writer enqueue (_push drops non-capture records), so routing a
+        # today-query through it would block QUERY_TIMEOUT (8 s) then return empty AND, worse,
+        # _exec_query → _get_conn would CREATE an empty today.duckdb. Skip the writer on a
+        # viewer and fall through to the read-only branch (no file → instant empty, no create).
+        if target == today and _CAPTURE_HOST and self._ok and self._thread.is_alive():
             req = _QueryReq(sql)
             self._push(("query", req))
             try:
