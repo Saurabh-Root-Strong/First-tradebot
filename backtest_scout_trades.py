@@ -66,28 +66,10 @@ def _target_week(n: int = 8) -> list[str]:
 
 
 def _dte(sym: str, day: str) -> int:
-    """Calendar days-to-expiry of the arrow's option on `day`. NIFTY trades WEEKLY options
-    (nearest Tuesday >= day, holiday-rolled back to the prior trading day); BANK/FIN/MIDCAP
-    are MONTHLY-only (last-Tuesday, via market_calendar). DTE is the theta axis — near 0 the
-    ATM premium decays fastest (theta ~ 1/sqrt(T)), which is the 'premium eaten by writers'
-    effect. Best-effort; -1 if the calendar can't resolve."""
-    try:
-        d = datetime.date.fromisoformat(day)
-        if sym == NIFTY:                              # weekly = nearest Tue on/after `day`
-            tue = d + datetime.timedelta(days=(1 - d.weekday()) % 7)  # Tue = weekday 1
-            while not _mktcal.is_trading_day(tue):    # holiday Tue → roll BACK to prior day
-                tue -= datetime.timedelta(days=1)
-            if tue < d:                               # rolled before entry → take next week
-                nxt = d + datetime.timedelta(days=(1 - d.weekday()) % 7 + 7)
-                while not _mktcal.is_trading_day(nxt):
-                    nxt -= datetime.timedelta(days=1)
-                tue = nxt
-            e = tue
-        else:                                          # monthly last-Tuesday
-            e = _mktcal.index_future_expiries(d, 1)[0]
-        return (e - d).days
-    except Exception:
-        return -1
+    """Calendar days-to-expiry of the arrow's option on `day` — the theta axis (near 0 the
+    ATM premium decays fastest, theta ~ 1/sqrt(T)). Thin wrapper over the canonical
+    market_calendar.days_to_expiry (weekly for NIFTY, monthly for the rest)."""
+    return _mktcal.days_to_expiry(day, weekly=(sym == NIFTY))
 
 
 def _dte_bkt(dte: int) -> str:

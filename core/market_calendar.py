@@ -119,3 +119,34 @@ def index_future_expiries(today=None, n: int = 3) -> "list[datetime.date]":
         if m > 12:
             m, y = 1, y + 1
     return out
+
+
+def weekly_expiry_on_or_after(d) -> datetime.date:
+    """Nearest NIFTY WEEKLY option expiry on/after `d` — Tuesday, holiday-rolled BACK to the
+    prior trading day. NSE-2026 regime: NIFTY has weekly options every Tuesday; the other
+    indices are monthly-only. REVISIT if NSE changes the weekly weekday (has moved
+    Thu→Wed→Tue historically)."""
+    d = _as_date(d)
+    tue = d + datetime.timedelta(days=(1 - d.weekday()) % 7)   # Tuesday = weekday 1
+    e = tue
+    while not is_trading_day(e):                               # holiday Tue → prior trading day
+        e -= datetime.timedelta(days=1)
+    if e < d:                                                  # this week's expiry passed → next
+        nxt = tue + datetime.timedelta(days=7)
+        while not is_trading_day(nxt):
+            nxt -= datetime.timedelta(days=1)
+        return nxt
+    return e
+
+
+def days_to_expiry(date, weekly: bool) -> int:
+    """Calendar days-to-expiry of the nearest option: WEEKLY (NIFTY, Tuesday) or MONTHLY
+    (last-Tuesday — the other indices). SINGLE SOURCE OF TRUTH for the DTE / theta axis —
+    callers pass weekly=(sym is NIFTY); do NOT re-hardcode the weekday rule (it was
+    duplicated in dashboard._scout_dte + backtest_scout_trades._dte). -1 if unresolvable."""
+    try:
+        d = _as_date(date)
+        e = weekly_expiry_on_or_after(d) if weekly else index_future_expiries(d, 1)[0]
+        return (e - d).days
+    except Exception:
+        return -1

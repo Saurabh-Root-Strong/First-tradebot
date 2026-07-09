@@ -1,4 +1,4 @@
-"""
+r"""
 dashboard.py  —  NSE Index Live Dashboard + Option Chain
 Left pane: 4 live index cards  |  Click any → full option chain (right pane)
 Run:   .venv\Scripts\python.exe dashboard.py
@@ -3945,30 +3945,13 @@ def _ghost_help():
 
 
 def _scout_dte(sym, today):
-    """Calendar days-to-expiry of the arrow's option for `today` — NIFTY trades WEEKLY
-    (nearest holiday-rolled Tuesday), BANK/FIN/MIDCAP MONTHLY (last-Tue). Mirrors
-    backtest_scout_trades._dte. Drives the theta-cliff badge: the 9-session scenario map
-    shows option-net −26% mean at 0-DTE (NIFTY-Tue −45%) → an AVOID flag. -1 if unresolved."""
-    try:
-        from core import market_calendar as _mc
-        from core.constants import NIFTY as _NIFTY
-        d = (datetime.date.fromisoformat(today) if isinstance(today, str)
-             else today or datetime.datetime.now(IST).date())
-        if sym == _NIFTY:
-            tue = d + datetime.timedelta(days=(1 - d.weekday()) % 7)
-            while not _mc.is_trading_day(tue):
-                tue -= datetime.timedelta(days=1)
-            if tue < d:
-                nxt = d + datetime.timedelta(days=(1 - d.weekday()) % 7 + 7)
-                while not _mc.is_trading_day(nxt):
-                    nxt -= datetime.timedelta(days=1)
-                tue = nxt
-            e = tue
-        else:
-            e = _mc.index_future_expiries(d, 1)[0]
-        return (e - d).days
-    except Exception:
-        return -1
+    """Days-to-expiry for the theta-cliff badge — thin wrapper over the canonical
+    market_calendar.days_to_expiry (weekly for NIFTY, monthly for the rest). The 9-session
+    scenario map shows option-net −26% mean at 0-DTE (NIFTY-Tue −45%) → an AVOID flag."""
+    from core import market_calendar as _mc
+    from core.constants import NIFTY as _NIFTY
+    day = today or datetime.datetime.now(IST).date()
+    return _mc.days_to_expiry(day, weekly=(sym == _NIFTY))
 
 
 def _scout_row(r, mem=None, today=None, live=True, practice=False):
@@ -4286,15 +4269,20 @@ def _scout_episodes(today: str, as_of=None):
             if _asof_ts is not None and _asof_ts.tzinfo is None:
                 _asof_ts = _asof_ts.tz_localize(IST)   # defensive: match read_mirror
             if _asof_ts is not None and _asof_ts >= cap_t:
+                # A position opened after ~14:00 caps PAST 15:30 — clamp the effective close
+                # to session end so the label/price read "closed at 15:30" (ran to EOD, no
+                # trigger), not a phantom post-market minute. Price is the last real premium.
+                _sess_close = pd.Timestamp(f"{today} 15:30", tz=IST)
+                eff_t = min(cap_t, _sess_close)
                 exit_p = None
                 try:
-                    exit_p = scout._opt_premium(sym, today, cap_t.to_pydatetime(),
+                    exit_p = scout._opt_premium(sym, today, eff_t.to_pydatetime(),
                                                 ep.get("strike"), ep.get("dir"))
                 except Exception:
                     exit_p = None
                 entry = ep.get("entry")
                 pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
-                closed.append({**ep, "close_t": cap_t.strftime("%H:%M"),
+                closed.append({**ep, "close_t": eff_t.strftime("%H:%M"),
                                "outcome": "TIMEOUT",
                                "exit": round(exit_p, 2) if exit_p else None, "pnl": pnl})
             else:
