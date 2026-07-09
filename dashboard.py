@@ -4265,9 +4265,22 @@ def _scout_openpos_body(today: str, as_of):
     # Numeric cols (Strike/Entry/Now/Exit/P&L) sort by VALUE not text; P&L is stored as
     # a fraction + percentage-formatted so its sort key is the true number.
     from dash import dash_table
-    from dash.dash_table.Format import Format, Scheme, Sign, Symbol
+    from dash.dash_table.Format import Format, Group, Scheme, Sign, Symbol
+    from core.constants import LOT_SIZES
     _rupee = Format(precision=2, scheme=Scheme.fixed).symbol(Symbol.yes).symbol_prefix("₹")
     _pctf = Format(precision=1, scheme=Scheme.percentage).sign(Sign.positive)
+    # ₹ P&L at ONE lot = (exit − entry) × index lot size. This is what actually hits the
+    # account — and it is NOT the same across indices: MIDCAP's 120-lot makes every ₹1 of
+    # premium move worth ₹120 (double NIFTY's 65), so an equal-% loss on MIDCAP is a far
+    # bigger rupee hit. The % column flatters MIDCAP churn; the ₹ column tells the truth.
+    _rupee0 = (Format(precision=0, scheme=Scheme.fixed).group(Group.yes)
+               .sign(Sign.positive).symbol(Symbol.yes).symbol_prefix("₹"))
+
+    def _pnl_rs(sym, entry, exit_p):
+        lot = LOT_SIZES.get(sym)
+        if not (lot and entry and exit_p):
+            return None
+        return round((exit_p - entry) * lot)
     _ledger_side_pnl_cond = [
         {"if": {"filter_query": "{side} = CE", "column_id": "side"},
          "color": "#34d399", "fontWeight": "700"},
@@ -4333,6 +4346,7 @@ def _scout_openpos_body(today: str, as_of):
             "index": o["label"], "side": d, "strike": o.get("strike"),
             "since": o.get("open_t"), "entry": entry, "now": cur,
             "pnl": (pnl / 100.0) if pnl is not None else None,
+            "rupee": _pnl_rs(o["sym"], entry, cur),
             "band": band, "status": _scout_trade_status(entry, cur, sl, tgt, peak),
             "check": flag,
         })
@@ -4344,11 +4358,16 @@ def _scout_openpos_body(today: str, as_of):
         {"name": "Entry", "id": "entry", "type": "numeric", "format": _rupee},
         {"name": "Now", "id": "now", "type": "numeric", "format": _rupee},
         {"name": "P&L (unreal.)", "id": "pnl", "type": "numeric", "format": _pctf},
+        {"name": "₹/lot (unreal.)", "id": "rupee", "type": "numeric", "format": _rupee0},
         {"name": "Band", "id": "band"},
         {"name": "Trade status", "id": "status"},
         {"name": "Live check", "id": "check"},
     ]
     open_extra_cond = [
+        {"if": {"filter_query": "{rupee} < 0", "column_id": "rupee"},
+         "color": "#f87171", "fontWeight": "700"},
+        {"if": {"filter_query": "{rupee} >= 0", "column_id": "rupee"},
+         "color": "#22c55e", "fontWeight": "700"},
         {"if": {"filter_query": '{check} contains "confirms"', "column_id": "check"},
          "color": "#22c55e", "fontWeight": "600"},
         {"if": {"filter_query": '{check} contains "stale"', "column_id": "check"},
@@ -4398,6 +4417,9 @@ def _scout_openpos_body(today: str, as_of):
         "entry": "Option premium paid at entry.",
         "now": "Live option premium.",
         "pnl": "Unrealised P&L = now / entry − 1.",
+        "rupee": "Unrealised ₹ at ONE lot = (now − entry) × index lot size "
+                 "(NIFTY 65 · BANK 30 · FIN 60 · MIDCAP 120). What actually moves in the "
+                 "account — MIDCAP's 120-lot doubles NIFTY's rupee swing for the same %.",
         "band": "'—' = still inside the σ-range band. A break (↑ upper / ↓ lower) closes "
                 "the episode → it moves to the CLOSED table below.",
         "status": "Live trajectory on the option premium vs SL (−35%) / target (+65%): "
@@ -4423,6 +4445,7 @@ def _scout_openpos_body(today: str, as_of):
             "held": f"{e.get('open_t')}→{e.get('close_t') or '—'}",
             "entry": e.get("entry"), "exit": e.get("exit"),
             "pnl": (pnl / 100.0) if pnl is not None else None,
+            "rupee": _pnl_rs(e["sym"], e.get("entry"), e.get("exit")),
             "outcome": badge,
         })
     closed_cols = [
@@ -4433,9 +4456,14 @@ def _scout_openpos_body(today: str, as_of):
         {"name": "Entry", "id": "entry", "type": "numeric", "format": _rupee},
         {"name": "Exit", "id": "exit", "type": "numeric", "format": _rupee},
         {"name": "P&L (real.)", "id": "pnl", "type": "numeric", "format": _pctf},
+        {"name": "₹/lot (real.)", "id": "rupee", "type": "numeric", "format": _rupee0},
         {"name": "Outcome", "id": "outcome"},
     ]
     closed_extra_cond = [
+        {"if": {"filter_query": "{rupee} < 0", "column_id": "rupee"},
+         "color": "#f87171", "fontWeight": "700"},
+        {"if": {"filter_query": "{rupee} >= 0", "column_id": "rupee"},
+         "color": "#22c55e", "fontWeight": "700"},
         {"if": {"filter_query": '{outcome} contains "SL"', "column_id": "outcome"},
          "color": "#f87171", "fontWeight": "600"},
         {"if": {"filter_query": '{outcome} contains "target"', "column_id": "outcome"},
@@ -4463,33 +4491,52 @@ def _scout_openpos_body(today: str, as_of):
         "entry": "Option premium at entry.",
         "exit": "Option premium at close.",
         "pnl": "Realised P&L = exit / entry − 1.",
+        "rupee": "Realised ₹ at ONE lot = (exit − entry) × index lot size "
+                 "(NIFTY 65 · BANK 30 · FIN 60 · MIDCAP 120). The real account move — "
+                 "MIDCAP churn hits 120× per ₹, so its red trades dominate the day's total.",
         "outcome": "How the episode closed.",
     }
     closed_tbl = _ledger_table(closed_records, closed_cols, closed_extra_cond,
                                closed_tips, closed_header_tips, tbl_id="scout-closed-table")
 
-    # ── day summary — realized win-rate + avg (reinforces negative-EV arrow) ──────
+    # ── day summary — realized win-rate + the ACCOUNT-TRUE ₹ total at 1 lot ───────
     rp = [e["pnl"] for e in closed if e.get("pnl") is not None]
     wins = sum(1 for x in rp if x > 0)
     avg = round(sum(rp) / len(rp), 1) if rp else None
-    total = round(sum(rp), 1) if rp else None          # equal-weight cumulative %
+    # Real ₹ at ONE lot per index — the number the % Σ hides. Summing %s across trades
+    # that sit on different premiums AND different lot sizes is meaningless; ₹ is not.
+    rs_by_idx, net_rs = {}, 0
+    for e in closed:
+        r = _pnl_rs(e.get("sym"), e.get("entry"), e.get("exit"))
+        if r is None:
+            continue
+        net_rs += r
+        rs_by_idx[e["label"]] = rs_by_idx.get(e["label"], 0) + r
     summ_c = "#22c55e" if (avg or 0) >= 0 else "#f87171"
-    tot_c = "#22c55e" if (total or 0) >= 0 else "#f87171"
+    net_c = "#22c55e" if net_rs >= 0 else "#f87171"
     summary = html.Div([
-        html.Span(f"{len(opens)} open  ·  {len(closed)} closed", style={"color": "#e2e8f0",
-                  "fontWeight": "700"}),
-        html.Span(f"   realized: {wins}/{len(rp)} win", style={"color": "#94a3b8"})
-        if rp else html.Span(""),
-        html.Span(f"  ·  avg {avg:+.1f}%" if avg is not None else "",
-                  style={"color": summ_c, "fontWeight": "700"}),
-        # Σ = sum of the per-trade realized %s. Only rupee-meaningful under EQUAL stake
-        # per trade (then Σ = N·avg); it is NOT compounded and NOT a rupee total, since
-        # each % sits on a different option premium. Titled so it can't be misread.
-        html.Span(f"  ·  Σ {total:+.1f}%" if total is not None else "",
-                  title="Sum of the per-trade realized %s (equal-weight — assumes the "
-                        "same stake per trade; = trades × avg). Not compounded, not a "
-                        "rupee total; the arrow is negative-EV over large samples.",
-                  style={"color": tot_c, "fontWeight": "700", "cursor": "help"}),
+        html.Div([
+            html.Span(f"{len(opens)} open  ·  {len(closed)} closed", style={"color": "#e2e8f0",
+                      "fontWeight": "700"}),
+            html.Span(f"   realized: {wins}/{len(rp)} win", style={"color": "#94a3b8"})
+            if rp else html.Span(""),
+            html.Span(f"  ·  avg {avg:+.1f}%" if avg is not None else "",
+                      style={"color": summ_c, "fontWeight": "700"}),
+            # THE headline number: real rupees at 1 lot each. Not %-summed.
+            html.Span(f"  ·  Σ ₹{net_rs:+,} (1 lot)" if rs_by_idx else "",
+                      title="Realised ₹ if you traded exactly ONE lot of each — "
+                            "Σ (exit − entry) × index lot size. The account-true total; "
+                            "the arrow is negative-EV over large samples.",
+                      style={"color": net_c, "fontWeight": "800", "cursor": "help",
+                             "fontSize": "0.74rem"}),
+        ]),
+        # per-index ₹ breakdown, worst → best — makes the heavy-lot index's damage obvious
+        html.Div([
+            html.Span(f"{lbl} ₹{v:+,}   ",
+                      style={"color": "#22c55e" if v >= 0 else "#f87171",
+                             "fontWeight": "700", "marginRight": "4px"})
+            for lbl, v in sorted(rs_by_idx.items(), key=lambda kv: kv[1])
+        ], style={"fontSize": "0.62rem", "marginTop": "3px"}) if rs_by_idx else html.Span(""),
     ], style={"fontSize": "0.68rem", "marginBottom": "8px"})
 
     note = html.Div(
@@ -4497,8 +4544,10 @@ def _scout_openpos_body(today: str, as_of):
         "search box (top-right) to filter both tables across all columns (e.g. NIFTY, PE, "
         "flipped, contradicts). One stance per index; OPEN holds through NO-TRADE blinks "
         "until it flips / hits SL / target / breaks the σ-band. CLOSED P&L is realized (entry→exit on the "
-        f"arrow's option). Alert-log state, tf={_ALERT_TF}m. Decision-support only — the "
-        "arrow is negative-EV; trade the range band, not the arrow.",
+        f"arrow's option); ₹/lot = that move × the index lot size (the real account P&L — "
+        "MIDCAP's 120-lot dominates the day). Alert-log state, "
+        f"tf={_ALERT_TF}m. Decision-support only — the arrow is negative-EV; trade the "
+        "range band, not the arrow.",
         style={"color": "#64748b", "fontSize": "0.58rem", "lineHeight": "1.4"})
     return html.Div([
         # full unfiltered rows — the search box filters the tables FROM these
