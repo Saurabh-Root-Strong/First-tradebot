@@ -51,6 +51,24 @@ _PARQUET_TABLES = (
     "chain_snapshots", "scout_alerts",
 )
 
+# ── Capture-role gate — WRITES are capturer-only, decided ONCE per process ─────
+# Only the DESIGNATED capture host may persist (and therefore export the parquet
+# mirrors): a `.capture_host` marker beside the mirror dir, or TRADEBOT_CAPTURE=1.
+# DASH_VIEWER=1 always wins as viewer. Same rule as dashboard._resolve_role, enforced
+# HERE at the single write choke point (_push) because role-blind writers kept leaking
+# in via render paths (signals.py write_signal fired from a VIEWER callback on
+# 2026-07-09 → created a local today-DB → export wave CLOBBERED the VM-synced mirrors
+# with empty tables). A viewer process now cannot write no matter who calls write_*.
+def _is_capture_host() -> bool:
+    if os.environ.get("DASH_VIEWER") == "1":
+        return False
+    if os.environ.get("TRADEBOT_CAPTURE") == "1":
+        return True
+    return (_DB_DIR / ".capture_host").exists()
+
+
+_CAPTURE_HOST = _is_capture_host()
+
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 # Per-day DuckDB schema is the single source of truth in the storage layer.
@@ -268,6 +286,8 @@ class IntradayDB:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _push(self, record: tuple) -> None:
+        if not _CAPTURE_HOST:
+            return   # viewer/non-capture process: NEVER persist (see _is_capture_host)
         try:
             self._q.put_nowait(record)
         except queue.Full:
