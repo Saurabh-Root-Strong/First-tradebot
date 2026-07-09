@@ -142,12 +142,62 @@ def footprint_index(sym: str, window_min: int = WINDOW_MIN,
     foot = [f"{int(r.strike)}{r.side} {r.kind} (ΔOI {r.d_oi/1e5:+.2f}L · vol {r.d_vol/1e5:.1f}L · eff {r.eff:.2f})"
             for r in top.itertuples()]
 
+    # Per-KIND aggregate (write/cover/buy/unwind) so callers can read the specific footprint
+    # config, not just the blended lean — e.g. reversal_signal() needs the COVER share + the
+    # same-side BUY. signed = direction-weighted (+bullish/-bearish); doi_L = net ΔOI in lakhs.
+    kinds = {k: {"signed": float(g["signed"].sum()), "weight": float(g["weight"].sum()),
+                 "doi_L": float(g["d_oi"].sum() / 1e5)}
+             for k, g in fr.groupby("kind")}
+
     return {"sym": sym, "label": LABELS.get(sym, sym), "has_data": True,
             "now": str(now_ts), "window": window_min,
             "lean": round(lean, 3), "direction": direction, "conviction": conviction,
             "spot_chg": round(spot_chg, 3), "leads": leads, "fut_note": fut_note,
             "footprints": foot, "n_strikes": len(fr),
-            "build_L": round(total_build / 1e5, 1)}
+            "build_L": round(total_build / 1e5, 1),
+            "kinds": kinds, "tot_weight": float(tot)}
+
+
+def reversal_signal(sym: str, date=None, as_of=None, dte=None,
+                    window_min: int = WINDOW_MIN) -> dict:
+    """Detect the 'writers secretly close shorts + fresh buying at cheap premium' REVERSAL-
+    ACCUMULATION pattern (the user's smart-money reversal). Reuses footprint_index and reads
+    its per-kind aggregate: FIRES when short-COVERING (OI↓ prem↑ — a short-gamma unwind) is a
+    heavy share of the footprint on ONE side, optionally confirmed by same-side BUYING. Near
+    expiry this is the gamma-squeeze / pin-break precursor; 'cheap' (DTE<=2) is the amplifier.
+
+    DISPLAY / CONTEXT ONLY — NOT a validated trade trigger. Cheap premium = near expiry = the
+    measured −45% theta cliff, so a FALSE fire is a lottery-ticket loss; grade it with
+    backtest_reversal.py as expiry days accrue before ever acting on it. Returns
+    {fired, side, cover_L, buy_L, cover_share, strength, cheap, confirmed, note}."""
+    fp = footprint_index(sym, window_min, date, as_of)
+    if not fp.get("has_data"):
+        return {"fired": False}
+    kinds = fp.get("kinds", {})
+    tot = fp.get("tot_weight", 0.0) or 1.0
+    cover = kinds.get("cover", {})
+    buy = kinds.get("buy", {})
+    cover_signed = cover.get("signed", 0.0)          # + bullish / - bearish
+    cover_weight = cover.get("weight", 0.0)
+    cover_L = abs(cover.get("doi_L", 0.0))           # OI unwound (lakhs)
+    buy_signed = buy.get("signed", 0.0)
+    cover_share = cover_weight / tot
+    cover_dir = 1 if cover_signed > 0 else -1 if cover_signed < 0 else 0
+    # same-side fresh buying CONFIRMS the accumulation (they cover AND go long the move side)
+    confirmed = cover_dir != 0 and (buy_signed > 0) == (cover_dir > 0) and abs(buy_signed) > 0
+    # FIRE: covering is a real chunk of the footprint (>=30%) AND a meaningful OI actually
+    # unwound (>=0.5L) — not a one-lot flicker. Buy confirmation is a bonus, not required.
+    fired = cover_dir != 0 and cover_share >= 0.30 and cover_L >= 0.5
+    strength = float(min(cover_share + (0.25 if confirmed else 0.0), 1.0))
+    cheap = dte is not None and 0 <= dte <= 2
+    side = "bullish" if cover_dir > 0 else "bearish" if cover_dir < 0 else "flat"
+    note = (f"{'call' if cover_dir > 0 else 'put'} short-cover {cover_L:.1f}L"
+            + (" + fresh buy" if confirmed else "")
+            + (" · CHEAP/expiry-charged" if cheap else ""))
+    return {"fired": bool(fired), "side": side, "cover_L": round(cover_L, 2),
+            "buy_L": round(abs(buy.get("doi_L", 0.0)), 2), "cover_share": round(cover_share, 2),
+            "strength": round(strength, 2), "cheap": bool(cheap),
+            "confirmed": bool(confirmed), "note": note}
 
 
 def _print(r: dict) -> None:

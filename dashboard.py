@@ -4020,6 +4020,29 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
                 title="1 day to expiry — accelerating theta decay on the ATM arrow "
                       "(option-net −8.5% mean in the scenario map). Size down / avoid.",
                 style={"color": "#f59e0b", "fontWeight": "700", "cursor": "help"})
+    # REVERSAL-ACCUMULATION flag — writers secretly closing shorts (OI↓ prem↑) + fresh
+    # buying = a positioning flip that can precede a move (gamma-squeeze near expiry). Rare
+    # by design (~1/36 day-cells); DISPLAY CONTEXT ONLY, never a trade trigger (cheap = the
+    # −45% theta cliff; a false fire is a lottery-ticket loss). Live only — the footprint
+    # reads the latest snapshot, so a replay would leak; skip it off-live.
+    rev_badge = None
+    if live and r.get("sym"):
+        try:
+            import smart_money as _sm
+            _rev = _sm.reversal_signal(r["sym"], date=today,
+                                       dte=_scout_dte(r["sym"], today))
+        except Exception:
+            _rev = None
+        if _rev and _rev.get("fired"):
+            _rc = "#34d399" if _rev.get("side") == "bullish" else "#f87171"
+            rev_badge = html.Span("  ⚡ REVERSAL · " + _rev.get("note", ""),
+                title="Smart-money REVERSAL ACCUMULATION: writers are net short-COVERING "
+                      "(OI down, premium up) on one side — a positioning flip that can "
+                      "precede a move (gamma-squeeze / pin-break near expiry). CONTEXT ONLY, "
+                      "NOT a trade signal — this is unvalidated (grade via backtest_reversal "
+                      "as expiry days accrue), and near expiry a false fire is the −45% "
+                      "theta cliff. Reads the day-level footprint (net vs prev close).",
+                style={"color": _rc, "fontWeight": "700", "cursor": "help"})
     _ul = {"textDecoration": "underline dotted", "cursor": "help"}
     metrics = [
         html.Span(f"str {r['strength']:+.2f}  ", title=_TIP_STR,
@@ -4039,6 +4062,7 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
                          "display": "inline-block", "cursor": "help"}),
         html.Span(metrics),
         theta_badge if theta_badge is not None else "",
+        rev_badge if rev_badge is not None else "",
     ], style={**MONO, "fontSize": "0.66rem"})
     # OPEN TRADE lifecycle: when it triggered, entry/SL/target, live P&L, manage call
     # (lc already fetched above for the held-strike headline)
