@@ -5525,6 +5525,21 @@ def update_sidebar(_):
     werr = (html.Span(f"  ⚠ WRITE ERR {_ierr}",
                       style={"color": "#ef4444", "fontWeight": "700"})
             if _ierr else "")
+    # Degradation badge — swallowed computation failures (core.obs.warn_once) surface here on
+    # the HEADER, not only stderr (the chain_snapshots lesson: buried logs = invisible). AMBER,
+    # not red: a defaulted field is softer than write data-loss, but it may be feeding a wrong
+    # number into a live score, so it must be seen. Count = distinct failing sites. 0 → hidden.
+    try:
+        from core.obs import warn_counts as _wc
+        _degr = len(_wc())
+    except Exception:
+        _degr = 0
+    degr = (html.Span(f"  ⚠ DEGRADED {_degr}",
+                      title="Silently-swallowed computation failures (a defaulted field may "
+                            "be feeding a wrong number into a score). See stderr/logs for the "
+                            "file:line contexts.",
+                      style={"color": "#f59e0b", "fontWeight": "700", "cursor": "help"})
+            if _degr else "")
     # Capture-freshness badge — presence-based LIVE/PARTIAL/CONNECTING can't see a FROZEN
     # feed: a stale _latest (VM capture died, or in viewer mode the sync stopped) still reads
     # "● LIVE". During a live session only, if the freshest tick has aged past the tolerance
@@ -5547,7 +5562,7 @@ def update_sidebar(_):
         stale = ""
     status = html.Span([html.Span("● ", style={"color": dot_c}),
                         html.Span(f"{lbl}  ·  {now}", style={"color": "#334155"}),
-                        werr, stale])
+                        werr, degr, stale])
     return ltps + chgs + stys + [status]
 
 
