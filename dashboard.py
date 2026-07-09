@@ -3944,6 +3944,33 @@ def _ghost_help():
     ], style={"marginTop": "6px"})
 
 
+def _scout_dte(sym, today):
+    """Calendar days-to-expiry of the arrow's option for `today` — NIFTY trades WEEKLY
+    (nearest holiday-rolled Tuesday), BANK/FIN/MIDCAP MONTHLY (last-Tue). Mirrors
+    backtest_scout_trades._dte. Drives the theta-cliff badge: the 9-session scenario map
+    shows option-net −26% mean at 0-DTE (NIFTY-Tue −45%) → an AVOID flag. -1 if unresolved."""
+    try:
+        from core import market_calendar as _mc
+        from core.constants import NIFTY as _NIFTY
+        d = (datetime.date.fromisoformat(today) if isinstance(today, str)
+             else today or datetime.datetime.now(IST).date())
+        if sym == _NIFTY:
+            tue = d + datetime.timedelta(days=(1 - d.weekday()) % 7)
+            while not _mc.is_trading_day(tue):
+                tue -= datetime.timedelta(days=1)
+            if tue < d:
+                nxt = d + datetime.timedelta(days=(1 - d.weekday()) % 7 + 7)
+                while not _mc.is_trading_day(nxt):
+                    nxt -= datetime.timedelta(days=1)
+                tue = nxt
+            e = tue
+        else:
+            e = _mc.index_future_expiries(d, 1)[0]
+        return (e - d).days
+    except Exception:
+        return -1
+
+
 def _scout_row(r, mem=None, today=None, live=True, practice=False):
     """One index row in the scout strip. `mem` = this index's persistent trade memory
     (scout-seen, live-only) so a held trade survives a NO-TRADE blink and a resolved
@@ -3971,6 +3998,28 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
         inst += f" · {_exp} exp"
     if r.get("thin"):
         inst += "  ⚠ thin"
+    # THETA-CLIFF badge — buying the arrow near expiry is the worst measured scenario
+    # (9-session DTE map: option-net −26% @0-DTE, NIFTY-Tue weekly −45%; theta ~1/√T eats
+    # the ATM premium). Flag it at the decision point on every strike-bearing row.
+    theta_badge = None
+    if inst and r.get("sym"):
+        _dte = _scout_dte(r["sym"], today)
+        if _dte == 0:
+            _is_nifty = r["sym"] == NIFTY
+            _txt = ("⚠ EXPIRY DAY · theta cliff" +
+                    (" (NIFTY-Tue: arrow ≈ −45% hist)" if _is_nifty
+                     else " (arrow ≈ −26% hist)"))
+            theta_badge = html.Span("  " + _txt,
+                title="Days-to-expiry = 0. Buying the ATM arrow on expiry day is the worst "
+                      "scenario in the 9-session scenario map: option-net −26% mean overall, "
+                      "−45% for NIFTY on its weekly Tuesday. Theta (~1/√T) evaporates the "
+                      "premium; the '+30% band' win here is the tiny-premium mirage. AVOID.",
+                style={"color": "#f87171", "fontWeight": "700", "cursor": "help"})
+        elif _dte == 1:
+            theta_badge = html.Span("  ⚠ 1d to expiry · theta risk",
+                title="1 day to expiry — accelerating theta decay on the ATM arrow "
+                      "(option-net −8.5% mean in the scenario map). Size down / avoid.",
+                style={"color": "#f59e0b", "fontWeight": "700", "cursor": "help"})
     _ul = {"textDecoration": "underline dotted", "cursor": "help"}
     metrics = [
         html.Span(f"str {r['strength']:+.2f}  ", title=_TIP_STR,
@@ -3989,6 +4038,7 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
                   style={"fontWeight": "700", "color": clr, "minWidth": "160px",
                          "display": "inline-block", "cursor": "help"}),
         html.Span(metrics),
+        theta_badge if theta_badge is not None else "",
     ], style={**MONO, "fontSize": "0.66rem"})
     # OPEN TRADE lifecycle: when it triggered, entry/SL/target, live P&L, manage call
     # (lc already fetched above for the held-strike headline)
