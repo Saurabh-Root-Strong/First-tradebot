@@ -18,9 +18,15 @@ REM 1) NSE constants (this also freshens the log mtime + clears/sets the marker)
 call "verify_nse.bat"
 
 REM 2) Signal structural-bias invariants
+REM exit 0 = healthy | 1 = structural bias drift | 2 = COULD NOT VERIFY (mirrors missing or
+REM corrupt). 2 must NOT be read as a pass -- a check that verified nothing is not a green
+REM light. Test errorlevel 2 BEFORE 1 (batch `if errorlevel N` means ">= N").
 echo --- signal health (structural bias invariants) --- >> logs\verify_nse.log
 ".venv\Scripts\python.exe" audit_signals.py --check >> logs\verify_nse.log 2>&1
-if errorlevel 1 (
+if errorlevel 2 (
+  echo SIGNAL CHECK COULD NOT VERIFY: mirrors missing/corrupt %DATE% %TIME% - see logs\verify_nse.log >> logs\verify_nse.DRIFT
+  echo [DRIFT] signal check could not verify - see logs\verify_nse.DRIFT >> logs\verify_nse.log
+) else if errorlevel 1 (
   echo SIGNAL DRIFT: component bias outside band %DATE% %TIME% - see logs\verify_nse.log >> logs\verify_nse.DRIFT
   echo [DRIFT] signal bias - see logs\verify_nse.DRIFT >> logs\verify_nse.log
 ) else (

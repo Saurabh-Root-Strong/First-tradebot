@@ -118,6 +118,13 @@ def check_lot_sizes(con) -> list[str]:
             "limit 5000", [nse]).fetchall()
         lots = [round(v * 1e5 / (c * n)) for v, c, n in rows if v and c and n]
         if not lots:
+            # FAIL-CLOSED: silently skipping is how a check dies without anyone noticing.
+            # No derivable rows => bhavcopy schema/ingestion changed, or a data gap. Either
+            # way THIS CHECK DID NOT RUN, and must not be mistaken for a pass.
+            problems.append(f"  LOTSIZE: {nse} — could NOT derive a lot from turnover "
+                            "(no usable FUTIDX rows in the last 30d). The lot check did NOT "
+                            "run; inspect bhavcopy schema / ingestion.")
+            print(f"  lot {nse:11s}: CANNOT DERIVE (no usable rows)  -> CHECK DID NOT RUN")
             continue
         lots.sort()
         modal = max(set(lots), key=lots.count)

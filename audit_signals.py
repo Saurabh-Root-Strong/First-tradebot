@@ -170,15 +170,20 @@ def _trailing(df):
 
 
 def check_invariants(df) -> int:
-    """Assert the structural signal-health invariants. Returns the number of HARD violations
-    (0 = healthy). Prints warnings for dead/inverted components (not fatal)."""
+    """Assert the structural signal-health invariants.
+    Returns  0 = healthy, >0 = that many HARD violations, -1 = COULD NOT VERIFY.
+
+    FAIL-CLOSED: if no gate-active component had enough data, this returns -1 and the caller
+    exits 2. A check that says "healthy" after evaluating NOTHING is worse than no check —
+    it manufactures false confidence exactly when the data pipeline is broken (missing /
+    corrupt mirrors), which is precisely when you need the alarm."""
     print("\n" + "=" * 82)
     print("SIGNAL-HEALTH CHECK (structural invariants)")
     print("=" * 82)
     win, ndays = _trailing(df)
     print(f"  asserting on the TRAILING {ndays} captured day(s) "
           f"(pooled history would dilute a fresh bias); pooled shown for context.\n")
-    violations = []
+    violations, checked = [], 0
     for c in _GATE_ACTIVE:
         nz_all = df[c][df[c] != 0]
         nz = win[c][win[c] != 0]
@@ -188,6 +193,7 @@ def check_invariants(df) -> int:
                   f"— too thin to judge; pooled {pooled:.1f}%)")
             continue
         pos = 100.0 * (nz > 0).mean()
+        checked += 1
         ok = _BIAS_LO <= pos <= _BIAS_HI
         print(f"  {c:6s} window %pos={pos:5.1f}  (pooled {pooled:5.1f})  "
               f"band[{_BIAS_LO:.0f},{_BIAS_HI:.0f}]  {'OK' if ok else 'STRUCTURAL BIAS'}")
@@ -212,9 +218,14 @@ def check_invariants(df) -> int:
         print(f"SIGNAL DRIFT ({len(violations)}):")
         for v in violations:
             print(f"  {v}")
-    else:
-        print("ALL STRUCTURAL INVARIANTS HOLD — components can still point both ways.")
-    return len(violations)
+        return len(violations)
+    if checked == 0:
+        print("CANNOT VERIFY — no gate-active component had enough data in the window.")
+        print("This is NOT a pass: the mirrors are missing/corrupt, or capture is broken.")
+        return -1
+    print(f"ALL STRUCTURAL INVARIANTS HOLD ({checked}/{len(_GATE_ACTIVE)} components "
+          "verified) — they can still point both ways.")
+    return 0
 
 
 def main():
@@ -232,7 +243,8 @@ def main():
     df = harvest(days)
     evaluate(df, 1500, rng)
     if args.check:
-        sys.exit(1 if check_invariants(df) else 0)
+        rc = check_invariants(df)          # 0 healthy | >0 violations | -1 could-not-verify
+        sys.exit(2 if rc < 0 else (1 if rc else 0))
 
 
 if __name__ == "__main__":

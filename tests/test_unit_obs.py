@@ -1,5 +1,47 @@
 """Unit — core.obs.warn_once: throttled, auto-labelling swallow observability."""
+import io
+import sys
+
 from core.obs import _reset, warn_counts, warn_once
+
+
+def test_warn_once_never_raises_on_cp1252_stderr_with_non_ascii():
+    """HARD CONTRACT: warn_once is called from `except` blocks that previously did `pass`.
+    If it can raise, observability turns a gracefully-swallowed error into a CRASH.
+    Regression: a cp1252 stderr (Windows .bat `>> log 2>&1`) + a '₹' in the exception message
+    raised UnicodeEncodeError and killed the caller."""
+    _reset()
+    real = sys.stderr
+    sys.stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    try:
+        try:
+            raise ValueError("bad ₹ value — delivery ✓")
+        except Exception as e:
+            n = warn_once(e)          # must NOT raise
+        assert n >= 1
+    finally:
+        sys.stderr = real
+    assert len(warn_counts()) == 1
+
+
+def test_warn_once_never_raises_on_broken_stderr():
+    """Even a totally broken stderr must not propagate out of the except block."""
+    _reset()
+    real = sys.stderr
+
+    class Boom:
+        def write(self, *_a, **_k): raise OSError("stderr is gone")
+        def flush(self, *_a, **_k): raise OSError("stderr is gone")
+
+    sys.stderr = Boom()
+    try:
+        try:
+            raise KeyError("x")
+        except Exception as e:
+            n = warn_once(e)          # must NOT raise
+        assert n >= 1
+    finally:
+        sys.stderr = real
 
 
 def _raise_bad():

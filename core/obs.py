@@ -19,25 +19,48 @@ import traceback
 _counts: dict[str, int] = {}
 
 
+def _emit(msg: str) -> None:
+    """Write to stderr, NEVER raising. stderr may be a cp1252 stream (Windows, redirected by
+    a .bat as `>> log 2>&1`), and this codebase is full of ₹ / — / ✓ — printing a non-ASCII
+    exception message there raises UnicodeEncodeError. Since warn_once is called from INSIDE
+    `except` blocks that previously did `pass`, any raise here would convert a gracefully
+    swallowed error into a CRASH. Fall back to ASCII, then to silence."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        try:
+            sys.stderr.write(msg.encode("ascii", "replace").decode("ascii") + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass                      # observability must never win over the caller
+
+
 def warn_once(exc: BaseException, context: str | None = None, every: int = 500) -> int:
     """Record a swallowed exception; print the 1st + every `every`-th for that context.
-    Returns the running count. `context` defaults to the file:line where the exception was
-    RAISED (deepest traceback frame), so a bare warn_once(e) self-labels to the failing
-    statement — one call site instruments many try/excepts with distinct contexts."""
-    if context is None:
-        try:
-            frames = traceback.extract_tb(exc.__traceback__)
-            f = frames[-1] if frames else None
-            fname = f.filename.replace("\\", "/").rsplit("/", 1)[-1] if f else "?"
-            context = f"{fname}:{f.lineno}" if f else "?"
-        except Exception:
-            context = "?"
-    n = _counts.get(context, 0) + 1
-    _counts[context] = n
-    if n == 1 or n % max(every, 1) == 0:
-        print(f"[warn-once x{n}] {context}: {type(exc).__name__}: {str(exc)[:180]}",
-              file=sys.stderr, flush=True)
-    return n
+    Returns the running count (-1 if the helper itself failed). `context` defaults to the
+    file:line where the exception was RAISED (deepest traceback frame), so a bare
+    warn_once(e) self-labels to the failing statement — one call site instruments many
+    try/excepts with distinct contexts.
+
+    HARD CONTRACT: this function NEVER raises. It is invoked from `except` blocks whose
+    prior behaviour was `pass`; if it could raise, adding observability would change control
+    flow and crash callers that used to degrade gracefully. Every path is guarded."""
+    try:
+        if context is None:
+            try:
+                frames = traceback.extract_tb(exc.__traceback__)
+                f = frames[-1] if frames else None
+                fname = f.filename.replace("\\", "/").rsplit("/", 1)[-1] if f else "?"
+                context = f"{fname}:{f.lineno}" if f else "?"
+            except Exception:
+                context = "?"
+        n = _counts.get(context, 0) + 1
+        _counts[context] = n
+        if n == 1 or n % max(every, 1) == 0:
+            _emit(f"[warn-once x{n}] {context}: {type(exc).__name__}: {str(exc)[:180]}")
+        return n
+    except Exception:
+        return -1                     # never propagate out of an except block
 
 
 def warn_counts() -> dict[str, int]:
