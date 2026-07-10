@@ -152,6 +152,21 @@ _GATE_ACTIVE = ["flow", "div", "fut"]   # nonzero gate weight AND actually fires
 _BIAS_LO, _BIAS_HI = 35.0, 65.0         # %positive of NONZERO values; 95%-CALL bug => ~95
 _DEAD_ZERO_PCT = 95.0                   # >=this %zero => component contributes ~nothing
 _IC_INVERT = -0.10                      # flow 15m IC below this => suspect a sign inversion
+# Assert on a TRAILING WINDOW, never the pooled archive. Pooling DILUTES a fresh bias by the
+# clean history and gets LESS sensitive as the archive grows — exactly backwards. Measured:
+# with 60d of history, a bug holding flow at 95% pos for 10 straight days pools to 58% and
+# NEVER fires. The original 95%-CALL bug ran for MONTHS, i.e. precisely the regime pooling
+# hides. A 10-day window (~35 nonzero rows/day x 10 = ample) catches a persistent bias within
+# about a week, while staying statistically stable.
+_WINDOW_DAYS = 10
+_MIN_WINDOW_ROWS = 150
+
+
+def _trailing(df):
+    """Last _WINDOW_DAYS captured days. Returns (sub_df, n_days)."""
+    days = sorted(df["date"].astype(str).unique())
+    keep = set(days[-_WINDOW_DAYS:])
+    return df[df["date"].astype(str).isin(keep)], len(keep)
 
 
 def check_invariants(df) -> int:
@@ -160,19 +175,25 @@ def check_invariants(df) -> int:
     print("\n" + "=" * 82)
     print("SIGNAL-HEALTH CHECK (structural invariants)")
     print("=" * 82)
+    win, ndays = _trailing(df)
+    print(f"  asserting on the TRAILING {ndays} captured day(s) "
+          f"(pooled history would dilute a fresh bias); pooled shown for context.\n")
     violations = []
     for c in _GATE_ACTIVE:
-        nz = df[c][df[c] != 0]
-        if len(nz) < 30:
-            print(f"  {c:6s} SKIP  (only {len(nz)} nonzero rows — too thin to judge)")
+        nz_all = df[c][df[c] != 0]
+        nz = win[c][win[c] != 0]
+        pooled = 100.0 * (nz_all > 0).mean() if len(nz_all) else float("nan")
+        if len(nz) < _MIN_WINDOW_ROWS:
+            print(f"  {c:6s} SKIP  (window has {len(nz)} nonzero rows < {_MIN_WINDOW_ROWS} "
+                  f"— too thin to judge; pooled {pooled:.1f}%)")
             continue
         pos = 100.0 * (nz > 0).mean()
         ok = _BIAS_LO <= pos <= _BIAS_HI
-        print(f"  {c:6s} %pos={pos:5.1f}  band[{_BIAS_LO:.0f},{_BIAS_HI:.0f}]  "
-              f"{'OK' if ok else 'STRUCTURAL BIAS'}")
+        print(f"  {c:6s} window %pos={pos:5.1f}  (pooled {pooled:5.1f})  "
+              f"band[{_BIAS_LO:.0f},{_BIAS_HI:.0f}]  {'OK' if ok else 'STRUCTURAL BIAS'}")
         if not ok:
-            violations.append(f"{c} is {pos:.0f}% positive — outside "
-                              f"[{_BIAS_LO:.0f},{_BIAS_HI:.0f}] (the 95%-CALL bug class)")
+            violations.append(f"{c} is {pos:.0f}% positive over the last {ndays} days — "
+                              f"outside [{_BIAS_LO:.0f},{_BIAS_HI:.0f}] (the 95%-CALL bug class)")
     # warnings (never fatal)
     for c in COMPONENTS:
         zero = 100.0 * (df[c] == 0).mean()
