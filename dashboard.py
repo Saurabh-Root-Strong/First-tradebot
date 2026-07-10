@@ -1205,6 +1205,7 @@ app.layout = dbc.Container([
             html.Div(style={"flex": "1 1 auto"}),     # spacer pushes actions to the right
             _header_action_chip("nav-charts", "📈", "CHARTS", "#a78bfa"),
             _header_action_chip("nav-liveoi", "📡", "LIVE OI", "#40c4ff"),
+            _header_action_chip("btst-btn", "🌙", "BTST", "#22c55e"),
             _header_action_chip(
                 "nav-alerts", "🔔", "ALERTS", "#fbbf24",
                 extra_child=html.Span(id="alert-badge", children="", style={
@@ -1602,6 +1603,14 @@ app.layout = dbc.Container([
                         html.Div(id="scout-openpos-body"),
                         type="circle", color="#67e8f9")),
                 ], id="scout-openpos-modal", is_open=False, size="lg", scrollable=True),
+                # BTST overnight paper ledger — the ONE validated edge, finally visible.
+                dbc.Modal([
+                    dbc.ModalHeader(dbc.ModalTitle(
+                        "🌙 BTST overnight — close-strength paper ledger"),
+                        close_button=True),
+                    dbc.ModalBody(dcc.Loading(html.Div(id="btst-body"),
+                                              type="circle", color="#22c55e")),
+                ], id="btst-modal", is_open=False, size="lg", scrollable=True),
                 dcc.Loading(dcc.Graph(
                     id="charts-graph",
                     config={
@@ -3148,6 +3157,126 @@ def _open_scout_openpos(_n, asof, date):
     else:
         day, as_of = today, datetime.datetime.now(IST)
     return True, _scout_openpos_body(day, as_of), ""
+
+
+def _btst_body():
+    """🌙 BTST overnight paper ledger — the ONLY validated positive-expectancy signal here
+    (close-strength clr>=0.66 → long index FUTURES at the close, exit next ~09:30). Read-only:
+    the VM cron is the single writer. Rupee figures are on ONE futures lot, cost-inclusive."""
+    import btst_panel as bp
+    try:
+        open_rows, stale_rows, closed_rows = bp.load()
+    except Exception as exc:
+        return html.Div(f"BTST ledger unavailable: {exc}",
+                        style={"color": "#f87171", "fontSize": "0.8rem", "padding": "10px"})
+    s = bp.summary(closed_rows)
+    bits = []
+
+    # VIEWER honesty — this box's ledger is a stale copy; the VM's cron owns the real one.
+    if _ROLE_VIEWER:
+        bits.append(html.Div(
+            "⚠ viewer copy — the authoritative ledger lives on the capture VM (cron writes "
+            "it). Numbers here can lag tonight's emit / this morning's reconcile.",
+            style={"color": "#f59e0b", "fontSize": "0.6rem", "marginBottom": "6px"}))
+
+    # STALE-OPEN = reconcile never ran. These are EXCLUDED from the P&L below, so a broken
+    # job would otherwise silently flatter the record (it did once: a −39.6bps loss hidden).
+    if stale_rows:
+        bits.append(html.Div([
+            html.Div(f"⚠ {len(stale_rows)} STALE-OPEN position(s) — the exit day passed but "
+                     "reconcile never ran. They are EXCLUDED from the scorecard below, which "
+                     "therefore OVERSTATES the edge.",
+                     style={"color": "#ef4444", "fontWeight": "700"}),
+            *[html.Div(f"    {r['signal_date']}  {r['index']}  clr {r['clr']}",
+                       style={**MONO, "color": "#fca5a5"}) for r in stale_rows],
+        ], style={"fontSize": "0.62rem", "marginBottom": "8px"}))
+
+    trk_c = {"above expectation": "#22c55e", "tracking": "#22c55e"}.get(s["tracking"], "#f59e0b")
+    if s["n"]:
+        tot = s["total_rupees"]
+        bits.append(html.Div([
+            html.Span(f"{s['n']} nights closed  ·  {s['wins']}/{s['n']} win "
+                      f"({s['win_pct']:.0f}%)", style={"color": "#e2e8f0", "fontWeight": "700"}),
+            html.Span(f"   mean {s['mean_bps']:+.1f} bps",
+                      style={"color": trk_c, "fontWeight": "800"}),
+            html.Span(f"  ·  Σ ₹{tot:+,} (1 lot)" if tot is not None else "",
+                      style={"color": "#22c55e" if (tot or 0) >= 0 else "#f87171",
+                             "fontWeight": "800"}),
+            html.Span(f"  ·  worst {s['worst_bps']:+.0f} bps", style={"color": "#94a3b8"}),
+        ], style={"fontSize": "0.72rem", "marginBottom": "3px"}))
+        bits.append(html.Div(
+            f"backtest expects +{bp.BACKTEST_LO:.0f}–{bp.BACKTEST_HI:.0f} bps/night → "
+            f"{s['tracking'].upper()}  ·  {s['gate_left']} more nights to the "
+            f"{bp.REVIEW_GATE}-night review gate (paper only — nothing auto-executes)",
+            style={"color": trk_c, "fontSize": "0.6rem", "marginBottom": "8px"}))
+
+        rows = bp.per_index(closed_rows)
+        bits.append(html.Div([
+            html.Span(f"{d['index']} {d['mean_bps']:+.1f}bps ₹{d['rupee']:+,} ({d['n']}n)   ",
+                      style={"color": "#22c55e" if d["mean_bps"] >= 0 else "#f87171",
+                             "fontWeight": "700", "marginRight": "6px"}) for d in rows
+        ], style={"fontSize": "0.62rem", "marginBottom": "10px"}))
+    else:
+        bits.append(html.Div("No closed BTST nights yet.",
+                             style={"color": "#94a3b8", "fontSize": "0.75rem"}))
+
+    def _tbl(title, color, rows, cols):
+        if not rows:
+            return html.Div()
+        head = html.Tr([html.Th(c[1], style={"padding": "3px 8px", "color": "#64748b",
+                                             "fontSize": "0.58rem", "textAlign": "left",
+                                             "textTransform": "uppercase"}) for c in cols])
+        body = [html.Tr([html.Td(c[2](r), style={**MONO, "padding": "3px 8px",
+                                                 "fontSize": "0.68rem"}) for c in cols])
+                for r in rows]
+        return html.Div([
+            html.Div(title, style={"color": color, "fontSize": "0.6rem",
+                                   "fontWeight": "700", "margin": "6px 0 3px"}),
+            html.Table([html.Thead(head), html.Tbody(body)],
+                       style={"width": "100%", "borderCollapse": "collapse"}),
+        ])
+
+    def _rs(v):
+        c = "#22c55e" if (v or 0) >= 0 else "#f87171"
+        return html.Span(f"₹{v:+,}" if v is not None else "—",
+                         style={"color": c, "fontWeight": "700"})
+
+    def _bps(v):
+        c = "#22c55e" if (v or 0) >= 0 else "#f87171"
+        return html.Span(f"{v:+.1f}" if v is not None else "—",
+                         style={"color": c, "fontWeight": "700"})
+
+    bits.append(_tbl("● OPEN OVERNIGHT (exit next ~09:30)", "#34d399", open_rows, [
+        ("index", "Index", lambda r: r["index"]),
+        ("signal_date", "Signal close", lambda r: r["signal_date"]),
+        ("clr", "clr", lambda r: f"{r['clr']:.3f}" if r["clr"] else "—"),
+        ("entry", "Entry (fut)", lambda r: f"₹{r['entry']:,.2f}" if r["entry"] else "—"),
+        ("lot", "Lot", lambda r: str(r["lot"] or "—")),
+    ]))
+    bits.append(_tbl("○ CLOSED NIGHTS", "#94a3b8", closed_rows, [
+        ("index", "Index", lambda r: r["index"]),
+        ("held", "Held", lambda r: r["held"]),
+        ("clr", "clr", lambda r: f"{r['clr']:.3f}" if r["clr"] else "—"),
+        ("entry", "Entry", lambda r: f"₹{r['entry']:,.2f}" if r["entry"] else "—"),
+        ("exit", "Exit", lambda r: f"₹{r['exit']:,.2f}" if r["exit"] else "—"),
+        ("net_bps", "Net bps", lambda r: _bps(r["net_bps"])),
+        ("rupee", "₹/lot (net)", lambda r: _rs(r["rupee"])),
+    ]))
+    bits.append(html.Div(
+        "Rule LOCKED (no tuning): a close in the top third of the day's range (clr ≥ 0.66) → "
+        "LONG index FUTURES at ~15:25, exit next ~09:30. Long-only — a weak close is NOT a "
+        "short. ₹ is on ONE lot, net of 3 bps round-trip. PAPER: nothing auto-executes; "
+        "real capital only after the review gate AND a gap-tail plan (worst backtest night "
+        "≈ −2%). This is the system's only validated positive-expectancy signal.",
+        style={"color": "#64748b", "fontSize": "0.57rem", "lineHeight": "1.45",
+               "marginTop": "10px"}))
+    return html.Div(bits)
+
+
+@app.callback(Output("btst-modal", "is_open"), Output("btst-body", "children"),
+              Input("btst-btn", "n_clicks"), prevent_initial_call=True)
+def _open_btst(_n):
+    return True, _btst_body()
 
 
 # One search box (modal top-right) filters BOTH ledger tables across every column, client
