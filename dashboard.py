@@ -3926,6 +3926,25 @@ def _scout_episodes(today: str, as_of=None):
 
     for sym, g in df.groupby("symbol"):                  # df is ts-ascending
         ep = None
+
+        def _cap_t(e):
+            return e["open_ts"] + pd.Timedelta(minutes=_SCOUT_MAX_HOLD_MIN)
+
+        def _timeout_close(e):
+            """Force-close `e` as TIMEOUT at min(open+cap, 15:30), premium looked up at that
+            minute (leak-safe: the cap instant is <= as_of whenever this is invoked)."""
+            eff_t = min(_cap_t(e), pd.Timestamp(f"{today} 15:30", tz=IST))
+            exit_p = None
+            try:
+                exit_p = scout._opt_premium(sym, today, eff_t.to_pydatetime(),
+                                            e.get("strike"), e.get("dir"))
+            except Exception:
+                exit_p = None
+            entry = e.get("entry")
+            pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
+            return {**e, "close_t": eff_t.strftime("%H:%M"), "outcome": "TIMEOUT",
+                    "exit": round(exit_p, 2) if exit_p else None, "pnl": pnl}
+
         for _, r in g.iterrows():
             kind = str(r.get("kind") or "")
             if kind == "NEW":
@@ -3940,6 +3959,15 @@ def _scout_episodes(today: str, as_of=None):
                       "open_ts": r["ts"],
                       "sl": _v(r.get("sl")), "tgt": _v(r.get("tgt")),
                       "bb": False, "band_dir": None}
+            elif kind in ("BAND", "FLIP", "SL", "TARGET") and ep and r["ts"] > _cap_t(ep):
+                # The poller's close fired AFTER the max-hold cap — under the 90m policy the
+                # position was already dead at cap_t, so the ledger closes it as TIMEOUT at
+                # the cap, NOT at the later trigger (2026-07-09 MIDCAP 12:16→15:20 "FLIP" was
+                # really a 184-minute hold; the policy exit was 13:46). Keeps the scoreboard
+                # consistent with the swept 90m rule instead of mixing hold windows. A FLIP's
+                # subsequent NEW row still opens the next episode normally.
+                closed.append(_timeout_close(ep))
+                ep = None
             elif kind == "BAND" and ep:
                 # A σ-band break RESOLVES the episode (range exceeded) → CLOSE it here,
                 # like SL/TARGET/FLIP. Exit = the arrow's premium at the band-break minute;
@@ -3967,31 +3995,15 @@ def _scout_episodes(today: str, as_of=None):
                                "outcome": kind, "exit": exit_p, "pnl": pnl})
                 ep = None
         if ep:
-            # MAX-HOLD TIMEOUT — a dangling position (never hit SL/target/band/flip) that
-            # has been open past _SCOUT_MAX_HOLD_MIN is force-closed here as TIMEOUT, priced
-            # at the arrow's premium at the cap minute (leak-safe: cap_t <= as_of). Without
-            # this a no-trigger position bleeds theta all day (poller holds it indefinitely).
-            cap_t = ep["open_ts"] + pd.Timedelta(minutes=_SCOUT_MAX_HOLD_MIN)
+            # MAX-HOLD TIMEOUT (dangling tail) — a still-open position past the cap with NO
+            # later close row is force-closed as TIMEOUT (leak-safe: only when as_of >= cap).
+            # Without this a no-trigger position bleeds theta all day. Late closes (a poller
+            # SL/FLIP AFTER the cap) are converted to TIMEOUT in the row loop above.
             _asof_ts = pd.Timestamp(as_of) if as_of is not None else None
             if _asof_ts is not None and _asof_ts.tzinfo is None:
                 _asof_ts = _asof_ts.tz_localize(IST)   # defensive: match read_mirror
-            if _asof_ts is not None and _asof_ts >= cap_t:
-                # A position opened after ~14:00 caps PAST 15:30 — clamp the effective close
-                # to session end so the label/price read "closed at 15:30" (ran to EOD, no
-                # trigger), not a phantom post-market minute. Price is the last real premium.
-                _sess_close = pd.Timestamp(f"{today} 15:30", tz=IST)
-                eff_t = min(cap_t, _sess_close)
-                exit_p = None
-                try:
-                    exit_p = scout._opt_premium(sym, today, eff_t.to_pydatetime(),
-                                                ep.get("strike"), ep.get("dir"))
-                except Exception:
-                    exit_p = None
-                entry = ep.get("entry")
-                pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
-                closed.append({**ep, "close_t": eff_t.strftime("%H:%M"),
-                               "outcome": "TIMEOUT",
-                               "exit": round(exit_p, 2) if exit_p else None, "pnl": pnl})
+            if _asof_ts is not None and _asof_ts >= _cap_t(ep):
+                closed.append(_timeout_close(ep))
             else:
                 opens.append(ep)
     closed.sort(key=lambda e: e.get("close_t") or "", reverse=True)
