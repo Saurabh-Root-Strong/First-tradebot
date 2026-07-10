@@ -21,15 +21,20 @@ REM 2) Signal structural-bias invariants
 REM exit 0 = healthy | 1 = structural bias drift | 2 = COULD NOT VERIFY (mirrors missing or
 REM corrupt). 2 must NOT be read as a pass -- a check that verified nothing is not a green
 REM light. Test errorlevel 2 BEFORE 1 (batch `if errorlevel N` means ">= N").
+REM OWN MARKER (logs\signal_health.DRIFT): each check must own its flag's full lifecycle.
+REM Sharing verify_nse.DRIFT had TWO bugs: (a) verify_nse.bat's clean-run `del` ERASED a
+REM standing signal-drift alarm it didn't set (dev.bat then showed green while the signal
+REM was still broken); (b) this check never cleared its own flag on recovery.
 echo --- signal health (structural bias invariants) --- >> logs\verify_nse.log
 ".venv\Scripts\python.exe" audit_signals.py --check >> logs\verify_nse.log 2>&1
 if errorlevel 2 (
-  echo SIGNAL CHECK COULD NOT VERIFY: mirrors missing/corrupt %DATE% %TIME% - see logs\verify_nse.log >> logs\verify_nse.DRIFT
-  echo [DRIFT] signal check could not verify - see logs\verify_nse.DRIFT >> logs\verify_nse.log
+  echo SIGNAL CHECK COULD NOT VERIFY: mirrors missing/corrupt %DATE% %TIME% - see logs\verify_nse.log > logs\signal_health.DRIFT
+  echo [DRIFT] signal check could not verify - see logs\signal_health.DRIFT >> logs\verify_nse.log
 ) else if errorlevel 1 (
-  echo SIGNAL DRIFT: component bias outside band %DATE% %TIME% - see logs\verify_nse.log >> logs\verify_nse.DRIFT
-  echo [DRIFT] signal bias - see logs\verify_nse.DRIFT >> logs\verify_nse.log
+  echo SIGNAL DRIFT: component bias outside band %DATE% %TIME% - see logs\verify_nse.log > logs\signal_health.DRIFT
+  echo [DRIFT] signal bias - see logs\signal_health.DRIFT >> logs\verify_nse.log
 ) else (
+  if exist logs\signal_health.DRIFT del logs\signal_health.DRIFT
   echo [OK] signal structural invariants hold >> logs\verify_nse.log
 )
 
