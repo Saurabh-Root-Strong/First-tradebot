@@ -202,6 +202,13 @@ def simulate(days: list[str], tf: int, step: int) -> pd.DataFrame:
                 rng60 = round((w60["ltp"].max() - w60["ltp"].min()) / spot * 100, 3) \
                     if len(w60) else np.nan
                 flat = bool(rng60 == rng60 and rng60 < 0.25)
+                # CAUSAL 30m realized range — known AT t+30m (unlike `flat`, whose 60m window
+                # peeks past a 30m decision). Feeds the mid-trade BLEED-EXIT policy test:
+                # momentum stalls -> consolidation -> theta eats the premium.
+                w30 = ticks[(ticks["ts"] > pd.Timestamp(t)) &
+                            (ticks["ts"] <= pd.Timestamp(t + datetime.timedelta(minutes=30)))]
+                rng30 = round((w30["ltp"].max() - w30["ltp"].min()) / spot * 100, 3) \
+                    if len(w30) else np.nan
                 # option P&L — the honest money grade (band-touch exit)
                 e_prem = scout._opt_premium(sym, day, t, atm, d)
                 x_prem = scout._opt_premium(sym, day, ex["exit_t"].to_pydatetime(), atm, d)
@@ -226,6 +233,7 @@ def simulate(days: list[str], tf: int, step: int) -> pd.DataFrame:
                     "entry_hr": t.hour, "dte": dte, "dte_bkt": _dte_bkt(dte),
                     "dir": d, "strength": r.get("strength"),
                     "spot": round(spot, 2), "lo": lo, "hi": hi, "atm": atm,
+                    "rng30": rng30,
                     "band_pct": round((hi - lo) / 2 / spot * 100, 3),
                     "outcome": ex["outcome"], "held_min": round(ex["held"], 1),
                     "idx_ret": round(idx_ret, 3), "rng60": rng60, "flat": flat,
@@ -402,6 +410,22 @@ def report(df: pd.DataFrame, rng, reps: int, tf: int, step: int, days: list[str]
         tag = "  <- your 2h15m" if cap == 135 else ""
         print(f"    {cap:>4d}m  | {_cell(df,c):>20s} | {_cell(df[df['flat']],c):>18s} | "
               f"{_cell(df[~df['flat'].astype(bool)],c):>18s}{tag}")
+
+    # ── BLEED-EXIT POLICY — the user's momentum→consolidation→theta-eat pattern ─────
+    # CAUSAL rule, decided AT entry+30m with only past data: if the index's realized range
+    # over the first 30m < THRESH (consolidation) AND the premium is underwater (gross<0 ⇔
+    # theta already eating), EXIT at t+30m; otherwise hold to band/SL/target else 90m cap.
+    # Baseline = plain cap90. Positive delta = the early bleed-exit SAVES money.
+    print("\n  BLEED-EXIT POLICY  (at +30m: flat idx AND premium underwater -> exit early)")
+    print(f"    {'thresh':>7s} | {'n_exited':>8s} | {'policy mean':>11s} | {'cap90 mean':>10s} | "
+          f"{'delta':>6s}   (option-net %, same entries)")
+    base = df["cap90"]
+    for th in (0.10, 0.15, 0.20, 0.25):
+        bleed = (df["rng30"] < th) & ((df["ts30"] + scout._OPT_RT_COST) < 0)
+        pol = np.where(bleed, df["ts30"], df["cap90"])
+        m = pd.Series(pol).dropna()
+        print(f"    <{th:.2f}% | {int(bleed.sum()):>8d} | {np.nanmean(pol):>+10.1f}% | "
+              f"{base.mean():>+9.1f}% | {np.nanmean(pol)-base.mean():>+5.1f}pp")
 
     # ── INDEX × ENTRY-HOUR MATRIX — the dynamic time-performance grid (option-net) ──
     print("\n  INDEX × ENTRY-HOUR  (mean band-touch option-net %, n) — the time matrix")
