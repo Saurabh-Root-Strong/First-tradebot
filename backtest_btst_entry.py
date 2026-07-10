@@ -30,7 +30,8 @@ COST_BPS = 3.0
 # reuse btst_signal's own file naming (FY short-name -> NSE_{FY}_INDEX_*.parquet)
 from btst_signal import FY, DAILY, MIN5
 IDX = list(FY)
-ENTRY_BARS = ["15:15", "15:20", "15:25"]     # 5min bar CLOSES; + "close" = the daily close
+ENTRY_BARS = ["15:10", "15:15", "15:20", "15:25"]  # 5min bar CLOSES; + "close" = daily close
+DECISION_BARS = ["15:10", "15:15"]                 # times you'd commit on a forming clr
 
 
 def _daily(idx):
@@ -63,11 +64,12 @@ def _intraday_prices(idx):
         for hm in ENTRY_BARS:
             b = g[g["hm"] == hm]
             row[hm] = float(b["close"].iloc[0]) if len(b) else np.nan
-        upto = g[g["hm"] <= "15:15"]           # session so far at 15:15
-        if len(upto):
-            hi, lo = upto["high"].max(), upto["low"].min()
-            px = float(upto["close"].iloc[-1])
-            row["clr_1515"] = (px - lo) / (hi - lo) if hi > lo else np.nan
+        for db in DECISION_BARS:               # forming clr using the session THROUGH db
+            upto = g[g["hm"] <= db]
+            if len(upto):
+                hi, lo = upto["high"].max(), upto["low"].min()
+                px = float(upto["close"].iloc[-1])
+                row[f"clr_{db.replace(':','')}"] = (px - lo) / (hi - lo) if hi > lo else np.nan
         out[date] = row
     return out
 
@@ -92,7 +94,8 @@ def run():
                 continue
             allrows.append({"idx": idx, "date": r.date, "clr": r.clr,
                             "close": r.close, "next_open": r.next_open,
-                            "clr_1515": px.get("clr_1515", np.nan),
+                            **{f"clr_{db.replace(':','')}": px.get(f"clr_{db.replace(':','')}", np.nan)
+                               for db in DECISION_BARS},
                             **{hm: px.get(hm, np.nan) for hm in ENTRY_BARS}})
     dfall = pd.DataFrame(allrows).dropna(subset=["clr_1515"])
     if dfall.empty:
@@ -125,31 +128,25 @@ def run():
           f"{net_close_same.mean():+.2f} bps -> 15:15 costs "
           f"~{net_close_same.mean() - ((df['next_open']/df['15:15']-1)*1e4-COST_BPS).dropna().mean():+.1f} bps vs close)")
 
-    # 3) CONFIRMATION — of FINAL strong, how much was already set at 15:15?
-    print("\n  3a) SIGNAL SET-BY-15:15 (of FINAL strong closes):")
-    strong_1515 = df["clr_1515"] >= CLR_TH
-    print(f"     {100*strong_1515.mean():.0f}% were already clr>=0.66 at 15:15; "
-          f"mean clr drift 15:15->close {(df['clr']-df['clr_1515']).mean():+.3f}")
-
-    # 3b) THE EXECUTION UNIVERSE — you decide at 15:15. FADE RATE + P&L on faded trades.
-    print("\n  3b) FADE RISK (the real 15:15 decision): of days STRONG AT 15:15, how many hold?")
-    look_strong = dfall[dfall["clr_1515"] >= CLR_TH]
-    held = look_strong["clr"] >= CLR_TH
-    faded = look_strong[~held]
-    print(f"     strong@15:15 n={len(look_strong)}  ->  held to close {100*held.mean():.1f}%  "
-          f"FADED below 0.66 {100*(~held).mean():.1f}% ({len(faded)} days)")
-    if len(faded):
-        fn = ((faded["next_open"] / faded["15:15"] - 1.0) * 1e4 - COST_BPS).dropna()
-        verdict = ("positive (fade is FREE)" if fn.mean() > 2 else
-                   "~breakeven (fade is cheap)" if fn.mean() > -3 else "a real drag")
-        print(f"     overnight on the FADED (wrongly-entered) trades: mean {fn.mean():+.1f} bps, "
-              f"win {100*(fn>0).mean():.0f}% -> {verdict}")
-    # blended: commit at 15:15 to EVERY strong@15:15 signal (held + faded), exit next open
-    commit = ((look_strong["next_open"] / look_strong["15:15"] - 1.0) * 1e4 - COST_BPS).dropna()
-    print(f"     COMMIT-AT-15:15 policy (take all strong@15:15, no confirmation): "
-          f"mean {commit.mean():+.1f} bps  win {100*(commit>0).mean():.0f}%  n={len(commit)}")
-    print("\n  READ: the 15:15-15:30 window is safe iff (a) the signal is mostly set by 15:15,")
-    print("  (b) faded trades don't bleed, and (c) commit-at-15:15 still clears +10-13 bps.")
+    # 3) CONFIRMATION + FADE RISK at each decision time (15:10 vs 15:15)
+    print("\n  3) DECIDE EARLY? confirmation + fade risk by decision minute:")
+    for db in DECISION_BARS:
+        col = f"clr_{db.replace(':','')}"
+        entry_px = db                              # enter at that same bar's price
+        setby = 100 * (df[col] >= CLR_TH).mean()   # of FINAL strong, already strong at db
+        drift = (df["clr"] - df[col]).mean()
+        look = dfall[dfall[col] >= CLR_TH]         # execution universe: strong AT db
+        held = look["clr"] >= CLR_TH
+        faded = look[~held]
+        fn = ((faded["next_open"] / faded[entry_px] - 1.0) * 1e4 - COST_BPS).dropna() if len(faded) else pd.Series([], dtype=float)
+        commit = ((look["next_open"] / look[entry_px] - 1.0) * 1e4 - COST_BPS).dropna()
+        print(f"     ── decide at {db} ──")
+        print(f"        set-by-{db}: {setby:.0f}% of final-strong already >=0.66  (drift {drift:+.3f})")
+        print(f"        strong@{db} n={len(look)} -> HOLD {100*held.mean():.1f}%  FADE {100*(~held).mean():.1f}% "
+              f"({len(faded)}d, faded overnight {fn.mean():+.1f}bps)")
+        print(f"        COMMIT-AT-{db} (no wait): {commit.mean():+.1f} bps  win {100*(commit>0).mean():.0f}%  n={len(commit)}")
+    print("\n  READ: earlier decision = more fade + weaker confirmation. Safe iff commit-at-time")
+    print("  still clears +10-13 bps AND fade cost stays small.")
 
 
 if __name__ == "__main__":

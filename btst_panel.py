@@ -32,10 +32,12 @@ REVIEW_GATE = 25                          # paper nights before any real-capital
 # so they are derived here rather than invented per-row:
 #   entry = the day's CLOSE (the emit cron fires ~15:28; entry_px is the true <=15:30 close)
 #   exit  = btst_signal.EXIT_T (09:30 next morning)
-# The tradeable window is 15:15-15:30, VALIDATED (backtest_btst_entry.py, 2yr n=754): the
-# clr>=0.66 signal is already set by 15:15 on 96% of days, faded signals cost ~0 bps, and a
-# commit-at-15:15 policy earns +14.3 bps vs the close-entry +14.9 bps — indistinguishable.
-ENTRY_T = "15:15–15:30"                   # executed into the close; entry_px = that close
+# Tradeable window 15:10-15:30, VALIDATED (backtest_btst_entry.py, 2yr n=754): the clr>=0.66
+# signal is already set by 15:10 on 97% of days; commit-at-15:10 earns +13.9 / commit-at-15:15
+# +14.3 bps vs close-entry +14.9 — all indistinguishable and all clear +10-13. NUANCE: on the
+# ~4% of days that fade, deciding at 15:10 costs -6.5 bps vs ~0 at 15:15, so 15:15-15:30 is the
+# marginally cleaner slice. Either works.
+ENTRY_T = "15:10–15:30"                   # executed into the close; entry_px = that close
 def _exit_t() -> str:
     import btst_signal as bs
     return bs.EXIT_T.strftime("%H:%M")
