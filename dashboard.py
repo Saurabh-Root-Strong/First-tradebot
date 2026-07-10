@@ -3172,6 +3172,51 @@ def _btst_body():
     s = bp.summary(closed_rows)
     bits = []
 
+    # ── LIVE FORMING PREVIEW — makes the 15:10-15:30 decision window actionable ──────
+    # During the session, show each index's forming close-strength RIGHT NOW (leak-safe,
+    # as-of this minute), so you see which futures to hold overnight IN your entry window,
+    # before the ~15:28 emit cron logs them. Hidden after ~15:35 (the ledger is then the
+    # record) and on non-trading days.
+    from core.market_calendar import is_trading_day as _itd
+    _now = datetime.datetime.now(IST)
+    if _itd(_now.date()) and _now.time() <= datetime.time(15, 35):
+        in_window = datetime.time(15, 10) <= _now.time() <= datetime.time(15, 30)
+        pre = _now.time() < datetime.time(15, 0)
+        try:
+            fc = bp.forming_candidates(_now)
+        except Exception:
+            fc = []
+        cand = [r for r in fc if r.get("candidate")]
+        hdr_c = "#22c55e" if in_window else "#64748b" if pre else "#fbbf24"
+        title = (f"🌙 FORMING NOW (as of {_now:%H:%M}) — YOUR ENTRY WINDOW IS OPEN"
+                 if in_window else
+                 f"🌙 BTST watch (as of {_now:%H:%M}) — decision window opens 15:10"
+                 if pre else
+                 f"🌙 FORMING (as of {_now:%H:%M}) — provisional, firms by 15:30")
+        rows = []
+        for r in fc:
+            clr = r.get("clr")
+            if clr is None:
+                rows.append(html.Div(f"  {r['index']:<14} · {r.get('note') or 'no data'}",
+                                     style={**MONO, "color": "#64748b", "fontSize": "0.66rem"}))
+                continue
+            hold = r["candidate"]
+            rows.append(html.Div(
+                f"  {r['index']:<14} clr {clr:.3f}   spot {r['spot']:,}   "
+                + ("✓ HOLD OVERNIGHT (long futures)" if hold else "— weak, skip"),
+                style={**MONO, "fontSize": "0.66rem", "fontWeight": "700" if hold else "400",
+                       "color": "#34d399" if hold else "#64748b"}))
+        bits.append(html.Div([
+            html.Div(title, style={"color": hdr_c, "fontWeight": "800",
+                                   "fontSize": "0.66rem", "marginBottom": "3px"}),
+            *rows,
+            html.Div(f"    → {len(cand)} candidate(s). Provisional — 97% of strong closes are "
+                     "already set by 15:10; final at 15:30. Paper: nothing auto-executes.",
+                     style={"color": "#64748b", "fontSize": "0.56rem", "marginTop": "2px"}),
+        ], style={"marginBottom": "10px", "padding": "6px 8px",
+                  "background": "#0c1f17" if in_window else "#0f172a",
+                  "borderRadius": "6px", "border": f"1px solid {hdr_c}44"}))
+
     # VIEWER honesty — this box's ledger is a stale copy; the VM's cron owns the real one.
     if _ROLE_VIEWER:
         bits.append(html.Div(

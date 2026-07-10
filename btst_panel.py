@@ -133,6 +133,43 @@ def per_index(closed_rows) -> list[dict]:
     return sorted(out.values(), key=lambda d: d["mean_bps"])
 
 
+def forming_candidates(as_of=None) -> list[dict]:
+    """LIVE forming close-strength per index from the tick mirror, AS OF now (leak-safe: the
+    read is capped at as_of, so it only sees ticks up to this minute). During 15:10-15:30 this
+    previews which indices are shaping into BTST-LONG candidates (clr>=0.66) BEFORE the ~15:28
+    emit cron logs them — the missing piece that makes the 15:10-15:30 window actionable.
+
+    PROVISIONAL: the final minutes can still nudge clr, but 97% of final-strong closes are
+    already >=0.66 by 15:10 (backtest_btst_entry). Each row: index, clr, spot, candidate, note."""
+    import datetime as dt
+    from core.mirror_io import read_mirror
+    import btst_signal as bs
+    now = as_of or dt.datetime.now(IST)
+    today = now.date()
+    out = []
+    for short, fy in bs.FY.items():
+        row = {"index": _LABEL.get(short, short), "sym": short,
+               "clr": None, "spot": None, "candidate": False, "note": ""}
+        try:
+            tk = read_mirror("ticks", today.isoformat(), now, f"NSE:{fy}-INDEX")
+            if tk is None or len(tk) < 30:
+                row["note"] = "warming up"
+                out.append(row); continue
+            m = tk[(tk["ts"].dt.date == today) & (tk["ts"].dt.time >= dt.time(9, 15))]
+            if len(m) < 30:
+                row["note"] = "warming up"
+                out.append(row); continue
+            ltp = m["ltp"].to_numpy(float)
+            hi, lo, px = float(ltp.max()), float(ltp.min()), float(m.iloc[-1]["ltp"])
+            clr = (px - lo) / (hi - lo) if hi > lo else 0.5
+            row.update({"clr": round(clr, 3), "spot": round(px, 1),
+                        "candidate": clr >= bs.CLR_TH})
+        except Exception as exc:
+            row["note"] = f"err: {exc}"
+        out.append(row)
+    return out
+
+
 def ledger_age_days() -> "int | None":
     """Whole days since the ledger file was last written. On a VIEWER this is a stale copy of
     the VM's; surfacing the age stops the UI implying the numbers are live."""
