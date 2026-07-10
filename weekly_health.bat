@@ -27,13 +27,9 @@ if errorlevel 1 (
   echo [OK] signal structural invariants hold >> logs\verify_nse.log
 )
 
-REM 3) BTST paper-ledger integrity — a STALE-OPEN position is silently dropped from the
-REM    scorecard, so a broken morning reconcile FLATTERS the only validated edge's record.
-echo --- BTST paper-ledger integrity (stale-open guard) --- >> logs\verify_nse.log
-".venv\Scripts\python.exe" btst_signal.py --check >> logs\verify_nse.log 2>&1
-if errorlevel 1 (
-  echo BTST LEDGER BROKEN: stale-open position(s), reconcile did not run %DATE% %TIME% >> logs\verify_nse.DRIFT
-  echo [DRIFT] btst stale-open - see logs\verify_nse.DRIFT >> logs\verify_nse.log
-) else (
-  echo [OK] btst paper ledger integrity intact >> logs\verify_nse.log
-)
+REM NOTE: NO btst check here on purpose. The AUTHORITATIVE BTST paper ledger lives on the
+REM capture VM (cron: btst_vm_cron.sh eod/morning; local Windows tasks are deliberately
+REM Disabled — one writer, one ledger). A local `btst_signal.py --check` would read this box's
+REM STALE COPY and report OK while the VM is broken (or vice versa). The stale-open guard is
+REM instead built into btst_signal.scorecard(), which the VM's own cron prints every run —
+REM see logs/btst_cron.log on the VM.
