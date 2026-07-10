@@ -61,15 +61,17 @@ def _intraday_prices(idx):
     for date, g in m.groupby("date"):
         g = g.sort_values("ts")
         row = {}
-        for hm in ENTRY_BARS:
-            b = g[g["hm"] == hm]
-            row[hm] = float(b["close"].iloc[0]) if len(b) else np.nan
-        for db in DECISION_BARS:               # forming clr using the session THROUGH db
-            upto = g[g["hm"] <= db]
-            if len(upto):
-                hi, lo = upto["high"].max(), upto["low"].min()
-                px = float(upto["close"].iloc[-1])
-                row[f"clr_{db.replace(':','')}"] = (px - lo) / (hi - lo) if hi > lo else np.nan
+        # BARS ARE BAR-START labelled: the bar "15:10" spans [15:10,15:15). So the price/clr
+        # KNOWN AT clock time T uses only bars that have fully CLOSED, i.e. hm < T (the bar
+        # ending exactly at T is the one labelled T-5m). hm <= T would leak 5 minutes ahead.
+        for T in set(ENTRY_BARS) | set(DECISION_BARS):
+            upto = g[g["hm"] < T]              # strictly before -> bars completed by clock T
+            if not len(upto):
+                continue
+            px = float(upto["close"].iloc[-1])           # last close = price AS OF T
+            hi, lo = upto["high"].max(), upto["low"].min()
+            row[T] = px                                  # entry price at T
+            row[f"clr_{T.replace(':','')}"] = (px - lo) / (hi - lo) if hi > lo else np.nan
         out[date] = row
     return out
 
