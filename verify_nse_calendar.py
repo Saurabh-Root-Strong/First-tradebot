@@ -100,6 +100,12 @@ def check_weekly_expiry(con) -> list[str]:
             continue                                         # holiday-rolled Monday
         bad.add(f"  EXPIRY:  nearest LIQUID NIFTY expiry from {td} is {nxt} ({nxt:%A}) - "
                 "not Tuesday (nor a holiday-rolled Monday). Weekly rule may have changed.")
+    if checked == 0:
+        # FAIL-CLOSED: zero liquid expiries found => the query/schema changed or bhavcopy has
+        # a gap. Reporting "all Tue" here would be a pass on an empty set.
+        print("  weekly expiry: CANNOT VERIFY (0 liquid expiries found) -> CHECK DID NOT RUN")
+        return ["  EXPIRY:  could NOT verify the weekly rule — no liquid NIFTY OPTIDX "
+                "expiries in the last 90d. Inspect bhavcopy schema / ingestion."]
     print(f"  weekly expiry: nearest-liquid-expiry checked over {checked} recent days "
           f"({'all Tue/rolled-Mon' if not bad else str(len(bad))+' OFF-DAY'})")
     return sorted(bad)
