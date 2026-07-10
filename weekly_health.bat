@@ -26,3 +26,14 @@ if errorlevel 1 (
 ) else (
   echo [OK] signal structural invariants hold >> logs\verify_nse.log
 )
+
+REM 3) BTST paper-ledger integrity — a STALE-OPEN position is silently dropped from the
+REM    scorecard, so a broken morning reconcile FLATTERS the only validated edge's record.
+echo --- BTST paper-ledger integrity (stale-open guard) --- >> logs\verify_nse.log
+".venv\Scripts\python.exe" btst_signal.py --check >> logs\verify_nse.log 2>&1
+if errorlevel 1 (
+  echo BTST LEDGER BROKEN: stale-open position(s), reconcile did not run %DATE% %TIME% >> logs\verify_nse.DRIFT
+  echo [DRIFT] btst stale-open - see logs\verify_nse.DRIFT >> logs\verify_nse.log
+) else (
+  echo [OK] btst paper ledger integrity intact >> logs\verify_nse.log
+)

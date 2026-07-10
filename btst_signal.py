@@ -201,8 +201,58 @@ def reconcile():
     print(f"  reconciled {filled} position(s).")
 
 
+def _next_trading_day(d: dt.date) -> dt.date:
+    from core.market_calendar import is_trading_day
+    n = d + dt.timedelta(days=1)
+    while not is_trading_day(n):
+        n += dt.timedelta(days=1)
+    return n
+
+
+def _as_date(x) -> dt.date:
+    return x if isinstance(x, dt.date) and not isinstance(x, dt.datetime) else \
+        dt.date.fromisoformat(str(x)[:10])
+
+
+def open_positions(led=None):
+    """Split OPEN rows into (fresh, STALE). STALE = the exit day has already passed, i.e.
+    --reconcile never ran.
+
+    WHY THIS MATTERS: the scorecard only sums CLOSED rows, so a stale-open position is
+    SILENTLY EXCLUDED from the paper P&L. A broken morning job therefore FLATTERS the record
+    by dropping trades — and it did: 2026-07-07..10 the morning task was disabled/failing
+    (0x80070002), one MIDCPNIFTY position sat unreconciled, and the card read
+    'win 83%, mean +14.3 bps'. Reconciled, that trade was -39.6 bps (the worst in the ledger)
+    and the truth was 'win 71%, mean +6.6 bps' — BELOW the +10-13 bps backtest expectation.
+    Never let an unreconciled position be invisible."""
+    led = _load_ledger() if led is None else led
+    o = led[led["status"] == "OPEN"]
+    if o.empty:
+        return o, o
+    from core.constants import IST
+    today = dt.datetime.now(IST).date()
+    stale = o["date"].map(lambda x: _next_trading_day(_as_date(x)) < today)
+    return o[~stale], o[stale]
+
+
+def _report_open(led) -> int:
+    """Print open/stale positions. Returns the STALE count (0 = ledger integrity intact)."""
+    fresh, stale = open_positions(led)
+    if len(stale):
+        print(f"\n  ⚠ {len(stale)} STALE-OPEN position(s) — the exit day passed but "
+              "--reconcile never ran.")
+        print("    They are EXCLUDED from the P&L below, which therefore OVERSTATES the edge.")
+        for r in stale.itertuples():
+            print(f"      {_as_date(r.date)}  {r.sym}  clr={r.clr}")
+        print("    FIX: .venv\\Scripts\\python.exe btst_signal.py --reconcile")
+    elif len(fresh):
+        print(f"\n  {len(fresh)} open position(s) awaiting tomorrow's exit (normal).")
+    return len(stale)
+
+
 def scorecard():
     led = _load_ledger()
+    _report_open(led)
     c = led[led["status"] == "CLOSED"]
     print("\n  ── PAPER SCORECARD (closed BTST-long positions) ──")
     if c.empty:
@@ -268,10 +318,20 @@ def main():
     ap.add_argument("--scorecard", action="store_true")
     ap.add_argument("--simulate", type=int, default=0)
     ap.add_argument("--date", default="", help="emit for a specific YYYY-MM-DD close")
+    ap.add_argument("--check", action="store_true",
+                    help="ledger-integrity guard: exit 1 if any position is STALE-OPEN "
+                         "(exit day passed, --reconcile never ran). For the weekly cron.")
     args = ap.parse_args()
     print("=" * 74)
     print("  BTST close-strength signal — PAPER-FIRST (nothing auto-executes)")
     print("=" * 74)
+    if args.check:
+        # A stale-open position is silently dropped from the scorecard -> the paper record
+        # overstates the edge. This is the ledger's integrity invariant; fail loudly.
+        n = _report_open(_load_ledger())
+        print("\n  LEDGER INTEGRITY: " + ("OK — no stale-open positions." if not n
+                                          else f"BROKEN — {n} stale-open (reconcile did not run)."))
+        sys.exit(1 if n else 0)
     if args.simulate:
         simulate(args.simulate); return
     if args.reconcile:
