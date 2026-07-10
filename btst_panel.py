@@ -28,6 +28,15 @@ _LABEL = {"NIFTY": "NIFTY 50", "BANKNIFTY": "BANK NIFTY",
 BACKTEST_LO, BACKTEST_HI = 10.0, 13.0     # bps/night the 4yr backtest expects
 REVIEW_GATE = 25                          # paper nights before any real-capital discussion
 
+# The ledger stores DATES + PRICES, never clock stamps — the times are FIXED BY THE RULE,
+# so they are derived here rather than invented per-row:
+#   entry = the day's CLOSE (the emit cron fires ~15:28; entry_px is the true <=15:30 close)
+#   exit  = btst_signal.EXIT_T (09:30 next morning)
+ENTRY_T = "15:25–15:30"                   # executed into the close; entry_px = that close
+def _exit_t() -> str:
+    import btst_signal as bs
+    return bs.EXIT_T.strftime("%H:%M")
+
 
 def _lot(sym_short: str):
     return LOT_SIZES.get(_SYM.get(sym_short, ""), None)
@@ -54,17 +63,25 @@ def load():
     fresh, stale = bs.open_positions(led)
     closed = led[led["status"] == "CLOSED"]
 
+    xt = _exit_t()
+
     def _open_row(r, is_stale):
+        d = bs._as_date(r.date)
         return {"index": _LABEL.get(r.sym, r.sym), "sym": r.sym,
                 "clr": round(float(r.clr), 3) if r.clr is not None else None,
-                "signal_date": str(bs._as_date(r.date)),
+                "signal_date": str(d),
+                "triggered": f"{d} {ENTRY_T}",
+                "exits": f"{bs._next_trading_day(d)} {xt}",
                 "entry": round(float(r.entry_px), 2) if r.entry_px else None,
                 "lot": _lot(r.sym), "stale": is_stale}
 
     def _closed_row(r):
+        d, xd = bs._as_date(r.date), bs._as_date(r.exit_date)
         return {"index": _LABEL.get(r.sym, r.sym), "sym": r.sym,
                 "clr": round(float(r.clr), 3) if r.clr is not None else None,
-                "held": f"{bs._as_date(r.date)}→{bs._as_date(r.exit_date)}",
+                "held": f"{d}→{xd}",
+                "triggered": f"{d} {ENTRY_T}",
+                "exited": f"{xd} {xt}",
                 "entry": round(float(r.entry_px), 2) if r.entry_px else None,
                 "exit": round(float(r.exit_px), 2) if r.exit_px else None,
                 "net_bps": round(float(r.net_bps), 1) if r.net_bps is not None else None,

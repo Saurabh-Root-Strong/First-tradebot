@@ -3246,16 +3246,19 @@ def _btst_body():
         return html.Span(f"{v:+.1f}" if v is not None else "—",
                          style={"color": c, "fontWeight": "700"})
 
-    bits.append(_tbl("● OPEN OVERNIGHT (exit next ~09:30)", "#34d399", open_rows, [
+    bits.append(_tbl("● OPEN OVERNIGHT — held through the night", "#34d399", open_rows, [
         ("index", "Index", lambda r: r["index"]),
-        ("signal_date", "Signal close", lambda r: r["signal_date"]),
+        ("triggered", "Triggered", lambda r: html.Span(r["triggered"],
+                                                       style={"color": "#34d399"})),
+        ("exits", "Exits at", lambda r: html.Span(r["exits"], style={"color": "#fbbf24"})),
         ("clr", "clr", lambda r: f"{r['clr']:.3f}" if r["clr"] else "—"),
         ("entry", "Entry (fut)", lambda r: f"₹{r['entry']:,.2f}" if r["entry"] else "—"),
         ("lot", "Lot", lambda r: str(r["lot"] or "—")),
     ]))
     bits.append(_tbl("○ CLOSED NIGHTS", "#94a3b8", closed_rows, [
         ("index", "Index", lambda r: r["index"]),
-        ("held", "Held", lambda r: r["held"]),
+        ("triggered", "Triggered", lambda r: r["triggered"]),
+        ("exited", "Exited", lambda r: r["exited"]),
         ("clr", "clr", lambda r: f"{r['clr']:.3f}" if r["clr"] else "—"),
         ("entry", "Entry", lambda r: f"₹{r['entry']:,.2f}" if r["entry"] else "—"),
         ("exit", "Exit", lambda r: f"₹{r['exit']:,.2f}" if r["exit"] else "—"),
@@ -3264,8 +3267,10 @@ def _btst_body():
     ]))
     bits.append(html.Div(
         "Rule LOCKED (no tuning): a close in the top third of the day's range (clr ≥ 0.66) → "
-        "LONG index FUTURES at ~15:25, exit next ~09:30. Long-only — a weak close is NOT a "
-        "short. ₹ is on ONE lot, net of 3 bps round-trip. PAPER: nothing auto-executes; "
+        "LONG index FUTURES at the close, exit next 09:30. Long-only — a weak close is NOT a "
+        "short. ₹ is on ONE lot, net of 3 bps round-trip. TIMES are FIXED BY THE RULE, not "
+        "recorded per-trade: entry is the day's close (the emit job runs ~15:28 and prices the "
+        "true ≤15:30 close); exit is 09:30 the next trading day. PAPER: nothing auto-executes; "
         "real capital only after the review gate AND a gap-tail plan (worst backtest night "
         "≈ −2%). This is the system's only validated positive-expectancy signal.",
         style={"color": "#64748b", "fontSize": "0.57rem", "lineHeight": "1.45",
