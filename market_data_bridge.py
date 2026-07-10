@@ -22,6 +22,8 @@ import threading
 import time
 from pathlib import Path
 
+from core.obs import warn_once   # observe silently-swallowed field-computation failures
+
 DB_PATH   = Path(r"D:\Python Projects\Daily_Cash_Market\data\market_data.duckdb")
 _LOCAL_DB = Path(__file__).parent / "data" / "tradebot_context.db"
 
@@ -441,6 +443,6 @@ def _get_delivery_context() -> dict:
                 age_days = 99
             if age_days <= 3:
                 return {"avg_deliv_pct": row[0], "high_deliv_count": row[1]}
-    except Exception:
-        pass
+    except Exception as _e:
+        warn_once(_e)
     return {}

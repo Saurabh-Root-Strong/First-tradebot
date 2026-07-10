@@ -33,6 +33,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from core.obs import warn_once   # observe silently-swallowed field-computation failures
+
 # ── Config ────────────────────────────────────────────────────────────────────
 DCM_DB    = Path(r"D:\Python Projects\Daily_Cash_Market\data\market_data.duckdb")
 CACHE_TTL = 30 * 60   # 30 minutes — short enough to pick up post-6:30 PM ingestion
@@ -155,8 +157,8 @@ class _DCMPredictionReader:
             ).fetchall()
             if rows:
                 india_vix = float(rows[0][0])
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # ── FAO participant: FII net futures + 1D change ───────────────────────
         # fii_net_change_1d > 0 → COV (covering), < 0 → ADD (adding to short)
@@ -178,8 +180,8 @@ class _DCMPredictionReader:
                 fii_net_latest = int(rows[0][1])
                 if len(rows) >= 2:
                     fii_net_change = int(rows[0][1]) - int(rows[1][1])
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
         # ── Per-symbol reads ───────────────────────────────────────────────────
         for fyers_sym, dcm_sym in _SYMBOLS.items():
@@ -244,8 +246,8 @@ class _DCMPredictionReader:
                 "expected_move_pts": float(exp_pts) if exp_pts  is not None else None,
                 "spot_close":      float(spot_cl)  if spot_cl   is not None else None,
             })
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
     def _read_prev_close(self, con, dcm_sym: str, d: dict) -> None:
         """Previous session's close — needed for day-change %."""
@@ -261,8 +263,8 @@ class _DCMPredictionReader:
             """, [idx_name]).fetchone()
             if row:
                 d["prev_close"] = float(row[1]) if row[1] is not None else None
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
     def _read_option_chain(self, con, dcm_sym: str, d: dict) -> None:
         """Near-expiry option chain: PCR, DTE, max pain, top OI strikes."""
@@ -291,8 +293,8 @@ class _DCMPredictionReader:
                     prd_dt  = (pred_date if isinstance(pred_date, datetime.date)
                                else datetime.date.fromisoformat(str(pred_date)[:10]))
                     d["dte"] = max(0, (exp_dt - prd_dt).days)
-                except Exception:
-                    pass
+                except Exception as _e:
+                    warn_once(_e)
 
             # All strikes for near expiry
             mp_df = con.execute("""
@@ -350,8 +352,8 @@ class _DCMPredictionReader:
                 d["top_put_strike"] = float(
                     np_.loc[np_["open_interest"].idxmax(), "strike_price"])
 
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
     def _read_accuracy(self, con, dcm_sym: str, d: dict) -> None:
         """30-day rolling prediction accuracy."""
@@ -368,8 +370,8 @@ class _DCMPredictionReader:
             """, [dcm_sym]).fetchone()
             if row and row[0]:
                 d["pred_acc_30d"] = round((row[1] or 0) / row[0] * 100, 1)
-        except Exception:
-            pass
+        except Exception as _e:
+            warn_once(_e)
 
 
 def compute_breakout_scenarios(d: dict) -> dict:
