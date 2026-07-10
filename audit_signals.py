@@ -140,14 +140,78 @@ def evaluate(df, reps, rng):
     print("bias (the 95%-CALL bug). IC CI straddling 0 = no directional skill (context only).")
 
 
+# ── MONITORED INVARIANTS (--check) ──────────────────────────────────────────────
+# We assert what must be STRUCTURALLY true, never what we HOPE is true about alpha.
+#   * BIAS SYMMETRY is structural: a directional component must be able to point BOTH ways.
+#     It broke once (flow was 95% CALL for months — strike-roll + vega + contango-sign bugs,
+#     silently buying calls into falling tapes) and the fix must stay fixed. HARD FAIL.
+#   * IC is market-dependent and currently ~0 on every component (no measured skill). Asserting
+#     IC>0 would fail forever and train you to ignore the alarm. NOT asserted — only a sign
+#     INVERSION is warned, since that smells like a new roll/vega-class sign bug.
+_GATE_ACTIVE = ["flow", "div", "fut"]   # nonzero gate weight AND actually fires (cross is inert)
+_BIAS_LO, _BIAS_HI = 35.0, 65.0         # %positive of NONZERO values; 95%-CALL bug => ~95
+_DEAD_ZERO_PCT = 95.0                   # >=this %zero => component contributes ~nothing
+_IC_INVERT = -0.10                      # flow 15m IC below this => suspect a sign inversion
+
+
+def check_invariants(df) -> int:
+    """Assert the structural signal-health invariants. Returns the number of HARD violations
+    (0 = healthy). Prints warnings for dead/inverted components (not fatal)."""
+    print("\n" + "=" * 82)
+    print("SIGNAL-HEALTH CHECK (structural invariants)")
+    print("=" * 82)
+    violations = []
+    for c in _GATE_ACTIVE:
+        nz = df[c][df[c] != 0]
+        if len(nz) < 30:
+            print(f"  {c:6s} SKIP  (only {len(nz)} nonzero rows — too thin to judge)")
+            continue
+        pos = 100.0 * (nz > 0).mean()
+        ok = _BIAS_LO <= pos <= _BIAS_HI
+        print(f"  {c:6s} %pos={pos:5.1f}  band[{_BIAS_LO:.0f},{_BIAS_HI:.0f}]  "
+              f"{'OK' if ok else 'STRUCTURAL BIAS'}")
+        if not ok:
+            violations.append(f"{c} is {pos:.0f}% positive — outside "
+                              f"[{_BIAS_LO:.0f},{_BIAS_HI:.0f}] (the 95%-CALL bug class)")
+    # warnings (never fatal)
+    for c in COMPONENTS:
+        zero = 100.0 * (df[c] == 0).mean()
+        if zero >= _DEAD_ZERO_PCT:
+            print(f"  WARN  {c} is {zero:.0f}% zero — inert; its gate weight is dead.")
+    sub = df.dropna(subset=["ret15"])
+    sub = sub[sub["flow"] != 0]
+    if len(sub) >= 30:
+        ic = _spearman(sub["flow"].to_numpy(float), sub["ret15"].to_numpy(float))
+        print(f"  flow 15m IC = {ic:+.3f} (informational; skill is NOT asserted)")
+        if ic < _IC_INVERT:
+            print(f"  WARN  flow 15m IC {ic:+.3f} < {_IC_INVERT} — possible sign inversion "
+                  "(roll/vega-class bug). Investigate.")
+    print("-" * 82)
+    if violations:
+        print(f"SIGNAL DRIFT ({len(violations)}):")
+        for v in violations:
+            print(f"  {v}")
+    else:
+        print("ALL STRUCTURAL INVARIANTS HOLD — components can still point both ways.")
+    return len(violations)
+
+
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="scout signal component bias + skill audit")
+    ap.add_argument("--check", action="store_true",
+                    help="assert structural invariants; exit 1 on drift (for the weekly cron)")
+    args = ap.parse_args()
     rng = np.random.default_rng(SEED)
     days = _captured_days()
     if not days:
-        print("no days"); return
+        print("no days")
+        sys.exit(2 if args.check else 0)
     print(f"reading {LIVE_DIR} (tf={TF})")
     df = harvest(days)
     evaluate(df, 1500, rng)
+    if args.check:
+        sys.exit(1 if check_invariants(df) else 0)
 
 
 if __name__ == "__main__":
