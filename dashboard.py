@@ -4257,6 +4257,24 @@ _ALERT_TF = 60
 # Ledger-only (no poller change).
 _SCOUT_MAX_HOLD_MIN = 90
 
+# ── THE BELL ───────────────────────────────────────────────────────────────────────────
+# The arrow is an INTRADAY product. It is flat overnight, always — a long option held over
+# the night bleeds theta (which is the whole reason the BTST edge buys FUTURES instead).
+# Two consequences the engine never enforced:
+#
+# _SCOUT_EOD_T — every open leg is SQUARED OFF at the bell. The poller loop simply stopped
+#   at 15:30 and left whatever was open dangling: it was never closed in the log, the
+#   ledger went on calling it "open" for another hour (until its 90m cap passed), and the
+#   board rendered a live, ageing leg deep into the night.
+#
+# _SCOUT_NO_NEW_AFTER — and therefore a leg opened in the last 20 minutes CANNOT reach its
+#   SL or target; it is force-flat within minutes and pays the ~3% option round-trip for a
+#   sliver of noise. MEASURED over 12 captured days: legs opened 15:10-15:30 returned
+#   mean -50.8%, win 13% (n=47) versus -5.6%, win 37% for the rest of the day. Not a tuned
+#   parameter — a structural one: do not open what the bell will immediately close.
+_SCOUT_EOD_T = datetime.time(15, 30)
+_SCOUT_NO_NEW_AFTER = datetime.time(15, 10)
+
 
 def _scout_episodes(today: str, as_of=None):
     """Replay the persisted scout_alerts log into per-index EPISODES: each NEW → close
@@ -4321,6 +4339,13 @@ def _scout_episodes(today: str, as_of=None):
                 # no TIMEOUT row and are still handled by the two branches below.
                 closed.append(_timeout_close(ep))
                 ep = None
+            elif kind == "EOD" and ep:
+                # squared off at the bell (the engine's native row)
+                exit_p, entry = _v(r.get("cur")), ep.get("entry")
+                pnl = round((exit_p / entry - 1.0) * 100.0, 1) if (exit_p and entry) else None
+                closed.append({**ep, "close_t": r["ts"].strftime("%H:%M"), "outcome": "EOD",
+                               "exit": exit_p, "pnl": pnl})
+                ep = None
             elif kind in ("BAND", "FLIP", "SL", "TARGET") and ep and r["ts"] > _cap_t(ep):
                 # The poller's close fired AFTER the max-hold cap — under the 90m policy the
                 # position was already dead at cap_t, so the ledger closes it as TIMEOUT at
@@ -4364,7 +4389,12 @@ def _scout_episodes(today: str, as_of=None):
             _asof_ts = pd.Timestamp(as_of) if as_of is not None else None
             if _asof_ts is not None and _asof_ts.tzinfo is None:
                 _asof_ts = _asof_ts.tz_localize(IST)   # defensive: match read_mirror
-            if _asof_ts is not None and _asof_ts >= _cap_t(ep):
+            # THE BELL closes it too, not just the 90m cap. A leg opened 15:29 has a cap of
+            # 16:59, so the old test kept calling it OPEN for an hour and a half AFTER the
+            # market shut. Nothing is held overnight; whichever comes first, cap or bell.
+            _bell = pd.Timestamp(f"{today} 15:30", tz=IST)
+            _dead_at = min(_cap_t(ep), _bell)
+            if _asof_ts is not None and _asof_ts >= _dead_at:
                 closed.append(_timeout_close(ep))
             else:
                 opens.append(ep)
@@ -4373,6 +4403,7 @@ def _scout_episodes(today: str, as_of=None):
 
 
 _OUTCOME_BADGE = {"FLIP": ("↺ flipped · reversed out", "#f59e0b"),
+                  "EOD": ("🔔 squared off at the bell", "#94a3b8"),
                   "SL": ("🛑 SL hit", "#f87171"),
                   "TARGET": ("🎯 target", "#22c55e"),
                   "TIMEOUT": (f"⌛ timed out ({_SCOUT_MAX_HOLD_MIN}m)", "#a78bfa"),
@@ -5042,6 +5073,13 @@ def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
                 f"{_SCOUT_MAX_HOLD_MIN}m max with no SL/target/band/flip. A flat index just "
                 f"bleeds theta; the slot is now free to re-enter.")
         color = "#a78bfa"
+    elif kind == "EOD":
+        head = f"🔔 SQUARED OFF AT THE BELL · {label}"
+        body = (f"{strike or ''} {side} force-closed at ₹{cur} (entry ₹{entry}) — the cash "
+                f"session ended. The arrow is an INTRADAY product: it is flat overnight, "
+                f"always. Holding a long option overnight bleeds theta (that is exactly why "
+                f"BTST buys FUTURES instead).")
+        color = "#94a3b8"
     else:                                                 # BAND
         head = f"📊 RANGE BREAK {band_dir} · {label}"
         body = (f"index {spot} broke the {_ALERT_TF}m band [{pos.get('bl')}, {pos.get('bh')}]"
@@ -5137,7 +5175,13 @@ def _scout_detect(state, now, persist):
             # later SL/target must not re-write history (the ledger converts late closes to
             # TIMEOUT for exactly this reason -- now the log carries it natively).
             _open_age = _mem_open_age_min(pos, today, as_of=now)
-            if _open_age is not None and _open_age >= _SCOUT_MAX_HOLD_MIN:
+            if now.time() >= _SCOUT_EOD_T:
+                # THE BELL — square off. Checked before the cap so a leg that reaches 15:30
+                # is recorded as EOD (what actually happened) rather than mislabelled TIMEOUT.
+                _emit(sym, _scout_alert_rec(now, pos, "EOD",
+                                            cur=round(cur, 2) if cur is not None else None))
+                closed, outcome = True, "EOD"
+            elif _open_age is not None and _open_age >= _SCOUT_MAX_HOLD_MIN:
                 _emit(sym, _scout_alert_rec(now, pos, "TIMEOUT",
                                             cur=round(cur, 2) if cur is not None else None))
                 closed, outcome = True, "TIMEOUT"
@@ -5192,7 +5236,8 @@ def _scout_detect(state, now, persist):
         # ── open a NEW position when a trade is live, none is open, and the side is
         #    RE-ARMED (see the lock above — a stopped/timed-out/band-broken side stays
         #    shut until the gate resets, instead of re-entering on the very next tick) ──
-        if v.startswith("TRADE") and r.get("direction") != lock:
+        if (v.startswith("TRADE") and r.get("direction") != lock
+                and now.time() < _SCOUT_NO_NEW_AFTER):
             pos = {"day": today, "dir": r.get("direction"),
                    "strike": lc.get("entry_strike") or r.get("atm"),
                    "entry": lc.get("entry_prem"), "sl": lc.get("sl"), "tgt": lc.get("target"),
@@ -5239,7 +5284,7 @@ def _rehydrate_scout_state(state, today):
                     "label": _v(r.get("label")) or str(sym),
                     "thin": bool(r.get("thin")), "spot": _v(r.get("spot"))}
                 st["lock"] = st["lock_day"] = None       # a leg that re-opened was armed
-            elif kind in ("BAND", "TIMEOUT", "SL", "TARGET", "FLIP") and st.get("open"):
+            elif kind in ("BAND", "TIMEOUT", "EOD", "SL", "TARGET", "FLIP") and st.get("open"):
                 # ALL FIVE are terminal — the same close policy the poller enforces. BAND used
                 # to only set bb=True and KEEP the position, and TIMEOUT was not handled at
                 # all, so a restart RESURRECTED a position the log had already closed: the
@@ -5364,8 +5409,13 @@ def _scout_alert_poller():
             # trading-day gate: a weekend/holiday process otherwise scans the dead
             # static quote feed every 30s with persist=True — one feed glitch away
             # from writing junk alerts into the canonical log on a non-session day.
+            # Upper bound runs a couple of minutes PAST the bell on purpose: the EOD square-off
+            # lives inside _scout_detect, and with a 30s tick a gate of "<= 15:30:00" can skip
+            # straight from 15:29:58 to 15:30:28 and never call it — leaving the open leg
+            # dangling exactly as before. The extra ticks open nothing (_SCOUT_NO_NEW_AFTER)
+            # and simply flatten what is open.
             if (is_trading_day(now)
-                    and datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
+                    and datetime.time(9, 15) <= now.time() <= datetime.time(15, 32)):
                 _scout_detect(_SCOUT_ALERT_STATE, now, persist=True)
                 _SCOUT_POLLER_HEALTH.update(last_ok=now, fails=0, last_err=None)
                 fails = 0
