@@ -5005,12 +5005,25 @@ def _scout_detect(state, now, persist):
                 _emit(sym, _scout_alert_rec(now, pos, "FLIP",
                                             cur=round(cur, 2) if cur is not None else None))
                 closed, outcome = True, "FLIP"           # flipped to the other side
+            elif (spot and pos.get("bl") and pos.get("bh")
+                  and (spot > pos["bh"] or spot < pos["bl"])):
+                # ── BAND BREAK IS TERMINAL ────────────────────────────────────────────
+                # It used to only set pos["bb"]=True and KEEP HOLDING, while the ledger
+                # (and the user's rule: "any band touch = the trade is closed") treated it
+                # as a close. That split was the root of everything: the poller sat on a
+                # position the ledger had already closed, and because a held position
+                # `continue`s past the NEW block, it went DEAF. 2026-07-13: BANK broke its
+                # band at 10:29 and could not fire another signal for 6+ HOURS — its 15:15
+                # TRADE never reached the log. All four indices were blocked this way.
+                # The band is the one VALIDATED product (~77% in-band); a break means the
+                # move exceeded the forecast, so the thesis is spent. Close it.
+                pos["bb"] = True
+                _emit(sym, _scout_alert_rec(
+                    now, pos, "BAND", spot=spot,
+                    cur=round(cur, 2) if cur is not None else None,
+                    band_dir=("above" if spot > pos["bh"] else "below")))
+                closed, outcome = True, "BAND"
             if not closed:
-                if (not pos.get("bb")) and spot and pos.get("bl") and pos.get("bh") \
-                        and (spot > pos["bh"] or spot < pos["bl"]):
-                    _emit(sym, _scout_alert_rec(now, pos, "BAND", spot=spot,
-                                  band_dir=("above" if spot > pos["bh"] else "below")))
-                    pos["bb"] = True
                 st["open"] = pos
                 state[sym] = st
                 continue
