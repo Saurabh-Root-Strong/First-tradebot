@@ -5,7 +5,7 @@ Run:   .venv\Scripts\python.exe dashboard.py
 Open:  http://127.0.0.1:8050
 """
 
-import base64, json, sys, threading, time, datetime
+import base64, json, sys, threading, time, datetime, traceback
 from pathlib import Path
 from collections import deque
 
@@ -4255,15 +4255,67 @@ _OUTCOME_BADGE = {"FLIP": ("↺ flipped · reversed out", "#f59e0b"),
                   "?": ("? unresolved", "#94a3b8")}
 
 
+def _scout_log_health(today: str):
+    """Is the alert log actually being WRITTEN? The ledger replays that log, so a dead
+    poller renders a calm "0 open" while real positions sit live on the board — which
+    reads as "you have no position". That has happened (2026-07-13: market data captured
+    through 15:30, alerts stopped at 14:23).
+
+    Diagnose by comparing the alert log against a mirror the CAPTURER writes continuously
+    (chain_snapshots). If capture is fresh but alerts are stale, the poller specifically is
+    dead — not the feed, not the sync. Returns None when healthy."""
+    from core.mirror_io import read_mirror
+    try:
+        now = datetime.datetime.now(IST)
+        if not is_trading_day(now) or now.time() < datetime.time(9, 45):
+            return None                       # pre-open / non-session: nothing to claim
+        a = read_mirror("scout_alerts", today)
+        c = read_mirror("chain_snapshots", today)
+        if c is None or c.empty:
+            return None                       # no capture reference → cannot diagnose
+        cap_last = c["ts"].max()
+        # the session clock the poller SHOULD have reached by now
+        clock = min(now, datetime.datetime.combine(now.date(), datetime.time(15, 30)).replace(tzinfo=IST))
+        alert_last = a["ts"].max() if (a is not None and not a.empty) else None
+        cap_age = (clock - cap_last).total_seconds() / 60.0
+        if cap_age > 15:
+            return None                       # capture itself is behind → a different fault
+        gap = ((clock - alert_last).total_seconds() / 60.0) if alert_last is not None \
+            else (clock - datetime.datetime.combine(now.date(), datetime.time(9, 45)).replace(tzinfo=IST)).total_seconds() / 60.0
+        if gap <= 20:                         # the poller only writes on EVENTS, so a quiet
+            return None                       # stretch is normal — 20m of slack before alarm
+        return {"alert_last": alert_last.strftime("%H:%M") if alert_last is not None else "never",
+                "cap_last": cap_last.strftime("%H:%M"), "gap_min": int(gap)}
+    except Exception:
+        return None
+
+
 def _scout_openpos_body(today: str, as_of):
     """Popup body: the day's scout ledger — OPEN positions (with a live cross-check +
     unrealized P&L) on top, then CLOSED episodes (outcome + realized P&L), newest-first.
     All reconstructed from the persisted alert log (tf = _ALERT_TF)."""
     import intraday_scout as scout
     opens, closed = _scout_episodes(today, as_of=as_of)
+
+    # ── the log must not be allowed to LOOK healthy when it is not ────────────────
+    _sick = _scout_log_health(today) if as_of is None else None
+    _warn = []
+    if _sick:
+        _warn = [html.Div(
+            [html.B("🛑 ALERT LOG IS STALE — THIS LEDGER IS INCOMPLETE. "),
+             f"The poller last wrote at {_sick['alert_last']}, but market data was captured "
+             f"through {_sick['cap_last']} ({_sick['gap_min']}m gap). The capturer and the "
+             f"sync are alive — the scout-alert writer specifically has stopped. Positions "
+             f"opened after {_sick['alert_last']} are MISSING here, so an empty OPEN section "
+             f"does NOT mean you have no position. Cross-check against the board."],
+            style={"background": "#7f1d1d", "color": "#fecaca", "padding": "8px 10px",
+                   "borderRadius": "6px", "fontSize": "0.78rem", "marginBottom": "8px",
+                   "border": "1px solid #ef4444"})]
+
     if not opens and not closed:
-        return html.Div("No scout episodes yet — the alert log is empty.",
-                        style={"color": "#94a3b8", "fontSize": "0.8rem", "padding": "10px"})
+        return html.Div(_warn + [html.Div(
+            "No scout episodes yet — the alert log is empty.",
+            style={"color": "#94a3b8", "fontSize": "0.8rem", "padding": "10px"})])
 
     # ── OPEN section — live cross-check + unrealized P&L ─────────────────────────
     # Each open row needs a live premium read + a fresh verdict scan (heavy, IO-bound
@@ -4589,7 +4641,7 @@ def _scout_openpos_body(today: str, as_of):
         f"tf={_ALERT_TF}m. Decision-support only — the arrow is negative-EV; trade the "
         "range band, not the arrow.",
         style={"color": "#64748b", "fontSize": "0.58rem", "lineHeight": "1.4"})
-    return html.Div([
+    return html.Div(_warn + [
         # full unfiltered rows — the search box filters the tables FROM these
         dcc.Store(id="scout-open-store", data=open_records),
         dcc.Store(id="scout-closed-store", data=closed_records),
@@ -4987,6 +5039,11 @@ def _backfill_scout_alerts(today, upto, write_before=None, step_sec=300):
     return n, state
 
 
+# Health of the authoritative writer. A dead poller must be VISIBLE: the ledger otherwise
+# renders a calm "0 open" while live positions sit on the board unrecorded.
+_SCOUT_POLLER_HEALTH = {"last_ok": None, "fails": 0, "last_err": None, "last_err_t": None}
+
+
 def _scout_alert_poller():
     """AUTHORITATIVE scout-alert detector — a server-side background thread (started
     only by the live capturer, not in VIEWER mode). Scans all 4 indices every 30s
@@ -5033,6 +5090,7 @@ def _scout_alert_poller():
                   f"({k} open position(s)) — log already covers the open, restart-safe")
     except Exception as e:
         print(f"  Scout-alert boot recovery skipped: {e}")
+    fails = 0
     while True:
         try:
             now = datetime.datetime.now(IST)
@@ -5042,8 +5100,21 @@ def _scout_alert_poller():
             if (is_trading_day(now)
                     and datetime.time(9, 15) <= now.time() <= datetime.time(15, 30)):
                 _scout_detect(_SCOUT_ALERT_STATE, now, persist=True)
-        except Exception:
-            pass
+                _SCOUT_POLLER_HEALTH.update(last_ok=now, fails=0, last_err=None)
+                fails = 0
+        except Exception as e:
+            # NEVER swallow this silently. This thread is the SYSTEM OF RECORD: if it
+            # stops writing, the ledger silently shows "0 open" while real positions are
+            # live on the board — which reads as "you have no position". It has already
+            # happened (2026-07-13: capture ran to 15:30, alerts stopped at 14:23, and a
+            # bare `except: pass` meant nothing surfaced it).
+            fails += 1
+            _SCOUT_POLLER_HEALTH.update(fails=fails, last_err=f"{type(e).__name__}: {e}",
+                                        last_err_t=datetime.datetime.now(IST))
+            if fails in (1, 2, 5, 10) or fails % 20 == 0:
+                print(f"  ⚠ SCOUT-ALERT POLLER FAILING ({fails}x) — the alert log is NOT "
+                      f"being written: {type(e).__name__}: {e}")
+                traceback.print_exc()
         _time.sleep(30)
 
 
