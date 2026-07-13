@@ -4290,10 +4290,84 @@ def _scout_log_health(today: str):
         return None
 
 
+def _btst_section(today: str):
+    """🌙 BTST carries — a SEPARATE, walled-off section of the popup.
+
+    Deliberately NOT merged into the scout episodes, and NOT counted in the scout summary.
+    They are different animals and mixing them would corrupt both numbers:
+
+        SCOUT : index OPTIONS, 60-90m, force-closed 15:30 — NEGATIVE-EV (the summary's whole
+                job is to show the arrow LOSES; averaging a winning edge into it would hide
+                that).
+        BTST  : index FUTURES, held OVERNIGHT, exit ~09:30 — the one VALIDATED edge here
+                (+10-13bps, Sharpe 2.4-4). Its P&L is bps on futures, not option premium %;
+                the two units are not even commensurable.
+
+    Also surfaces the silent failure that prompted this: the board can show BTST-CARRY while
+    NOTHING is written to the ledger (the scheduled emit was disabled 07-07..07-13 and six
+    days of the only validated edge went unrecorded)."""
+    try:
+        import btst_signal as bs
+        led = bs._load_ledger()
+    except Exception:
+        return []
+    if led is None or led.empty:
+        return []
+    led = led.copy()
+    led["date"] = led["date"].astype(str)
+    carried = led[led["status"] == "OPEN"]                       # held overnight, not yet exited
+    closed_today = led[(led["status"] == "CLOSED") & (led["exit_date"].astype(str) == today)]
+    if carried.empty and closed_today.empty:
+        return []
+
+    def _row(r, live: bool):
+        px = r.get("exit_px")
+        bps = r.get("net_bps")
+        return html.Tr([
+            html.Td(str(r["sym"]), style={"padding": "3px 8px", "fontWeight": "700"}),
+            html.Td(str(r["date"]), style={"padding": "3px 8px", "color": "#94a3b8"}),
+            html.Td(f"{r['clr']:.2f}", style={"padding": "3px 8px"}),
+            html.Td(f"{r['entry_px']:,.1f}", style={"padding": "3px 8px"}),
+            html.Td(f"{px:,.1f}" if px == px and px else "—", style={"padding": "3px 8px"}),
+            html.Td(html.Span(f"{bps:+.1f}" if (bps == bps and bps is not None) else "—",
+                              style={"color": ("#22c55e" if (bps or 0) >= 0 else "#f87171"),
+                                     "fontWeight": "700"}), style={"padding": "3px 8px"}),
+            html.Td(html.Span("🌙 OPEN OVERNIGHT" if live else "✓ closed",
+                              style={"color": "#fbbf24" if live else "#94a3b8"}),
+                    style={"padding": "3px 8px"}),
+        ])
+
+    hdr = html.Tr([html.Th(h, style={"padding": "3px 8px", "textAlign": "left",
+                                     "color": "#94a3b8", "fontWeight": "600"})
+                   for h in ("index", "entered", "clr", "entry", "exit", "net bps", "status")])
+    rows = [_row(r, True) for _, r in carried.iterrows()] + \
+           [_row(r, False) for _, r in closed_today.iterrows()]
+    n_open = len(carried)
+    return [
+        html.Div([
+            html.Span("🌙 BTST — carried OVERNIGHT ", style={"color": "#fbbf24",
+                                                             "fontWeight": "700"}),
+            html.Span(f"· {n_open} open · index FUTURES · exit ~09:30 next session",
+                      style={"color": "#94a3b8"}),
+        ], style={"fontSize": "0.62rem", "margin": "10px 0 3px"}),
+        html.Table([html.Thead(hdr), html.Tbody(rows)],
+                   style={"width": "100%", "fontSize": "0.62rem",
+                          "borderCollapse": "collapse"}),
+        html.Div("Separate from the scout P&L above — and deliberately so. SCOUT is the "
+                 "intraday option ARROW (negative-EV; that summary exists to prove it "
+                 "loses). BTST is the index-FUTURES overnight carry — the one validated "
+                 "edge (+10–13bps). Mixing option-% into futures-bps would corrupt both. "
+                 "PAPER only; nothing auto-executes.",
+                 style={"color": "#64748b", "fontSize": "0.55rem", "lineHeight": "1.4",
+                        "marginTop": "3px"}),
+    ]
+
+
 def _scout_openpos_body(today: str, as_of):
     """Popup body: the day's scout ledger — OPEN positions (with a live cross-check +
     unrealized P&L) on top, then CLOSED episodes (outcome + realized P&L), newest-first.
-    All reconstructed from the persisted alert log (tf = _ALERT_TF)."""
+    All reconstructed from the persisted alert log (tf = _ALERT_TF). BTST carries are
+    appended in their OWN section — never merged into the scout stats (see _btst_section)."""
     import intraday_scout as scout
     opens, closed = _scout_episodes(today, as_of=as_of)
 
@@ -4312,10 +4386,13 @@ def _scout_openpos_body(today: str, as_of):
                    "borderRadius": "6px", "fontSize": "0.78rem", "marginBottom": "8px",
                    "border": "1px solid #ef4444"})]
 
+    _btst = _btst_section(today) if as_of is None else []
     if not opens and not closed:
+        # BTST can exist with ZERO scout episodes — never hide the carries behind an
+        # "alert log is empty" message.
         return html.Div(_warn + [html.Div(
             "No scout episodes yet — the alert log is empty.",
-            style={"color": "#94a3b8", "fontSize": "0.8rem", "padding": "10px"})])
+            style={"color": "#94a3b8", "fontSize": "0.8rem", "padding": "10px"})] + _btst)
 
     # ── OPEN section — live cross-check + unrealized P&L ─────────────────────────
     # Each open row needs a live premium read + a fresh verdict scan (heavy, IO-bound
@@ -4651,7 +4728,7 @@ def _scout_openpos_body(today: str, as_of):
         open_tbl,
         html.Div("○ CLOSED", style={"color": "#94a3b8", "fontSize": "0.6rem",
                  "fontWeight": "700", "margin": "8px 0 3px"}),
-        closed_tbl, note])
+        closed_tbl, note] + _btst)
 
 
 def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=False):
