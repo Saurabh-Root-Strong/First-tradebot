@@ -3242,77 +3242,139 @@ def _btst_body():
     trk_c = {"above expectation": "#22c55e", "tracking": "#22c55e"}.get(s["tracking"], "#f59e0b")
     if s["n"]:
         tot = s["total_rupees"]
-        bits.append(html.Div([
-            html.Span(f"{s['n']} nights closed  ·  {s['wins']}/{s['n']} win "
-                      f"({s['win_pct']:.0f}%)", style={"color": "#e2e8f0", "fontWeight": "700"}),
-            html.Span(f"   mean {s['mean_bps']:+.1f} bps",
-                      style={"color": trk_c, "fontWeight": "800"}),
-            html.Span(f"  ·  Σ ₹{tot:+,} (1 lot)" if tot is not None else "",
-                      style={"color": "#22c55e" if (tot or 0) >= 0 else "#f87171",
-                             "fontWeight": "800"}),
-            html.Span(f"  ·  worst {s['worst_bps']:+.0f} bps", style={"color": "#94a3b8"}),
-        ], style={"fontSize": "0.72rem", "marginBottom": "3px"}))
-        bits.append(html.Div(
-            f"backtest expects +{bp.BACKTEST_LO:.0f}–{bp.BACKTEST_HI:.0f} bps/night → "
-            f"{s['tracking'].upper()}  ·  {s['gate_left']} more nights to the "
-            f"{bp.REVIEW_GATE}-night review gate (paper only — nothing auto-executes)",
-            style={"color": trk_c, "fontSize": "0.6rem", "marginBottom": "8px"}))
+        def _tile(label, value, color, sub=""):
+            """One stat tile: big number, quiet label. The old summary was a single dense
+            run-on line — the eye had nowhere to land and the key figure hid in the middle."""
+            return html.Div([
+                html.Div(value, style={"color": color, "fontSize": "1.02rem",
+                                       "fontWeight": "800", "lineHeight": "1.15"}),
+                html.Div(label, style={"color": "#64748b", "fontSize": "0.54rem",
+                                       "textTransform": "uppercase",
+                                       "letterSpacing": "0.06em", "marginTop": "2px"}),
+                html.Div(sub, style={"color": "#475569", "fontSize": "0.52rem"}) if sub else "",
+            ], style={"background": "#0f172a", "border": "1px solid #1e293b",
+                      "borderRadius": "6px", "padding": "7px 11px", "minWidth": "88px"})
 
+        bits.append(html.Div([
+            _tile("nights", f"{s['n']}", "#e2e8f0", f"{s['gate_left']} to gate"),
+            _tile("win rate", f"{s['win_pct']:.0f}%", "#e2e8f0", f"{s['wins']}/{s['n']}"),
+            _tile("mean / night", f"{s['mean_bps']:+.1f} bps", trk_c,
+                  f"expect +{bp.BACKTEST_LO:.0f}–{bp.BACKTEST_HI:.0f}"),
+            _tile("total (1 lot)", f"₹{tot:+,}" if tot is not None else "—",
+                  "#22c55e" if (tot or 0) >= 0 else "#f87171"),
+            _tile("worst night", f"{s['worst_bps']:+.0f} bps", "#f87171"),
+        ], style={"display": "flex", "gap": "8px", "flexWrap": "wrap",
+                  "marginBottom": "8px"}))
+
+        bits.append(html.Div(
+            f"{'✓' if trk_c == '#22c55e' else '⚠'} {s['tracking'].upper()} vs the "
+            f"+{bp.BACKTEST_LO:.0f}–{bp.BACKTEST_HI:.0f} bps backtest  ·  paper only, nothing "
+            f"auto-executes  ·  real capital only after the {bp.REVIEW_GATE}-night gate",
+            style={"color": trk_c, "fontSize": "0.62rem", "fontWeight": "700",
+                   "marginBottom": "9px"}))
+
+        # per-index, worst first — where MIDCAP's drag becomes impossible to miss
         rows = bp.per_index(closed_rows)
         bits.append(html.Div([
-            html.Span(f"{d['index']} {d['mean_bps']:+.1f}bps ₹{d['rupee']:+,} ({d['n']}n)   ",
-                      style={"color": "#22c55e" if d["mean_bps"] >= 0 else "#f87171",
-                             "fontWeight": "700", "marginRight": "6px"}) for d in rows
-        ], style={"fontSize": "0.62rem", "marginBottom": "10px"}))
+            html.Div("BY INDEX (worst first)", style={
+                "color": "#64748b", "fontSize": "0.54rem", "textTransform": "uppercase",
+                "letterSpacing": "0.06em", "marginBottom": "3px"}),
+            html.Div([
+                html.Span([
+                    html.Span(f"{d['index']}  ", style={"color": "#94a3b8"}),
+                    html.Span(f"{d['mean_bps']:+.1f}bps ", style={"fontWeight": "800"}),
+                    html.Span(f"₹{d['rupee']:+,} ", style={"fontWeight": "700"}),
+                    html.Span(f"({d['n']}n · {d['win_pct']:.0f}%)",
+                              style={"color": "#64748b", "fontSize": "0.55rem"}),
+                ], style={"color": "#22c55e" if d["mean_bps"] >= 0 else "#f87171",
+                          "fontSize": "0.63rem", "background": "#0f172a",
+                          "border": "1px solid #1e293b", "borderRadius": "5px",
+                          "padding": "3px 8px", "marginRight": "6px",
+                          "display": "inline-block", "marginBottom": "4px"})
+                for d in rows]),
+        ], style={"marginBottom": "8px"}))
     else:
         bits.append(html.Div("No closed BTST nights yet.",
                              style={"color": "#94a3b8", "fontSize": "0.75rem"}))
 
-    def _tbl(title, color, rows, cols):
+    def _tbl(title, color, rows, cols, cond=None, header_tips=None, tid=None):
+        """Sortable, colour-coded DataTable — the same affordances the scout ledger has.
+        `cols` is [(id, Name, format_or_None)]; a numeric format makes the column sort by
+        VALUE, so clicking "Net bps" ranks -39.6 below +18.4 instead of sorting as text."""
         if not rows:
             return html.Div()
-        head = html.Tr([html.Th(c[1], style={"padding": "3px 8px", "color": "#64748b",
-                                             "fontSize": "0.58rem", "textAlign": "left",
-                                             "textTransform": "uppercase"}) for c in cols])
-        body = [html.Tr([html.Td(c[2](r), style={**MONO, "padding": "3px 8px",
-                                                 "fontSize": "0.68rem"}) for c in cols])
-                for r in rows]
+        from dash import dash_table
         return html.Div([
-            html.Div(title, style={"color": color, "fontSize": "0.6rem",
-                                   "fontWeight": "700", "margin": "6px 0 3px"}),
-            html.Table([html.Thead(head), html.Tbody(body)],
-                       style={"width": "100%", "borderCollapse": "collapse"}),
+            html.Div(title, style={"color": color, "fontSize": "0.62rem",
+                                   "fontWeight": "800", "margin": "8px 0 3px"}),
+            dash_table.DataTable(
+                id=tid, data=rows,
+                columns=[({"name": n, "id": i, "type": "numeric", "format": f}
+                          if f is not None else {"name": n, "id": i}) for i, n, f in cols],
+                sort_action="native", sort_mode="single", page_action="none",
+                style_as_list_view=True,
+                style_table={"marginBottom": "4px", "overflowX": "auto"},
+                style_header={"backgroundColor": "#1e293b", "color": "#e2e8f0",
+                              "fontSize": "0.6rem", "textTransform": "uppercase",
+                              "border": "none", "fontWeight": "700", "cursor": "pointer"},
+                style_cell={"backgroundColor": "#0f172a", "color": "#e2e8f0",
+                            "fontSize": "0.7rem", "border": "none",
+                            "padding": "4px 9px", "textAlign": "left"},
+                style_data_conditional=cond or [],
+                tooltip_header=header_tips or {},
+                tooltip_delay=150, tooltip_duration=None,
+                css=[{"selector": ".dash-table-tooltip",
+                      "rule": "background-color:#0f172a; color:#e2e8f0; "
+                              "border:1px solid #334155; font-size:0.68rem; "
+                              "max-width:280px; padding:6px 8px;"}],
+            ),
         ])
 
-    def _rs(v):
-        c = "#22c55e" if (v or 0) >= 0 else "#f87171"
-        return html.Span(f"₹{v:+,}" if v is not None else "—",
-                         style={"color": c, "fontWeight": "700"})
+    from dash.dash_table.Format import Format, Group, Scheme, Sign, Symbol
+    _f_fut = Format(precision=2, scheme=Scheme.fixed).group(Group.yes).symbol(
+        Symbol.yes).symbol_prefix("₹")
+    _f_rs = (Format(precision=0, scheme=Scheme.fixed).group(Group.yes)
+             .sign(Sign.positive).symbol(Symbol.yes).symbol_prefix("₹"))
+    _f_bps = Format(precision=1, scheme=Scheme.fixed).sign(Sign.positive)
+    _f_clr = Format(precision=3, scheme=Scheme.fixed)
 
-    def _bps(v):
-        c = "#22c55e" if (v or 0) >= 0 else "#f87171"
-        return html.Span(f"{v:+.1f}" if v is not None else "—",
-                         style={"color": c, "fontWeight": "700"})
+    def _sign_cond(col):
+        """Green when the number made money, red when it lost — the fastest read there is."""
+        return [{"if": {"filter_query": f"{{{col}}} < 0", "column_id": col},
+                 "color": "#f87171", "fontWeight": "700"},
+                {"if": {"filter_query": f"{{{col}}} >= 0", "column_id": col},
+                 "color": "#22c55e", "fontWeight": "700"}]
 
-    bits.append(_tbl("● OPEN OVERNIGHT — held through the night", "#34d399", open_rows, [
-        ("index", "Index", lambda r: r["index"]),
-        ("triggered", "Triggered", lambda r: html.Span(r["triggered"],
-                                                       style={"color": "#34d399"})),
-        ("exits", "Exits at", lambda r: html.Span(r["exits"], style={"color": "#fbbf24"})),
-        ("clr", "clr", lambda r: f"{r['clr']:.3f}" if r["clr"] else "—"),
-        ("entry", "Entry (fut)", lambda r: f"₹{r['entry']:,.2f}" if r["entry"] else "—"),
-        ("lot", "Lot", lambda r: str(r["lot"] or "—")),
-    ]))
-    bits.append(_tbl("○ CLOSED NIGHTS", "#94a3b8", closed_rows, [
-        ("index", "Index", lambda r: r["index"]),
-        ("triggered", "Triggered", lambda r: r["triggered"]),
-        ("exited", "Exited", lambda r: r["exited"]),
-        ("clr", "clr", lambda r: f"{r['clr']:.3f}" if r["clr"] else "—"),
-        ("entry", "Entry", lambda r: f"₹{r['entry']:,.2f}" if r["entry"] else "—"),
-        ("exit", "Exit", lambda r: f"₹{r['exit']:,.2f}" if r["exit"] else "—"),
-        ("net_bps", "Net bps", lambda r: _bps(r["net_bps"])),
-        ("rupee", "₹/lot (net)", lambda r: _rs(r["rupee"])),
-    ]))
+    bits.append(_tbl(
+        f"● OPEN OVERNIGHT — {len(open_rows)} position(s) held through the night",
+        "#34d399", open_rows,
+        [("index", "Index", None), ("triggered", "Triggered", None),
+         ("exits", "Exits at", None), ("clr", "clr", _f_clr),
+         ("entry", "Entry (fut)", _f_fut), ("lot", "Lot", None)],
+        cond=[{"if": {"column_id": "exits"}, "color": "#fbbf24", "fontWeight": "700"},
+              {"if": {"column_id": "triggered"}, "color": "#34d399"},
+              {"if": {"filter_query": "{clr} >= 0.85", "column_id": "clr"},
+               "color": "#22c55e", "fontWeight": "800"}],
+        header_tips={
+            "clr": "Close position in the day's range = (close−low)/(high−low). ≥0.66 fires "
+                   "the signal; ≥0.85 is a very strong close.",
+            "exits": "Exit is 09:30 the NEXT TRADING DAY (weekend / holiday aware).",
+            "lot": "Contracts per lot — MIDCAP's 120 makes the same move hurt ~2× NIFTY's 65.",
+        }, tid="btst-open-table"))
+
+    bits.append(_tbl(
+        "○ CLOSED NIGHTS", "#94a3b8", closed_rows,
+        [("index", "Index", None), ("triggered", "Triggered", None),
+         ("exited", "Exited", None), ("clr", "clr", _f_clr),
+         ("entry", "Entry", _f_fut), ("exit", "Exit", _f_fut),
+         ("net_bps", "Net bps", _f_bps), ("rupee", "₹/lot (net)", _f_rs)],
+        cond=_sign_cond("net_bps") + _sign_cond("rupee"),
+        header_tips={
+            "net_bps": "Overnight return in basis points, NET of the 3 bps round-trip. The "
+                       "backtest expects +10–13 bps/night — that is the bar.",
+            "rupee": "What ONE futures lot actually made/lost = entry × bps/1e4 × lot size.",
+            "clr": "Close-strength that fired the signal (≥ 0.66).",
+        }, tid="btst-closed-table"))
     bits.append(html.Div(
         "Rule LOCKED (no tuning): a close in the top third of the day's range (clr ≥ 0.66) → "
         "LONG index FUTURES at the close, exit next 09:30. Long-only — a weak close is NOT a "
