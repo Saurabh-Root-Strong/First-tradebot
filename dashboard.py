@@ -1214,6 +1214,9 @@ app.layout = dbc.Container([
                     "minWidth": "16px", "textAlign": "center", "display": "none"})),
         ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px",
                   "alignItems": "center", "marginTop": "10px"}),
+        # STALE-DATA banner (viewer only) — empty/zero-height until the mirror goes stale,
+        # then a full-width red bar. A tiny header badge was missed in the wild.
+        html.Div(id="mirror-banner", style={"marginTop": "8px"}),
         # Live news / event-impact ticker — always visible across all panels.
         # The date nav (◀ ▶) drives the news-date Store, which is the MASTER date for
         # the whole viewer: news panel, index cards (seed) AND the Charts section.
@@ -5422,18 +5425,28 @@ def update_sidebar(_):
     # (sync 60s + mirror-export lag → a healthy viewer can trail ~2min; 240s avoids false
     # alarms, catches a real death within 4min), surface it RED so a silent gap is impossible
     # to miss. Outside the session / on a past day it stays hidden (no clutter after close).
+    # On a VIEWER the label must NOT say "CAPTURE" -- the VM is usually capturing perfectly and
+    # it is the LOCAL SYNC that died. Blaming capture sends you to fix the wrong machine (it did,
+    # 2026-07-13). _viewer_mirror_health() tells the two apart; the full-width banner carries the
+    # detail, this badge is just the always-visible marker.
     stale = ""
     try:
-        from core.market_calendar import is_trading_day
-        _nowdt = datetime.datetime.now(tz=IST)
-        if (is_trading_day(_nowdt.date())
-                and datetime.time(9, 15) <= _nowdt.time() <= datetime.time(15, 31)):
-            _fts = [float((t or {}).get("exch_feed_time") or 0) for t in latest.values()]
-            _newest = max(_fts) if _fts else 0.0
-            _age = (_nowdt.timestamp() - _newest) if _newest else 1e9
-            if _age > 240:
-                stale = html.Span(f"  ⚠ CAPTURE STALE {int(_age)}s",
-                                  style={"color": "#ef4444", "fontWeight": "700"})
+        _h = _viewer_mirror_health()
+        if _h and _h[0] != "OK":
+            _txt = ("  ⛔ SYNC DEAD — SCREEN STALE" if _h[0] == "SYNC_DEAD"
+                    else "  ⛔ VM CAPTURE DOWN — SCREEN STALE")
+            stale = html.Span(_txt, style={"color": "#ef4444", "fontWeight": "800"})
+        elif _h is None:                      # CAPTURER: keep the original in-memory feed check
+            from core.market_calendar import is_trading_day
+            _nowdt = datetime.datetime.now(tz=IST)
+            if (is_trading_day(_nowdt.date())
+                    and datetime.time(9, 15) <= _nowdt.time() <= datetime.time(15, 31)):
+                _fts = [float((t or {}).get("exch_feed_time") or 0) for t in latest.values()]
+                _newest = max(_fts) if _fts else 0.0
+                _age = (_nowdt.timestamp() - _newest) if _newest else 1e9
+                if _age > 240:
+                    stale = html.Span(f"  ⚠ CAPTURE STALE {int(_age)}s",
+                                      style={"color": "#ef4444", "fontWeight": "700"})
     except Exception:
         stale = ""
     status = html.Span([html.Span("● ", style={"color": dot_c}),
@@ -7209,6 +7222,78 @@ def _viewer_seed_latest(date=None) -> None:
                 }
         except Exception:
             continue
+
+
+# A viewer showing a stale mirror is the WORST failure mode in this system: the screen looks
+# alive and is quietly lying. 2026-07-13: the laptop slept an hour, the dashboard restarted but
+# the sync watcher did NOT, and the viewer served 11:19 data at 12:27 with no usable warning.
+# The old "⚠ CAPTURE STALE" badge fired, but it is (a) a tiny header span and (b) MISLEADING —
+# it blames CAPTURE when the VM was perfectly healthy and the LOCAL SYNC was the dead thing.
+# Those two failures need OPPOSITE fixes, so we diagnose them apart:
+#   SYNC_DEAD — the mirror FILE is not being rewritten (sync_from_vm is not running) -> restart
+#               the sync HERE. The VM is probably fine.
+#   VM_DEAD   — the file IS being rewritten every ~60s but its NEWEST TICK is old -> the VM
+#               stopped producing. Fix the VM (token/capture), not the laptop.
+_MIRROR_STALE_SEC = 240      # >4 missed 60s sync cycles = the data on screen is not live
+_SYNC_DEAD_SEC = 180         # the mirror file should be republished every ~60s
+
+
+def _viewer_mirror_health():
+    """(state, msg) for the viewer's mirror freshness, or None when the check does not apply
+    (capturer, non-trading day, outside market hours — a quiet feed is CORRECT then, and a
+    monitor that cries wolf gets ignored). Cheap: reuses the exch_feed_time the seed loop
+    already maintains, plus one os.stat — no parquet re-parse."""
+    if not _ROLE_VIEWER:
+        return None
+    now = datetime.datetime.now(IST)
+    try:
+        from core.market_calendar import is_trading_day
+        if not (is_trading_day(now.date())
+                and datetime.time(9, 15) <= now.time() <= datetime.time(15, 31)):
+            return None
+        from core.constants import LIVE_DIR
+        f = LIVE_DIR / f"{now.date().isoformat()}_ticks.parquet"
+        if not f.exists():
+            return ("SYNC_DEAD", "No mirror for today — nothing has been synced from the VM yet.")
+        file_age = now.timestamp() - f.stat().st_mtime
+        with _lock:
+            fts = [float((t or {}).get("exch_feed_time") or 0) for t in _latest.values()]
+        newest = max(fts) if fts else 0.0
+        content_age = (now.timestamp() - newest) if newest else 1e9
+        if content_age <= _MIRROR_STALE_SEC:
+            return ("OK", "")
+        mins = content_age / 60.0
+        if file_age > _SYNC_DEAD_SEC:
+            return ("SYNC_DEAD",
+                    f"Your screen is {mins:.0f} MIN STALE. The local sync is NOT running — the "
+                    f"mirror file has not been updated in {file_age/60:.0f} min. The VM is likely "
+                    f"capturing fine; it is THIS laptop that stopped fetching. "
+                    f"FIX: run dev.bat (or: python sync_from_vm.py --watch 60).")
+        return ("VM_DEAD",
+                f"Your screen is {mins:.0f} MIN STALE. The sync IS running (mirror rewritten "
+                f"{file_age:.0f}s ago) but the VM has stopped producing ticks — capture is down "
+                f"UPSTREAM. FIX: python check_vm_capture.py --fix")
+    except Exception:
+        return None
+
+
+@app.callback(Output("mirror-banner", "children"), Input("fast-tick", "n_intervals"))
+def _mirror_banner(_):
+    """Full-width RED banner when the viewer's data is stale. Empty (zero height) when healthy,
+    so it costs nothing visually until it matters."""
+    h = _viewer_mirror_health()
+    if not h or h[0] == "OK":
+        return ""
+    state, msg = h
+    return html.Div([
+        html.Span("⛔ STALE DATA — DO NOT TRADE OFF THIS SCREEN  ",
+                  style={"fontWeight": "900", "letterSpacing": "0.04em"}),
+        html.Span(msg, style={"fontWeight": "600"}),
+    ], style={
+        "background": "#7f1d1d", "color": "#fee2e2", "padding": "8px 14px",
+        "borderRadius": "6px", "marginBottom": "8px", "fontSize": "0.72rem",
+        "border": "1px solid #ef4444", "animation": "red-pulse 1.6s ease-out infinite",
+    })
 
 
 def _viewer_seed_loop() -> None:
