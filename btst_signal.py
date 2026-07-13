@@ -68,6 +68,16 @@ def _bar_from_mirror(sym, date):
         m = tk[(tk["ts"].dt.time >= _dt.time(9, 15)) & (tk["ts"].dt.time <= _dt.time(15, 30))]
         if len(m) < 30:
             return None
+        # ── THE SESSION MUST ACTUALLY BE OVER ────────────────────────────────────────
+        # clr and entry_px are defined ON THE CLOSE. If capture DIED mid-session (an expired
+        # token, a dropped WS — both happened this month) the mirror still holds a plausible
+        # half-day of ticks, and without this guard the 15:28 emit computes clr from that
+        # partial range and logs a signal whose "close" is an 11am price. That is a PHANTOM
+        # trade in the ledger of the one edge that gates real capital. A truncated session is
+        # NOT a weak signal, it is NO signal — refuse it rather than emit a wrong one.
+        last = m.iloc[-1]["ts"].time()
+        if last < _dt.time(15, 10):        # start of the validated 15:10-15:30 entry window
+            return None
         ltp = m["ltp"].to_numpy(float)
         hi, lo, close = float(ltp.max()), float(ltp.min()), float(m.iloc[-1]["ltp"])
         return {"clr": (close - lo) / (hi - lo) if hi > lo else 0.5, "close": close}
@@ -107,9 +117,14 @@ def _exit_px(sym, next_date):
         b = pd.read_parquet(MIN5.format(FY[sym]))
         b["ts"] = pd.to_datetime(b["ts"])
         g = b[b["ts"].dt.date == next_date]
-        if not g.empty:
-            aft = g[g["ts"].dt.time >= EXIT_T]
-            return float((aft.iloc[0] if len(aft) else g.iloc[0])["close"])
+        aft = g[g["ts"].dt.time >= EXIT_T] if not g.empty else g
+        if len(aft):
+            return float(aft.iloc[0]["close"])
+        # NO bar at/after 09:30 yet -> do NOT fall back to g.iloc[0] (the 09:15 OPEN). The
+        # rule's exit IS 09:30; filling at the open books a price the strategy never traded.
+        # Fall through to the mirror, and if that has nothing either, return None: reconcile
+        # is idempotent and simply fills on the next run. A missing fill is visible (the
+        # STALE-OPEN guard shouts); a WRONG fill is invisible and corrupts the paper record.
     except Exception:
         pass
     return _exit_px_from_mirror(sym, next_date)
@@ -125,8 +140,12 @@ def _exit_px_from_mirror(sym, next_date):
             return None
         tk = tk[tk["ts"].dt.date == next_date]   # drop prior-evening bleed (mirror spans midnight)
         aft = tk[tk["ts"].dt.time >= EXIT_T]
-        src = aft if len(aft) else tk
-        return float(src.iloc[0]["ltp"]) if len(src) else None
+        # STRICTLY at/after 09:30. The old `src = aft if len(aft) else tk` filled at the FIRST
+        # TICK OF THE DAY when the 09:30 print was missing -- and the morning cron fires at
+        # 09:35, so a late-starting capture or a lagging sync silently booked the exit at the
+        # 09:15 open instead of 09:30. Wrong exits are worse than missing ones: they are
+        # invisible, and they poison the only validated edge's paper record.
+        return float(aft.iloc[0]["ltp"]) if len(aft) else None
     except Exception:
         return None
 
@@ -164,19 +183,6 @@ def emit(date):
     return cands
 
 
-def _next_trading_day(d: dt.date) -> dt.date | None:
-    """Next NSE trading day after d (calendar-driven, capped at today). Independent of the
-    historical archive — which lags live capture, the bug that stalled reconcile."""
-    from core.market_calendar import is_trading_day
-    nxt = d + dt.timedelta(days=1)
-    today = dt.date.today()
-    while nxt <= today:
-        if is_trading_day(nxt):
-            return nxt
-        nxt += dt.timedelta(days=1)
-    return None
-
-
 def reconcile():
     led = _load_ledger()
     if led.empty:
@@ -185,14 +191,15 @@ def reconcile():
     for i, r in led[led["status"] == "OPEN"].iterrows():
         d = r["date"] if isinstance(r["date"], dt.date) else pd.to_datetime(r["date"]).date()
         nd = _next_trading_day(d)
-        if nd is None:
-            continue                       # exit day hasn't happened yet
-        nxt = [nd]
-        xp = _exit_px(r["sym"], nxt[0])
+        if nd > dt.date.today():
+            continue                       # exit day hasn't happened yet — leave it OPEN
+        # No 09:30 print yet (exit day still early, or capture/sync lagging) -> leave OPEN and
+        # fill on the next run. _exit_px NEVER substitutes an earlier price for the 09:30 one.
+        xp = _exit_px(r["sym"], nd)
         if xp is None:
             continue
         gross = (xp / r["entry_px"] - 1.0) * 1e4
-        led.at[i, "exit_date"] = nxt[0]; led.at[i, "exit_px"] = xp
+        led.at[i, "exit_date"] = nd; led.at[i, "exit_px"] = xp
         led.at[i, "gross_bps"] = round(gross, 1)
         led.at[i, "net_bps"] = round(gross - COST_BPS, 1)
         led.at[i, "status"] = "CLOSED"
