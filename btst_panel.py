@@ -47,6 +47,33 @@ def _lot(sym_short: str):
     return LOT_SIZES.get(_SYM.get(sym_short, ""), None)
 
 
+def futures_contract(date) -> str:
+    """The contract you actually BUY: the near-month index FUTURES (all four indices share the
+    same last-Tuesday monthly expiry). BTST is NOT an option — there is no strike and no CE/PE.
+    That is precisely why it works: a futures contract has NO THETA, so it can be held
+    overnight without decaying. An option would bleed against you."""
+    try:
+        import btst_signal as bs
+        from core.market_calendar import index_future_expiries
+        e = index_future_expiries(bs._as_date(date), 1)[0]
+        return f"{e:%d%b} FUT"
+    except Exception:
+        return "near-month FUT"
+
+
+def notional(entry_px, sym_short) -> "int | None":
+    """Contract value of ONE lot = index level × lot size. This is the EXPOSURE you carry
+    overnight (margin is only ~10–12% of it) — the number that decides whether a gap-down
+    hurts or ruins."""
+    lot = _lot(sym_short)
+    if not (lot and entry_px):
+        return None
+    try:
+        return round(float(entry_px) * lot)
+    except (TypeError, ValueError):
+        return None
+
+
 def net_rupees(entry_px, net_bps, sym_short) -> "int | None":
     """Net Rs on ONE futures lot = entry x (net_bps/1e4) x lot. net_bps already carries the
     3bps round-trip cost, so this is the account-true number, not a gross point move."""
@@ -75,9 +102,14 @@ def load():
         return {"index": _LABEL.get(r.sym, r.sym), "sym": r.sym,
                 "clr": round(float(r.clr), 3) if r.clr is not None else None,
                 "signal_date": str(d),
+                # what you actually place: BUY <n> lots of the near-month FUTURES. No strike,
+                # no CE/PE — the old panel showed neither the contract nor the exposure.
+                "action": "BUY (long)",
+                "contract": f"{r.sym} {futures_contract(d)}",
                 "triggered": f"{d} {ENTRY_T}",
                 "exits": f"{bs._next_trading_day(d)} {xt}",
                 "entry": round(float(r.entry_px), 2) if r.entry_px else None,
+                "notional": notional(r.entry_px, r.sym),
                 "lot": _lot(r.sym), "stale": is_stale}
 
     def _closed_row(r):

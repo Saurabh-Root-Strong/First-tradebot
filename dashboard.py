@@ -3345,21 +3345,48 @@ def _btst_body():
                 {"if": {"filter_query": f"{{{col}}} >= 0", "column_id": col},
                  "color": "#22c55e", "fontWeight": "700"}]
 
+    # WHAT THE INSTRUMENT IS — the panel never said, and it is the #1 confusion: people look
+    # for a strike and a CE/PE because the scout ledger has them. BTST has NEITHER.
+    if open_rows:
+        bits.append(html.Div([
+            html.Span("📐 INSTRUMENT: index FUTURES — ", style={"fontWeight": "800"}),
+            html.Span("NOT an option. There is no strike and no CE/PE. You BUY the near-month "
+                      "futures contract itself — which is exactly why this works overnight: "
+                      "futures have NO THETA, so nothing decays while you hold. An option "
+                      "would bleed against you every hour."),
+        ], style={"background": "#0c1f17", "border": "1px solid #22c55e44",
+                  "borderRadius": "6px", "padding": "6px 10px", "marginTop": "6px",
+                  "color": "#a7f3d0", "fontSize": "0.63rem", "lineHeight": "1.45"}))
+
     bits.append(_tbl(
         f"● OPEN OVERNIGHT — {len(open_rows)} position(s) held through the night",
         "#34d399", open_rows,
-        [("index", "Index", None), ("triggered", "Triggered", None),
-         ("exits", "Exits at", None), ("clr", "clr", _f_clr),
-         ("entry", "Entry (fut)", _f_fut), ("lot", "Lot", None)],
+        [("contract", "Buy this contract", None), ("action", "Action", None),
+         ("lot", "Qty (1 lot)", None), ("entry", "Index @ close", _f_fut),
+         ("notional", "Exposure (1 lot)", _f_rs), ("clr", "clr", _f_clr),
+         ("exits", "Exit at", None)],
         cond=[{"if": {"column_id": "exits"}, "color": "#fbbf24", "fontWeight": "700"},
-              {"if": {"column_id": "triggered"}, "color": "#34d399"},
+              {"if": {"column_id": "contract"}, "color": "#e2e8f0", "fontWeight": "700"},
+              {"if": {"column_id": "action"}, "color": "#22c55e", "fontWeight": "800"},
+              {"if": {"column_id": "notional"}, "color": "#94a3b8"},
               {"if": {"filter_query": "{clr} >= 0.85", "column_id": "clr"},
                "color": "#22c55e", "fontWeight": "800"}],
         header_tips={
+            "contract": "The actual instrument: the NEAR-MONTH index futures (all four indices "
+                        "share the same last-Tuesday monthly expiry). No strike. No CE/PE.",
+            "action": "Long-only. A WEAK close is never a short — the short leg fights the "
+                      "overnight drift and adds tail risk.",
+            "lot": "One lot = this many units. MIDCAP's 120 vs NIFTY's 65 means the SAME index "
+                   "move costs you ~2× more on MIDCAP.",
+            "entry": "The INDEX level at the close — the signal's reference price (clr is "
+                     "computed from it). You execute the FUTURES, which trades at a small "
+                     "basis to this; the overnight bps move tracks the index closely.",
+            "notional": "Contract value you carry overnight = index × lot. Margin is only "
+                        "~10–12% of this, but a gap moves the FULL exposure — this is the "
+                        "number that decides whether a gap-down hurts or ruins.",
             "clr": "Close position in the day's range = (close−low)/(high−low). ≥0.66 fires "
                    "the signal; ≥0.85 is a very strong close.",
             "exits": "Exit is 09:30 the NEXT TRADING DAY (weekend / holiday aware).",
-            "lot": "Contracts per lot — MIDCAP's 120 makes the same move hurt ~2× NIFTY's 65.",
         }, tid="btst-open-table"))
 
     bits.append(_tbl(
@@ -3374,11 +3401,17 @@ def _btst_body():
                        "backtest expects +10–13 bps/night — that is the bar.",
             "rupee": "What ONE futures lot actually made/lost = entry × bps/1e4 × lot size.",
             "clr": "Close-strength that fired the signal (≥ 0.66).",
+            "entry": "INDEX level at the close you entered on (the signal's reference). The "
+                     "trade is on the near-month FUTURES — no strike, no CE/PE.",
+            "exit": "INDEX level at the 09:30 exit next trading day.",
         }, tid="btst-closed-table"))
     bits.append(html.Div(
         "Rule LOCKED (no tuning): a close in the top third of the day's range (clr ≥ 0.66) → "
         "LONG index FUTURES at the close, exit next 09:30. Long-only — a weak close is NOT a "
-        "short. ₹ is on ONE lot, net of 3 bps round-trip. TIMES are FIXED BY THE RULE, not "
+        "short. NO STRIKE / NO CE-PE: this is a futures contract, not an option (that is why "
+        "it survives overnight — no theta). Prices shown are the INDEX level (the signal's "
+        "reference); you execute the near-month future, which trades at a small basis to it. "
+        "₹ is on ONE lot, net of 3 bps round-trip. TIMES are FIXED BY THE RULE, not "
         "recorded per-trade: entry is the day's close (the emit job runs ~15:28 and prices the "
         "true ≤15:30 close); exit is 09:30 the next trading day. PAPER: nothing auto-executes; "
         "real capital only after the review gate AND a gap-tail plan (worst backtest night "
