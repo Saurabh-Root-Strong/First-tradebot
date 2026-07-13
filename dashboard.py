@@ -4189,6 +4189,14 @@ def _scout_episodes(today: str, as_of=None):
                       "open_ts": r["ts"],
                       "sl": _v(r.get("sl")), "tgt": _v(r.get("tgt")),
                       "bb": False, "band_dir": None}
+            elif kind == "TIMEOUT" and ep:
+                # NATIVE timeout row — the POLLER now enforces the cap at the source and logs
+                # it. Close at the cap instant (not the poll minute, which trails it by up to
+                # one 30s tick) so a native TIMEOUT and the ledger's own reinterpretation of a
+                # legacy log produce the SAME close_t/exit. Older logs (pre-poller-cap) carry
+                # no TIMEOUT row and are still handled by the two branches below.
+                closed.append(_timeout_close(ep))
+                ep = None
             elif kind in ("BAND", "FLIP", "SL", "TARGET") and ep and r["ts"] > _cap_t(ep):
                 # The poller's close fired AFTER the max-hold cap — under the 90m policy the
                 # position was already dead at cap_t, so the ledger closes it as TIMEOUT at
@@ -4762,6 +4770,12 @@ def _scout_alert_rec(now, pos, kind, cur=None, spot=None, band_dir=None):
         body = (f"{strike or ''} {side} exited ₹{cur} (entry ₹{entry}) — arrow flipped to "
                 f"{newdir}; ⚠ whipsaw, NOT a new position on top (decision-support only)")
         color = "#f59e0b"
+    elif kind == "TIMEOUT":
+        head = f"⌛ TIMED OUT ({_SCOUT_MAX_HOLD_MIN}m) · {label}"
+        body = (f"{strike or ''} {side} force-closed at ₹{cur} (entry ₹{entry}) — held the "
+                f"{_SCOUT_MAX_HOLD_MIN}m max with no SL/target/band/flip. A flat index just "
+                f"bleeds theta; the slot is now free to re-enter.")
+        color = "#a78bfa"
     else:                                                 # BAND
         head = f"📊 RANGE BREAK {band_dir} · {label}"
         body = (f"index {spot} broke the {_ALERT_TF}m band [{pos.get('bl')}, {pos.get('bh')}]"
@@ -4833,7 +4847,23 @@ def _scout_detect(state, now, persist):
         if pos:
             cur = scout._opt_premium(sym, today, now, pos.get("strike"), pos["dir"])
             closed = outcome = None
-            if cur is not None and pos.get("sl") and cur <= pos["sl"]:
+            # ── MAX-HOLD TIMEOUT — the POLICY, enforced HERE at the source ─────────────
+            # Without this the poller holds a no-trigger position FOREVER (it only closed on
+            # SL/target/flip). Two consequences, one of them serious:
+            #   1. dead positions sat on the board for hours (cosmetic), and
+            #   2. the `continue` below SKIPS the "open a NEW position" block -- so a stuck
+            #      position BLOCKED EVERY NEW SIGNAL for that index. 2026-07-13: MIDCAP
+            #      opened 10:02 and never triggered, so it could not fire a NEW alert for 5
+            #      HOURS. That is lost signal, not just clutter.
+            # Checked FIRST: past the cap the position was already closed by policy, so a
+            # later SL/target must not re-write history (the ledger converts late closes to
+            # TIMEOUT for exactly this reason -- now the log carries it natively).
+            _open_age = _mem_open_age_min(pos, today)
+            if _open_age is not None and _open_age >= _SCOUT_MAX_HOLD_MIN:
+                _emit(sym, _scout_alert_rec(now, pos, "TIMEOUT",
+                                            cur=round(cur, 2) if cur is not None else None))
+                closed, outcome = True, "TIMEOUT"
+            elif cur is not None and pos.get("sl") and cur <= pos["sl"]:
                 _emit(sym, _scout_alert_rec(now, pos, "SL", cur=round(cur, 2)))
                 closed, outcome = True, "SL"
             elif cur is not None and pos.get("tgt") and cur >= pos["tgt"]:
