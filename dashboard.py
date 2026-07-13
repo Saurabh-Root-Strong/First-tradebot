@@ -3614,12 +3614,19 @@ def _recon_note(msg):
 # ── SCOUT panel: multi-index TRADE/NO-TRADE scan ─────────────────────────────────
 # Hover-tooltip copy (native `title`) so the panel explains itself.
 
-def _mem_open_age_min(op, today):
-    """Minutes an open poller position has been held (from its 'trig' HH:MM). None if unknown."""
+def _mem_open_age_min(op, today, as_of=None):
+    """Minutes an open poller position has been held (from its 'trig' HH:MM). None if unknown.
+
+    `as_of` is REQUIRED by any caller that is not on the wall clock. _scout_detect runs both
+    live (as_of=now) AND over a historical grid in _backfill_scout_alerts, where measuring
+    against datetime.now() makes every reconstructed position read as hours old -> the 90m cap
+    fires instantly on the morning replay, TIMEOUTs the whole day and (with the re-arm lock)
+    bolts every side shut. Same wall-clock-vs-as-of trap as the replay bug in 1911c85."""
     try:
         h, m = str(op.get("trig") or "").split(":")
         opened = datetime.datetime(*map(int, today.split("-")), int(h), int(m), tzinfo=IST)
-        return max(0.0, (datetime.datetime.now(IST) - opened).total_seconds() / 60.0)
+        ref = as_of or datetime.datetime.now(IST)
+        return max(0.0, (ref - opened).total_seconds() / 60.0)
     except Exception:
         return None
 
@@ -4836,7 +4843,11 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
     anchors = None
     if live:
         try:
-            _op0, _ = _scout_episodes(today)
+            # MUST pass as_of (live => now): with as_of=None the dangling-tail branch in
+            # _scout_episodes can never fire, so a position PAST the 90m cap is still
+            # reported open here and keeps anchoring the live board to a leg the ledger has
+            # already timed out — the same badge-vs-popup divergence, one layer down.
+            _op0, _ = _scout_episodes(today, as_of=datetime.datetime.now(IST))
             anchors = {}
             for e in _op0:
                 try:
@@ -5067,6 +5078,18 @@ def _scout_detect(state, now, persist):
         pos = st.get("open")
         if pos and pos.get("day") != today:              # stale position from a prior day
             pos = None
+        # ── RE-ARM GATE ────────────────────────────────────────────────────────────
+        # A policy close (TIMEOUT/SL/TARGET/BAND) sets a LOCK on that side. Without it the
+        # close below frees the slot and the NEW block re-opens the SAME side on the SAME
+        # tick (the verdict is still TRADE — that is WHY it was open), which silently
+        # DEFEATS both policies: the 90m cap merely restarts its clock, and a "terminal"
+        # band break is undone instantly. The arrow would churn a fresh round-trip cost
+        # every 90m forever. The lock clears only when the gate genuinely RESETS — the
+        # verdict leaves TRADE, or it flips to the other side. A FLIP does NOT lock: the
+        # direction really changed, and its NEW is the intended other leg.
+        lock = st.get("lock") if st.get("lock_day") == today else None
+        if lock and not (v.startswith("TRADE") and r.get("direction") == lock):
+            lock = None                                  # gate reset → re-armed
         # ── manage an OPEN position (gate-independent, survives NO-TRADE blinks) ────
         if pos:
             cur = scout._opt_premium(sym, today, now, pos.get("strike"), pos["dir"])
@@ -5082,7 +5105,7 @@ def _scout_detect(state, now, persist):
             # Checked FIRST: past the cap the position was already closed by policy, so a
             # later SL/target must not re-write history (the ledger converts late closes to
             # TIMEOUT for exactly this reason -- now the log carries it natively).
-            _open_age = _mem_open_age_min(pos, today)
+            _open_age = _mem_open_age_min(pos, today, as_of=now)
             if _open_age is not None and _open_age >= _SCOUT_MAX_HOLD_MIN:
                 _emit(sym, _scout_alert_rec(now, pos, "TIMEOUT",
                                             cur=round(cur, 2) if cur is not None else None))
@@ -5120,8 +5143,11 @@ def _scout_detect(state, now, persist):
                 closed, outcome = True, "BAND"
             if not closed:
                 st["open"] = pos
+                st["lock"], st["lock_day"] = lock, today
                 state[sym] = st
                 continue
+            if outcome != "FLIP":
+                lock = pos["dir"]        # policy close → no same-side re-entry until reset
             # position closed → record the RESOLVED episode so the charts board can
             # still show what happened (instead of the trade silently vanishing), then
             # free the slot to re-open.
@@ -5132,8 +5158,10 @@ def _scout_detect(state, now, persist):
                           "outcome": outcome, "cur": round(cur, 2) if cur is not None else None,
                           "closed_t": now.strftime("%H:%M"), "label": pos["label"]}
             st["open"] = None
-        # ── open a NEW position when a trade is live and none is open ───────────────
-        if v.startswith("TRADE"):
+        # ── open a NEW position when a trade is live, none is open, and the side is
+        #    RE-ARMED (see the lock above — a stopped/timed-out/band-broken side stays
+        #    shut until the gate resets, instead of re-entering on the very next tick) ──
+        if v.startswith("TRADE") and r.get("direction") != lock:
             pos = {"day": today, "dir": r.get("direction"),
                    "strike": lc.get("entry_strike") or r.get("atm"),
                    "entry": lc.get("entry_prem"), "sl": lc.get("sl"), "tgt": lc.get("target"),
@@ -5143,6 +5171,8 @@ def _scout_detect(state, now, persist):
                    "label": r["label"], "thin": bool(r.get("thin")), "spot": spot}
             _emit(sym, _scout_alert_rec(now, pos, "NEW"))
             st["open"] = pos
+            lock = None                                  # a fresh leg is armed by definition
+        st["lock"], st["lock_day"] = lock, today
         state[sym] = st
     return events
 
@@ -5177,11 +5207,32 @@ def _rehydrate_scout_state(state, today):
                     "trig": r["ts"].strftime("%H:%M"),
                     "label": _v(r.get("label")) or str(sym),
                     "thin": bool(r.get("thin")), "spot": _v(r.get("spot"))}
-            elif kind == "BAND" and st.get("open"):
-                st["open"]["bb"] = True                   # band already broken → don't re-fire
-            elif kind in ("SL", "TARGET", "FLIP") and st.get("open"):
+                st["lock"] = st["lock_day"] = None       # a leg that re-opened was armed
+            elif kind in ("BAND", "TIMEOUT", "SL", "TARGET", "FLIP") and st.get("open"):
+                # ALL FIVE are terminal — the same close policy the poller enforces. BAND used
+                # to only set bb=True and KEEP the position, and TIMEOUT was not handled at
+                # all, so a restart RESURRECTED a position the log had already closed: the
+                # poller then sat on a dead leg and (because a held position skips the NEW
+                # block) that index went DEAF for the rest of the day. A container restart is
+                # routine — deploy_vm.bat does one — so this path had to match the engine.
+                side = _v(r.get("side")) or st["open"].get("dir")
                 st["open"] = None                        # episode closed → free the slot
-        if st.get("open"):
+                if kind != "FLIP":                       # re-entry lock survives the restart
+                    st["lock"], st["lock_day"] = side, today
+        # MAX-HOLD, applied HERE too. A LEGACY log (written before the poller enforced the
+        # cap) carries no TIMEOUT row, so the loop above leaves the position open while the
+        # ledger — which converts a dangling tail at cap_t — already closed it. A restart
+        # would then resurrect a leg the ledger calls dead and go deaf on that index. The cap
+        # is the policy: engine, ledger and rehydrator must all apply it or they disagree.
+        op = st.get("open")
+        if op:
+            age = _mem_open_age_min(op, today)       # live: rehydrate only runs at startup
+            if age is not None and age >= _SCOUT_MAX_HOLD_MIN:
+                st["open"] = None
+                st["lock"], st["lock_day"] = op.get("dir"), today
+        if st.get("open") or st.get("lock"):
+            # keep the row even with NO open position: it may carry only the LOCK, and
+            # dropping it would re-arm a stopped-out side for free across a restart.
             state[str(sym)] = st
     return sum(1 for v in state.values() if v.get("open"))
 
