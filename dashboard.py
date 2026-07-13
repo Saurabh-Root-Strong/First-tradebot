@@ -3980,7 +3980,20 @@ def _scout_dte(sym, today):
     return _mc.days_to_expiry(day, weekly=(sym == _NIFTY))
 
 
-def _scout_row(r, mem=None, today=None, live=True, practice=False):
+def _session_over(live: bool) -> bool:
+    """Is the cash session finished? The arrow is an INTRADAY product — it is flat overnight,
+    always. Without this the board kept rendering a live TRADE leg with a running age long
+    after 15:30 (BANK read 'leg since 15:15 ... held 435m' at 22:26), which looks exactly like
+    a held position and contradicts the ledger's '0 open'. LIVE-only: replay/ghost drive their
+    own clock and must not be judged against wall-time."""
+    if not live:
+        return False
+    now = datetime.datetime.now(IST)
+    from core.market_calendar import is_trading_day
+    return is_trading_day(now.date()) and now.time() > datetime.time(15, 30)
+
+
+def _scout_row(r, mem=None, today=None, live=True, practice=False, session_over=False):
     """One index row in the scout strip. `mem` = this index's persistent trade memory
     (scout-seen, live-only) so a held trade survives a NO-TRADE blink and a resolved
     trade shows its outcome instead of vanishing."""
@@ -4089,10 +4102,19 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
         # flipped to CLOSE, corrupting ghost practice. In replay the engine's own manage call
         # (computed AT as_of) is already correct — leave it alone.
         _lage = _leg_age_min(lc.get("trigger"), today) if (live and today) else None
-        if _lage is not None and _lage >= _SCOUT_MAX_HOLD_MIN and not mng.startswith("BOOK"):
+        if session_over:
+            # THE SESSION IS OVER. The scan's lifecycle is a rolling per-bar leg with no
+            # end-of-day concept, so after 15:30 it happily keeps a TRADE leg "running" and
+            # ages it into the night. The arrow is INTRADAY-ONLY — it is flat overnight, by
+            # construction (an option held overnight bleeds theta; that is why BTST uses
+            # futures instead). Say so, rather than showing what looks like an open position.
+            mng = "SESSION CLOSED 15:30 · arrow is intraday-only — flat overnight"
+        elif _lage is not None and _lage >= _SCOUT_MAX_HOLD_MIN and not mng.startswith("BOOK"):
             mng = f"CLOSE · max-hold {_SCOUT_MAX_HOLD_MIN}m (held {_lage:.0f}m)"
-        is_close = mng.startswith("CLOSE") or mng.startswith("BOOK")
-        mclr = "#ef4444" if mng.startswith("CLOSE") else "#22c55e" if mng.startswith("BOOK") else "#34d399"
+        is_close = mng.startswith("CLOSE") or mng.startswith("BOOK") or session_over
+        mclr = ("#94a3b8" if session_over else                      # settled, not a live call
+                "#ef4444" if mng.startswith("CLOSE") else
+                "#22c55e" if mng.startswith("BOOK") else "#34d399")
         pnl = lc.get("pnl_pct")
         pnlclr = "#22c55e" if (pnl or 0) > 0 else "#ef4444" if (pnl or 0) < 0 else "#94a3b8"
         idx_seg = (f"@ index {lc.get('entry_spot')}→{lc.get('cur_spot')}  "
@@ -4877,6 +4899,7 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
             f"👻 GHOST {date} @ {as_of_dt:%H:%M} — session over, graded" if
             (practice and as_of_dt) else
             f"replay @ {as_of_dt:%H:%M}" if as_of_dt else f"{date} full day")
+    _over = _session_over(live)
     n_trade = sum(1 for r in rows if r.get("has_data") and r["verdict"].startswith("TRADE"))
     hits = sum(1 for r in rows if r.get("verify") and r["verify"]["dir_hit"])
     graded = sum(1 for r in rows if r.get("verify"))
@@ -4913,8 +4936,16 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
             if practice else None), style={
             "color": "#34d399", "fontWeight": "700", "fontSize": "0.7rem",
             "letterSpacing": "0.05em", **({"cursor": "help"} if practice else {})}),
-        html.Span(f"{n_trade} trade{'s' if n_trade != 1 else ''} on the board",
-                  style={"color": "#94a3b8", "fontSize": "0.62rem"}),
+        # "N trades on the board" counted VERDICTS, while the ledger badge beside it counts
+        # POSITIONS — two different questions rendered as one answer, so the strip could read
+        # "1 trade on the board" next to "0 open" and look self-contradictory. Say which is
+        # which, and after 15:30 say the session is done instead of implying something is live.
+        html.Span("session closed 15:30 · flat overnight" if _over else
+                  f"{n_trade} index verdict{'s' if n_trade != 1 else ''} = TRADE",
+                  title="how many indices the scanner currently rates TRADE. This is NOT a "
+                        "position count — the 📋 ledger beside it is the authority on what is "
+                        "actually open.",
+                  style={"color": "#94a3b8", "fontSize": "0.62rem", "cursor": "help"}),
         sb, openbtn,
     ], style={"marginBottom": "5px"})
     note = html.Div([
@@ -4931,7 +4962,7 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
               "borderRadius": "4px", "padding": "5px 8px"})
     return html.Div(
         [title] + [_scout_row(r, mem=(seen or {}).get(r.get("sym")), today=today,
-                              live=live, practice=practice)
+                              live=live, practice=practice, session_over=_over)
                    for r in rows] + [note]
         + ([_ghost_help()] if practice else []),
         style={"background": "#070d18", "border": "1px solid #1e293b",
