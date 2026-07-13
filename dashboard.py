@@ -3519,6 +3519,26 @@ def _recon_note(msg):
 # ── SCOUT panel: multi-index TRADE/NO-TRADE scan ─────────────────────────────────
 # Hover-tooltip copy (native `title`) so the panel explains itself.
 
+def _mem_open_age_min(op, today):
+    """Minutes an open poller position has been held (from its 'trig' HH:MM). None if unknown."""
+    try:
+        h, m = str(op.get("trig") or "").split(":")
+        opened = datetime.datetime(*map(int, today.split("-")), int(h), int(m), tzinfo=IST)
+        return max(0.0, (datetime.datetime.now(IST) - opened).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
+def _leg_age_min(trig, today):
+    """Minutes since the live scan's current TRADE leg began ('HH:MM'). None if unknown."""
+    try:
+        h, m = str(trig or "").split(":")
+        started = datetime.datetime(*map(int, today.split("-")), int(h), int(m), tzinfo=IST)
+        return max(0.0, (datetime.datetime.now(IST) - started).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
 def _scout_mem_block(mem, today):
     """Persistent trade memory for one index, drawn from the live alert brain
     (scout-seen). Two cases the stateless per-bar scan can't show on its own:
@@ -3532,7 +3552,22 @@ def _scout_mem_block(mem, today):
     op = mem.get("open")
     if op and op.get("day") == today:
         side = op.get("dir"); strike = op.get("strike")
-        seg = (f"📌 HOLDING {strike or ''} {side} since {op.get('trig','?')}"
+        # The POLLER holds a position indefinitely (it only closes on SL/target/band/flip), so
+        # without this it kept showing "📌 HOLDING since 10:33" FOUR HOURS into a 90-minute
+        # rule — the board contradicting the ledger, which had already timed it out. The 90m
+        # cap is the POLICY; every surface must honour it. Display-side: the raw poller stream
+        # is untouched (the ledger reinterprets it the same way).
+        _age = _mem_open_age_min(op, today)
+        if _age is not None and _age >= _SCOUT_MAX_HOLD_MIN:
+            seg = (f"⌛ TIMED OUT ({_SCOUT_MAX_HOLD_MIN}m) — {strike or ''} {side} opened "
+                   f"{op.get('trig','?')}, held {_age:.0f}m with no SL/target/band/flip. "
+                   f"Position is CLOSED per the max-hold rule (the poller still tracks it).")
+            return html.Div(seg, style={**MONO, "fontSize": "0.6rem", "color": "#a78bfa",
+                            "fontWeight": "700", "lineHeight": "1.4",
+                            "background": "#171526", "borderRadius": "3px",
+                            "padding": "2px 6px", "marginLeft": "120px", "marginTop": "2px"})
+        _held = f"  ·  held {_age:.0f}m/{_SCOUT_MAX_HOLD_MIN}m" if _age is not None else ""
+        seg = (f"📌 HOLDING {strike or ''} {side} since {op.get('trig','?')}{_held}"
                f"  ·  SL ₹{op.get('sl')}  T ₹{op.get('tgt')}"
                f"  ·  gate flickering NO-TRADE on the forming bar — position still live")
         if op.get("bb"):
@@ -3941,6 +3976,13 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
     trade_blk = None
     if lc:
         mng = lc.get("manage", "HOLD")
+        # MAX-HOLD OVERRIDE — the scan's lifecycle has no time cap, so a leg running since
+        # 10:02 still read "HOLD" at 14:55 (~5h) under a 90-MINUTE rule, while the ledger had
+        # already timed it out. A stale HOLD on a dead position is the most dangerous thing
+        # this board can say. The cap is the policy: past it, the call is CLOSE.
+        _lage = _leg_age_min(lc.get("trigger"), today) if today else None
+        if _lage is not None and _lage >= _SCOUT_MAX_HOLD_MIN and not mng.startswith("BOOK"):
+            mng = f"CLOSE · max-hold {_SCOUT_MAX_HOLD_MIN}m (held {_lage:.0f}m)"
         is_close = mng.startswith("CLOSE") or mng.startswith("BOOK")
         mclr = "#ef4444" if mng.startswith("CLOSE") else "#22c55e" if mng.startswith("BOOK") else "#34d399"
         pnl = lc.get("pnl_pct")
@@ -4598,7 +4640,10 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
           if graded else
           html.Span(_pend, style={"color": "#475569", "fontSize": "0.58rem"}))
     if live:
-        _op, _cl = _scout_episodes(today)
+        # MUST pass as_of — without it the 90m TIMEOUT never fires and the badge disagrees
+        # with the popup it opens (badge said "1 open · 6 closed", popup said "0 open · 7").
+        # One source of truth for "what is open": _scout_episodes(today, as_of).
+        _op, _cl = _scout_episodes(today, as_of=datetime.datetime.now(IST))
         n_open, n_closed = len(_op), len(_cl)
     else:
         n_open = n_closed = 0
