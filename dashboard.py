@@ -3980,7 +3980,13 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False):
         # 10:02 still read "HOLD" at 14:55 (~5h) under a 90-MINUTE rule, while the ledger had
         # already timed it out. A stale HOLD on a dead position is the most dangerous thing
         # this board can say. The cap is the policy: past it, the call is CLOSE.
-        _lage = _leg_age_min(lc.get("trigger"), today) if today else None
+        #
+        # LIVE-ONLY. `today` here is the WALL-CLOCK date (see _charts_scout_panel), so on a
+        # replay/ghost day the age would be measured against real `now` instead of the replay
+        # clock: a leg 30m old at as_of 11:00 read as 259m and every replayed leg falsely
+        # flipped to CLOSE, corrupting ghost practice. In replay the engine's own manage call
+        # (computed AT as_of) is already correct — leave it alone.
+        _lage = _leg_age_min(lc.get("trigger"), today) if (live and today) else None
         if _lage is not None and _lage >= _SCOUT_MAX_HOLD_MIN and not mng.startswith("BOOK"):
             mng = f"CLOSE · max-hold {_SCOUT_MAX_HOLD_MIN}m (held {_lage:.0f}m)"
         is_close = mng.startswith("CLOSE") or mng.startswith("BOOK")
