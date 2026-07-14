@@ -4398,6 +4398,12 @@ def _scout_episodes(today: str, as_of=None):
                 closed.append(_timeout_close(ep))
             else:
                 opens.append(ep)
+    # NEWEST FIRST, both tables. The episodes are built by grouping on SYMBOL, so without this
+    # the open legs came out in symbol order (FIN 10:14, MIDCAP 10:05, NIFTY 10:33) — an order
+    # that means nothing to a reader. The freshest position is the one you are still deciding
+    # about, so it belongs at the top. `closed` was already newest-first by close time; `opens`
+    # now matches, keyed on when the leg was OPENED.
+    opens.sort(key=lambda e: e.get("open_t") or "", reverse=True)
     closed.sort(key=lambda e: e.get("close_t") or "", reverse=True)
     return opens, closed
 
