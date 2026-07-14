@@ -3641,6 +3641,38 @@ def _leg_age_min(trig, today):
         return None
 
 
+def _ledger_mem(today, as_of):
+    """Per-symbol trade memory built from the AUTHORITATIVE poller log (the same episodes the
+    ledger popup and the open/closed badge read), shaped like the browser's `seen` state.
+
+    WHY THIS EXISTS. The strip used to render its HOLDING line from `seen` -- the browser's
+    OWN copy of the detector (persist=False). That is a SECOND ENGINE, and it drifts: on
+    2026-07-14 the board said NIFTY "HOLDING 24100 PE since 12:13 ... held 81m/90m" while the
+    poller log -- the thing the ledger, the badge and the P&L all read -- said the leg opened
+    12:09 and was 86m old. Same position, two truths, and the one on screen was the wrong one.
+
+    The drift is not cosmetic: the 90m CAP is measured off this timestamp. A 4-minute error
+    means a 4-minute window in which the board shows HOLDING for a leg the ledger has already
+    TIMED OUT -- exactly the badge-vs-popup contradiction, one layer down. One source of truth
+    for "what is held": the poller's log."""
+    op, cl = _scout_episodes(today, as_of=as_of)
+    mem: dict = {}
+    for e in op:
+        mem.setdefault(e["sym"], {})["open"] = {
+            "day": today, "trig": e.get("open_t"), "dir": e.get("dir"),
+            "strike": e.get("strike"), "entry": e.get("entry"),
+            "sl": e.get("sl"), "tgt": e.get("tgt"), "bb": bool(e.get("bb"))}
+    for e in cl:                       # cl is newest-first -> first hit per sym is the latest
+        m = mem.setdefault(e["sym"], {})
+        if "open" in m or "last" in m:
+            continue
+        m["last"] = {"day": today, "dir": e.get("dir"), "strike": e.get("strike"),
+                     "entry": e.get("entry"), "cur": e.get("exit"),
+                     "outcome": e.get("outcome"), "closed_t": e.get("close_t"),
+                     "trig": e.get("open_t"), "band_broke": bool(e.get("bb"))}
+    return mem
+
+
 def _scout_mem_block(mem, today):
     """Persistent trade memory for one index, drawn from the live alert brain
     (scout-seen). Two cases the stateless per-bar scan can't show on its own:
@@ -4027,7 +4059,13 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False, session_over=
     if inst and r.get("sym"):
         _dte = _scout_dte(r["sym"], today)
         if _dte == 0:
-            _is_nifty = r["sym"] == NIFTY
+            # NIFTY was referenced BARE here and is not imported at module scope (the only
+            # import is local, inside _scout_dte). This branch runs ONLY on 0-DTE, i.e. NIFTY's
+            # weekly expiry -- every TUESDAY -- so the whole scout panel raised NameError and
+            # died the moment NIFTY carried a TRADE verdict on an expiry day. Latent since
+            # 5fcfeab, and it fired today (Tue 2026-07-14).
+            from core.constants import NIFTY as _NIFTY_SYM
+            _is_nifty = r["sym"] == _NIFTY_SYM
             _txt = ("⚠ EXPIRY DAY · theta cliff" +
                     (" (NIFTY-Tue: arrow ≈ −45% hist)" if _is_nifty
                      else " (arrow ≈ −26% hist)"))
@@ -4937,6 +4975,7 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
             (practice and as_of_dt) else
             f"replay @ {as_of_dt:%H:%M}" if as_of_dt else f"{date} full day")
     _over = _session_over(live)
+    _lmem = _ledger_mem(today, datetime.datetime.now(IST)) if live else {}
     n_trade = sum(1 for r in rows if r.get("has_data") and r["verdict"].startswith("TRADE"))
     hits = sum(1 for r in rows if r.get("verify") and r["verify"]["dir_hit"])
     graded = sum(1 for r in rows if r.get("verify"))
@@ -4998,8 +5037,12 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
               "background": "#1a0c0c", "border": "1px solid #7f1d1d",
               "borderRadius": "4px", "padding": "5px 8px"})
     return html.Div(
-        [title] + [_scout_row(r, mem=(seen or {}).get(r.get("sym")), today=today,
-                              live=live, practice=practice, session_over=_over)
+        # LIVE rows take their trade memory from the POLLER LOG (one source of truth with the
+        # badge + ledger popup), not from the browser's private detector copy, which drifts by
+        # minutes and was driving the 90m cap countdown off the wrong clock. Replay/ghost have
+        # no poller log for their day, so they keep the per-bar engine's own memory.
+        [title] + [_scout_row(r, mem=(_lmem if live else (seen or {})).get(r.get("sym")),
+                              today=today, live=live, practice=practice, session_over=_over)
                    for r in rows] + [note]
         + ([_ghost_help()] if practice else []),
         style={"background": "#070d18", "border": "1px solid #1e293b",
