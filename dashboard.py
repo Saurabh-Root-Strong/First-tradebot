@@ -1205,6 +1205,7 @@ app.layout = dbc.Container([
             html.Div(style={"flex": "1 1 auto"}),     # spacer pushes actions to the right
             _header_action_chip("nav-charts", "📈", "CHARTS", "#a78bfa"),
             _header_action_chip("nav-liveoi", "📡", "LIVE OI", "#40c4ff"),
+            _header_action_chip("nav-tradeboard", "🎯", "TRADEBOARD", "#f472b6"),
             _header_action_chip("btst-btn", "🌙", "BTST", "#22c55e"),
             _header_action_chip(
                 "nav-alerts", "🔔", "ALERTS", "#fbbf24",
@@ -1635,6 +1636,96 @@ app.layout = dbc.Container([
                 # per strike, anchored to the DCM EOD baseline. CONTEXT, not a call
                 # — the directional edge is unproven (backtest_reconciliation null).
                 html.Div(id="charts-recon", style={"marginTop": "8px"}),
+            ]),
+            # 🎯 TRADEBOARD — a proper routed PAGE (not a modal). Shows when sel-sym=='TRADEBOARD'
+            # (toggle_view). Per index: 2x2 multi-TF candle grid (5/15/30/60m) + band overlay +
+            # structure + full option chain. DATA for your own PA; no machine trade (fade edge
+            # was a fill artifact). Index tabs switch symbol.
+            html.Div(id="tradeboard-panel", style={"display": "none"}, children=[
+                # live refresh — matched to the ~25-30s capture cadence (the VM writes a tick/
+                # chain snapshot ~every 25s; the board's DECISIONS only change on 15m closes,
+                # but spot/premium/tape are live fields and should track the feed). Callbacks
+                # gate on sel-sym so the interval costs nothing on other pages.
+                dcc.Interval(id="tb-refresh", interval=30_000),
+                html.Div("🎯 TRADEBOARD — multi-TF price action · structure · option chain",
+                         style={"color": "#f472b6", "fontWeight": "800", "fontSize": "0.9rem",
+                                "letterSpacing": "0.08em", "marginBottom": "6px"}),
+                # ── SCOUT — cross-index price-action scan, best setup first (default 15m→1h) ──
+                html.Div([
+                    html.Span("🔭 SCOUT — scan all indices · lower(entry) × higher(confirm)",
+                              style={"color": "#22d3ee", "fontSize": "0.62rem", "fontWeight": "800",
+                                     "letterSpacing": "0.1em"}),
+                    dbc.Select(id="tb-scout-combo", value="15-60", style={"width": "170px",
+                               "fontSize": "0.72rem", "marginLeft": "12px"}, options=[
+                        {"label": "5m → 15m", "value": "5-15"},
+                        {"label": "10m → 30m", "value": "10-30"},
+                        {"label": "15m → 1h", "value": "15-60"}]),
+                    html.Div(id="tb-ledger-badge", style={"marginLeft": "auto",
+                             "fontSize": "0.62rem"}),
+                    html.Div("📋 SCOUT LEDGER", id="tb-ledger-btn", n_clicks=0, style={
+                        "cursor": "pointer", "marginLeft": "12px", "color": "#22d3ee",
+                        "fontSize": "0.62rem", "fontWeight": "800", "border": "1px solid #22d3ee55",
+                        "borderRadius": "6px", "padding": "4px 10px", "whiteSpace": "nowrap"}),
+                ], style={"display": "flex", "alignItems": "center", "margin": "4px 0"}),
+                dcc.Loading(html.Div(id="tb-scout"), type="circle", color="#22d3ee"),
+                dbc.Modal([
+                    dbc.ModalHeader(dbc.ModalTitle(
+                        "📋 Scout day ledger — open + closed (PA level-trades)"),
+                        close_button=True),
+                    dbc.ModalBody(dcc.Loading(html.Div(id="tb-ledger"), type="circle",
+                                              color="#22d3ee")),
+                ], id="tb-ledger-modal", is_open=False, size="xl", scrollable=True),
+                dbc.Tabs([dbc.Tab(label=LABELS.get(s, s), tab_id=s) for s in INDEX_SYMBOLS],
+                         id="tb-idx-tabs", active_tab=INDEX_SYMBOLS[0]),
+                html.Div(id="tb-intro"),
+                dcc.Loading(type="circle", color="#f472b6", children=[
+                    # 1D — the TOP of the stack, the ONE validated edge (overnight)
+                    html.Div("DAILY · OVERNIGHT — the validated directional edge",
+                             style={"color": "#22c55e", "fontSize": "0.6rem", "fontWeight": "800",
+                                    "letterSpacing": "0.12em", "margin": "6px 0 2px"}),
+                    dbc.Row([
+                        dbc.Col(dcc.Graph(id="tb-fig-1d", config={"displayModeBar": False}),
+                                xs=12, md=7),
+                        dbc.Col(html.Div(id="tb-daily"), xs=12, md=5),
+                    ], className="g-2"),
+                    # ── MTF COMBO FOCUS — pick a master combo, see LTF entry + HTF confirm ──
+                    html.Div([
+                        html.Span("MTF COMBO FOCUS — lower(entry) × higher(confirm)",
+                                  style={"color": "#a78bfa", "fontSize": "0.6rem",
+                                         "fontWeight": "800", "letterSpacing": "0.12em"}),
+                        dbc.Select(id="tb-combo", value="5-15", style={"width": "180px",
+                                   "fontSize": "0.72rem", "marginLeft": "12px"}, options=[
+                            {"label": "5m → 15m", "value": "5-15"},
+                            {"label": "10m → 30m", "value": "10-30"},
+                            {"label": "15m → 60m", "value": "15-60"}]),
+                    ], style={"display": "flex", "alignItems": "center", "margin": "12px 0 4px"}),
+                    html.Div(id="tb-combo-read"),
+                    dbc.Row([
+                        dbc.Col(dcc.Graph(id="tb-combo-ltf",
+                                config={"displayModeBar": False, "scrollZoom": True}), xs=12, md=6),
+                        dbc.Col(dcc.Graph(id="tb-combo-htf",
+                                config={"displayModeBar": False, "scrollZoom": True}), xs=12, md=6),
+                    ], className="g-2"),
+                    html.Div("INTRADAY — all timeframes (CONTEXT for your PA) "
+                             "· scroll-wheel zooms · drag pans back through history",
+                             style={"color": "#64748b", "fontSize": "0.6rem", "fontWeight": "800",
+                                    "letterSpacing": "0.12em", "margin": "10px 0 2px"}),
+                    dbc.Row([
+                        dbc.Col(dcc.Graph(id="tb-fig-5",
+                                config={"displayModeBar": False, "scrollZoom": True}), xs=12, md=4),
+                        dbc.Col(dcc.Graph(id="tb-fig-10",
+                                config={"displayModeBar": False, "scrollZoom": True}), xs=12, md=4),
+                        dbc.Col(dcc.Graph(id="tb-fig-15",
+                                config={"displayModeBar": False, "scrollZoom": True}), xs=12, md=4),
+                    ], className="g-2"),
+                    dbc.Row([
+                        dbc.Col(dcc.Graph(id="tb-fig-30",
+                                config={"displayModeBar": False, "scrollZoom": True}), xs=12, md=6),
+                        dbc.Col(dcc.Graph(id="tb-fig-60",
+                                config={"displayModeBar": False, "scrollZoom": True}), xs=12, md=6),
+                    ], className="g-2"),
+                    html.Div(id="tb-chain"),
+                ]),
             ]),
         ], md=9, lg=9, style={"padding": "12px 16px"}),
     ], className="gx-0"),
@@ -3047,7 +3138,7 @@ _URL_SHORT = {"NSE:NIFTY50-INDEX": "nifty50", "NSE:NIFTYBANK-INDEX": "banknifty"
               "NSE:FINNIFTY-INDEX": "finnifty", "NSE:MIDCPNIFTY-INDEX": "midcpnifty"}
 _SHORT_TO_SYM = {v: k for k, v in _URL_SHORT.items()}
 _PATH_TO_SEL = {"/live-oi": "LIVEOI", "/charts": "CHARTS",
-                "/alerts": "ALERTS", "/trades": "TRADES"}
+                "/alerts": "ALERTS", "/trades": "TRADES", "/tradeboard": "TRADEBOARD"}
 _SEL_TO_PATH = {v: k for k, v in _PATH_TO_SEL.items()}
 
 
@@ -3057,6 +3148,7 @@ _SEL_TO_PATH = {v: k for k, v in _PATH_TO_SEL.items()}
     Input("nav-liveoi",    "n_clicks"),
     Input("nav-charts",    "n_clicks"),
     Input("nav-alerts",    "n_clicks"),
+    Input("nav-tradeboard", "n_clicks"),
     State("url", "pathname"),
     prevent_initial_call=True,
 )
@@ -3066,7 +3158,7 @@ def on_nav_click(*args):
     there is NO sel-sym→url edge and thus no circular dependency."""
     from dash import callback_context as ctx
     from dash.exceptions import PreventUpdate
-    *_, _liveoi_clicks, _charts_clicks, _alerts_clicks, cur = args
+    *_, _liveoi_clicks, _charts_clicks, _alerts_clicks, _tb_clicks, cur = args
     if not ctx.triggered:
         raise PreventUpdate
     tid = ctx.triggered[0]["prop_id"].split(".")[0]
@@ -3079,6 +3171,8 @@ def on_nav_click(*args):
         return toggle("/charts")
     if tid == "nav-alerts":
         return toggle("/alerts")
+    if tid == "nav-tradeboard":
+        return toggle("/tradeboard")
     for sym in INDEX_SYMBOLS:
         if tid == f"nav-{_slug(sym)}":
             return toggle(f"/chain/{_URL_SHORT.get(sym, 'index')}")
@@ -3425,6 +3519,749 @@ def _btst_body():
               Input("btst-btn", "n_clicks"), prevent_initial_call=True)
 def _open_btst(_n):
     return True, _btst_body()
+
+
+_VERDICT_COLOR = {"TRADE-FADE": "#f472b6", "RANGE-ONLY": "#fbbf24",
+                  "NO-TRADE": "#64748b", "WARMING": "#64748b"}
+
+
+def _tb_num(v, k=False):
+    """Compact number: OI/vol in K/L; None → '—'."""
+    if v is None:
+        return "—"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if k and abs(v) >= 1e5:
+        return f"{v/1e5:.1f}L"
+    if k and abs(v) >= 1e3:
+        return f"{v/1e3:.0f}K"
+    return f"{v:g}"
+
+
+def _tb_mtf_strip(mtf):
+    """Multi-TF price-action + structure grid (5/15/30/60m)."""
+    _sc = {"BREAKOUT_UP": "#22c55e", "BREAKOUT_DOWN": "#f87171", "TREND_UP": "#4ade80",
+           "TREND_DOWN": "#fb7185", "CONSOLIDATION": "#fbbf24", "RANGE": "#64748b",
+           "n/a": "#475569"}
+    cells = []
+    for m in mtf:
+        col = _sc.get(m["struct"], "#94a3b8")
+        cells.append(html.Div([
+            html.Div(f"{m['tf']}m", style={"color": "#64748b", "fontSize": "0.6rem"}),
+            html.Div(m["struct"], style={"color": col, "fontWeight": "700",
+                                         "fontSize": "0.66rem"}),
+            html.Div(f"ER {m['er'] if m['er'] is not None else '—'} · {m['char']}",
+                     style={"color": "#94a3b8", "fontSize": "0.6rem"}),
+        ], style={"padding": "4px 10px", "borderRight": "1px solid #1e293b",
+                  "minWidth": "120px"}))
+    return html.Div(cells, style={"display": "flex", "flexWrap": "wrap",
+                    "background": "#0a1220", "borderRadius": "8px", "marginBottom": "8px"})
+
+
+def _tb_strike_table(strikes, chain):
+    """Option chain: ATM+/-4 strikes, CE | STRIKE | PE, OI/COI/vol/IV/prem. Walls + max-pain
+    highlighted. The RAW data — read it, it does not tell you a direction."""
+    cw, pw, mp = chain.get("call_wall"), chain.get("put_wall"), chain.get("max_pain")
+    th = lambda t: html.Th(t, style={"padding": "3px 6px", "color": "#64748b",
+                                     "fontSize": "0.58rem", "fontWeight": "700"})
+    header = html.Tr([th("CE OI"), th("COI"), th("Vol"), th("IV"), th("Prem"),
+                      th("STRIKE"), th("Prem"), th("IV"), th("Vol"), th("COI"), th("PE OI")])
+    body = []
+    for s in strikes:
+        k = s["strike"]
+        tag = (" ●CW" if k == cw else "") + (" ●PW" if k == pw else "") + \
+              (" ◆MP" if k == mp else "")
+        kcol = "#f472b6" if s["atm"] else ("#40c4ff" if tag else "#cbd5e1")
+        bg = "#141d2e" if s["atm"] else "transparent"
+
+        def td(v, col="#94a3b8", kk=False, bold=False):
+            return html.Td(_tb_num(v, kk), style={"padding": "2px 6px", "color": col,
+                           "fontSize": "0.62rem", "textAlign": "center",
+                           "fontWeight": "700" if bold else "400"})
+        body.append(html.Tr([
+            td(s["ce_oi"], "#93c5fd", True), td(s["ce_oich"],
+               "#22c55e" if (s["ce_oich"] or 0) > 0 else "#f87171", True),
+            td(s["ce_vol"], "#94a3b8", True), td(s["ce_iv"]), td(s["ce_prem"]),
+            html.Td([f"{k}", html.Span(tag, style={"color": "#40c4ff", "fontSize": "0.52rem"})],
+                    style={"padding": "2px 8px", "color": kcol, "fontWeight": "800",
+                           "fontSize": "0.66rem", "textAlign": "center", "background": bg}),
+            td(s["pe_prem"]), td(s["pe_iv"]), td(s["pe_vol"], "#94a3b8", True),
+            td(s["pe_oich"], "#22c55e" if (s["pe_oich"] or 0) > 0 else "#f87171", True),
+            td(s["pe_oi"], "#fca5a5", True),
+        ], style={"background": bg}))
+    legend = html.Div(f"●CW call-wall {cw or '—'} · ●PW put-wall {pw or '—'} · "
+                      f"◆MP max-pain {mp or '—'} · PCR {chain.get('pcr') or '—'}",
+                      style={"color": "#64748b", "fontSize": "0.6rem", "marginTop": "3px"})
+    return html.Div([html.Table([html.Thead(header), html.Tbody(body)],
+                    style={"width": "100%", "borderCollapse": "collapse"}), legend])
+
+
+def _tradeboard_body():
+    """🎯 The full fused PAGE. Read-only over tradeboard.build_board(): per index — mood/ER,
+    the MULTI-TF price-action + structure grid, the VALIDATED band, the FULL option chain
+    (OI/COI/vol/IV/premium + walls/max-pain/PCR + expiry), and the ONE honest suggestion
+    (the band-fade, paper-first). No directional CE/PE arrow — that product is dead."""
+    import tradeboard as tb
+    now = datetime.datetime.now(IST)
+    try:
+        rows = tb.build_board(None, now)
+    except Exception as exc:
+        return html.Div(f"TradeBoard unavailable: {exc}",
+                        style={"color": "#f87171", "fontSize": "0.8rem", "padding": "10px"})
+
+    def _kv(label, val, color="#cbd5e1"):
+        return html.Span([html.Span(f"{label} ", style={"color": "#64748b"}),
+                          html.Span(str(val), style={"color": color, "fontWeight": "600"})],
+                         style={"marginRight": "14px", "fontSize": "0.72rem"})
+
+    def _sec(title):
+        return html.Div(title, style={"color": "#64748b", "fontSize": "0.58rem",
+                        "fontWeight": "800", "letterSpacing": "0.12em", "margin": "8px 0 3px"})
+
+    cards = [html.Div(
+        f"as of {now:%H:%M} IST · this board is DATA for YOUR read (multi-TF price action + "
+        f"structure + full option chain) · NO validated machine trade: the band-fade edge was "
+        f"a fill artifact (loses ~-6 to -11bps at real fills, audit 2026-07-16) · band = risk "
+        f"map · overnight (BTST) is the only validated directional edge",
+        style={"color": "#94a3b8", "fontSize": "0.7rem", "marginBottom": "12px",
+               "fontStyle": "italic"})]
+
+    for r in rows:
+        vc = _VERDICT_COLOR.get(r["verdict"], "#64748b")
+        head = [html.Span(r["label"], style={"fontWeight": "800", "fontSize": "1rem",
+                                             "color": "#e2e8f0", "marginRight": "12px"})]
+        if r["verdict"] == "WARMING":
+            head.append(html.Span("WARMING — " + r.get("note", ""),
+                                  style={"color": "#64748b", "fontSize": "0.72rem"}))
+            cards.append(html.Div(head, style={"padding": "10px 12px", "marginBottom": "10px",
+                        "background": BG_CARD, "borderRadius": "8px",
+                        "borderLeft": "3px solid #64748b"}))
+            continue
+        head += [
+            html.Span(f"{r['spot']:.2f}", style={"color": "#cbd5e1", "marginRight": "12px",
+                     "fontSize": "0.95rem"}),
+            _kv("mood", r["mood"], "#a78bfa"),
+            _kv("ER", r["er"] if r["er"] is not None else "—"),
+            _kv("expiry DTE", f"{r['expiry_dte']} ({'weekly' if r['weekly'] else 'monthly'})"),
+            html.Span(r["verdict"], style={"marginLeft": "auto", "color": "#0a0f1a",
+                     "background": vc, "borderRadius": "6px", "padding": "3px 12px",
+                     "fontWeight": "800", "fontSize": "0.72rem"}),
+        ]
+        body = [html.Div(head, style={"display": "flex", "alignItems": "center",
+                                      "flexWrap": "wrap", "marginBottom": "4px"})]
+        # 1) PRICE ACTION + STRUCTURE (multi-TF)
+        body.append(_sec("PRICE ACTION · STRUCTURE (multi-TF)"))
+        body.append(_tb_mtf_strip(r.get("mtf", [])))
+        # 2) BAND (validated risk product)
+        cov = (f"{100*r['cover']:.0f}% ({r['cover_conf']})" if r.get("cover") is not None else "—")
+        body.append(html.Div([_kv("band", f"[{r['band_lo']}, {r['band_hi']}]", "#40c4ff"),
+                              _kv("cover", cov)], style={"marginBottom": "2px"}))
+        # 3) OPTION CHAIN (OI/COI/vol/IV/premium + walls/max-pain/PCR)
+        age = r.get("chain_age")
+        stale = r.get("chain_stale")
+        body.append(_sec(f"OPTION CHAIN — OI · COI · VOL · IV · PREMIUM   "
+                         f"({'STALE ' + str(age) + 'm — context only' if stale else 'live ' + str(age) + 'm'})"))
+        if stale:
+            body.append(html.Div("chain data stale (capture dies ~11am) — greyed, not scored",
+                                 style={"color": "#f87171", "fontSize": "0.64rem",
+                                        "marginBottom": "4px"}))
+        if r.get("strikes"):
+            body.append(_tb_strike_table(r["strikes"], r.get("chain", {})))
+        # 4) CONTEXT MARKER (NOT a trade — the fade edge was a fill artifact, audit 2026-07-16)
+        s = r.get("setup")
+        body.append(_sec("CONTEXT MARKER — no validated intraday trade"))
+        if s:
+            body.append(html.Div([
+                html.Span("⚠ stretch+rejection at band edge (context, NOT a trade): ",
+                          style={"color": "#fbbf24", "fontWeight": "700",
+                                 "fontSize": "0.68rem"}),
+                _kv("side", s["side"].replace("-fade", ""), "#cbd5e1"),
+                _kv("edge~", s["entry"]), _kv("mean~", s["target"]),
+                _kv("band", f"{s['band_pct']}%"), _kv("clr", s["clr"]), _kv("ER", s["er"]),
+            ], style={"marginTop": "2px"}))
+        else:
+            body.append(html.Div("no marker — band is the product (risk map), not a direction",
+                                 style={"color": "#94a3b8", "fontSize": "0.7rem"}))
+        if r.get("note"):
+            body.append(html.Div("· " + r["note"],
+                                 style={"color": "#94a3b8", "fontSize": "0.68rem",
+                                        "fontStyle": "italic", "marginTop": "3px"}))
+        cards.append(html.Div(body, style={"padding": "14px 16px", "marginBottom": "14px",
+                    "background": BG_CARD, "borderRadius": "10px",
+                    "borderLeft": f"3px solid {vc}"}))
+    return html.Div(cards)
+
+
+_STRUCT_COLOR = {"BREAKOUT_UP": "#22c55e", "BREAKOUT_DOWN": "#ef4444", "TREND_UP": "#4ade80",
+                 "TREND_DOWN": "#fb7185", "CONSOLIDATION": "#fbbf24", "RANGE": "#64748b",
+                 "n/a": "#475569"}
+
+
+def _tb_candle_fig(sym, tf, date, as_of, band_lo=None, band_hi=None):
+    """One TF candlestick — CONTINUOUS recent bars (stitched multi-day, same series the ER is
+    computed on), band overlay, structure+ER in the title. Drawing the continuous series (not
+    a single day) means the chart is never empty pre-market / early session — the coarse TFs
+    show recent sessions, matching the ER. rangebreaks hide weekend + overnight so contiguous."""
+    import tradeboard as tb
+    sf = tb._struct_full(sym, tf, date, as_of)          # 20-bar Kaufman ER + structure (BTST)
+    struct, er = sf.get("struct", "n/a"), sf.get("er")
+    # ER = Kaufman efficiency ratio over the last 20 CLOSED bars: |net travel| / Σ|bar moves|.
+    # 1 = clean one-way trend, 0 = thrash-with-no-progress (chop). The trend-vs-chop meter.
+    if er is None:
+        er_txt = ""
+    elif er < 0.30:
+        er_txt = f" · ER {er} chop"
+    elif er < 0.45:
+        er_txt = f" · ER {er} weak-trend"
+    else:
+        er_txt = f" · ER {er} STRONG-trend"
+    # LOAD a deep history so the user can scroll/drag BACK; DEFAULT-VIEW only the recent window.
+    _load = {5: 750, 10: 500, 15: 400, 30: 220, 60: 160}.get(tf, 300)   # ~10-25 sessions
+    _view = {5: 78, 10: 40, 15: 34, 30: 26, 60: 26}.get(tf, 40)          # initial visible bars
+    cont = tb._bars_continuous(sym, tf, date, as_of, need=_load)
+    fig = go.Figure()
+    col = _STRUCT_COLOR.get(struct, "#94a3b8")
+    if cont is None or len(cont) < 3:
+        fig.add_annotation(text="no data yet", showarrow=False,
+                           font=dict(color="#64748b", size=11))
+        fig.update_layout(template="plotly_dark", height=250, paper_bgcolor=BG_CARD,
+                          plot_bgcolor=BG_CARD, margin=dict(l=8, r=8, t=26, b=8),
+                          xaxis=dict(visible=False), yaxis=dict(visible=False),
+                          title=dict(text=f"{tf}m · {struct}{er_txt}", x=0.02,
+                                     font=dict(size=11, color=col)))
+        return fig
+    fig.add_trace(go.Candlestick(
+        x=cont["ts"], open=cont["open"], high=cont["high"], low=cont["low"],
+        close=cont["close"], name="",
+        increasing_line_color="#22c55e", decreasing_line_color="#ef4444",
+        increasing_fillcolor="#22c55e", decreasing_fillcolor="#ef4444",
+        line=dict(width=1), showlegend=False))
+    # BAND overlay (validated risk zone — where price is likely to sit; NOT a signal)
+    if band_lo and band_hi:
+        fig.add_hrect(y0=band_lo, y1=band_hi, fillcolor="#40c4ff", opacity=0.07, line_width=0)
+        for y in (band_lo, band_hi):
+            fig.add_hline(y=y, line=dict(color="#40c4ff", width=0.8, dash="dot"))
+    rb = [dict(bounds=["sat", "mon"]), dict(bounds=[15.6, 9.25], pattern="hour")]
+    # initial view = the recent _view bars; the rest is loaded → drag/scroll BACK to see it
+    x0 = cont["ts"].iloc[-min(_view, len(cont))]
+    x1 = cont["ts"].iloc[-1] + pd.Timedelta(minutes=tf)
+    fig.update_layout(
+        template="plotly_dark", height=250, paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD,
+        margin=dict(l=8, r=50, t=26, b=20), hovermode="x unified", showlegend=False,
+        dragmode="pan",                                    # drag = scroll back through history
+        title=dict(text=f"{tf}m · <b>{struct}</b>{er_txt}", x=0.02, font=dict(size=11, color=col)),
+        xaxis=dict(rangeslider_visible=False, gridcolor="#0f1a2a", rangebreaks=rb,
+                   range=[x0, x1], tickfont=dict(color="#475569", size=8)),
+        yaxis=dict(side="right", gridcolor="#0f1a2a", tickfont=dict(color="#64748b", size=8),
+                   tickformat=",.0f", autorange=True, fixedrange=False))
+    return fig
+
+
+def _tb_daily_fig(sym):
+    """DAILY candle chart (last ~45 EOD bars) + 200-DMA. The 1D bar carries the validated
+    overnight edge — the top of the MTF stack."""
+    import tradeboard as tb
+    d = tb._daily_read(sym)
+    fig = go.Figure()
+    from pathlib import Path
+    from core.constants import DATA_DIR
+    fn = sym.replace(":", "_").replace("-", "_")
+    p = Path(DATA_DIR) / "historical" / "daily" / f"{fn}_daily.parquet"
+    if not p.exists():
+        fig.update_layout(template="plotly_dark", height=260, paper_bgcolor=BG_CARD,
+                          plot_bgcolor=BG_CARD)
+        return fig
+    df = pd.read_parquet(p).sort_values("ts").tail(45)
+    sma = pd.read_parquet(p).sort_values("ts")["close"].rolling(200).mean().tail(45)
+    fig.add_trace(go.Candlestick(x=df["ts"], open=df["open"], high=df["high"], low=df["low"],
+        close=df["close"], name="", increasing_line_color="#22c55e",
+        decreasing_line_color="#ef4444", increasing_fillcolor="#22c55e",
+        decreasing_fillcolor="#ef4444", line=dict(width=1), showlegend=False))
+    fig.add_trace(go.Scatter(x=df["ts"], y=sma.values, mode="lines", name="200-DMA",
+        line=dict(color="#a78bfa", width=1, dash="dot"), hoverinfo="skip"))
+    struct = d.get("struct", "")
+    col = "#22c55e" if "UP" in struct else "#ef4444" if "DOWN" in struct else "#fbbf24"
+    fig.update_layout(template="plotly_dark", height=260, paper_bgcolor=BG_CARD,
+        plot_bgcolor=BG_CARD, margin=dict(l=8, r=50, t=26, b=20), showlegend=False,
+        title=dict(text=f"1D · <b>{struct}</b> · clr {d.get('clr')} · ER20 {d.get('er20')} · "
+                   f"{d.get('regime','')}", x=0.02, font=dict(size=11, color=col)),
+        xaxis=dict(rangeslider_visible=False, gridcolor="#0f1a2a",
+                   rangebreaks=[dict(bounds=["sat", "mon"])],
+                   tickfont=dict(color="#475569", size=8)),
+        yaxis=dict(side="right", gridcolor="#0f1a2a", tickfont=dict(color="#64748b", size=8),
+                   tickformat=",.0f"))
+    return fig
+
+
+def _tb_daily_panel(row):
+    """The DAILY read = the top of the stack and the ONLY validated directional edge here:
+    daily close-strength → overnight long (8.5yr-validated), regime-gated. Character shown
+    for the user's own PA; the overnight lean is the machine's one real call."""
+    d = row.get("daily") or {}
+    if not d:
+        return html.Div("daily EOD not available", style={"color": "#64748b",
+                        "fontSize": "0.7rem"})
+    strong = d.get("strong_close")
+    lc = "#22c55e" if strong else "#64748b"
+
+    def _kv(lab, val, c="#cbd5e1"):
+        return html.Span([html.Span(f"{lab} ", style={"color": "#64748b"}),
+                          html.Span(str(val), style={"color": c, "fontWeight": "600"})],
+                         style={"marginRight": "13px", "fontSize": "0.72rem"})
+    char = html.Div([
+        _kv("close", d.get("close")), _kv("clr", d.get("clr"),
+            "#22c55e" if (d.get("clr") or 0) >= 0.66 else "#cbd5e1"),
+        _kv("body", d.get("body")), _kv("upper-wick", d.get("uwick")),
+        _kv("lower-wick", d.get("lwick")), _kv("ER20", d.get("er20")),
+        _kv("regime", d.get("regime"), "#a78bfa"),
+    ], style={"marginBottom": "4px"})
+    onv, win = d.get("onv"), d.get("onv_win")
+    forming, actionable = d.get("forming"), d.get("actionable")
+    src = ("TODAY forming" if forming else f"session {d.get('asof_date','')}")
+    if strong and actionable and onv:
+        lean = html.Div([
+            html.Span("OVERNIGHT LEAN: ", style={"color": lc, "fontWeight": "800",
+                      "fontSize": "0.74rem"}),
+            html.Span("LONG into close → exit next open", style={"color": "#e2e8f0",
+                      "fontWeight": "700", "fontSize": "0.72rem"}),
+            html.Span(f"  (8.5yr-validated: strong-close pays ~+{onv}% overnight, win {win}%, "
+                      f"{'size up' if d.get('regime') == 'bull' else 'smaller — bear'})",
+                      style={"color": "#94a3b8", "fontSize": "0.66rem"}),
+        ])
+    elif strong and forming:
+        lean = html.Div([
+            html.Span("OVERNIGHT LEAN: ", style={"color": "#fbbf24", "fontWeight": "800",
+                      "fontSize": "0.74rem"}),
+            html.Span("forming strong (clr≥0.66) — FIRMS in the 15:10–15:30 window; not yet "
+                      "actionable", style={"color": "#e2e8f0", "fontSize": "0.7rem"}),
+        ])
+    else:
+        lean = html.Div("OVERNIGHT LEAN: none — daily close not strong (clr<0.66); the edge "
+                        "fires only on a strong daily close", style={"color": "#94a3b8",
+                        "fontSize": "0.7rem"})
+    note = html.Div(f"daily = {src} · the ONE validated directional edge here (overnight); "
+                    f"intraday TFs below are CONTEXT for your own PA · the tonight call firms "
+                    f"at the 15:10–15:30 close", style={"color": "#64748b",
+                    "fontSize": "0.58rem", "fontStyle": "italic", "marginTop": "3px"})
+    return html.Div([char, lean, note], style={"background": "#0a1220",
+                    "borderLeft": f"3px solid {lc}", "borderRadius": "8px",
+                    "padding": "8px 12px", "margin": "6px 0"})
+
+
+def _tb_chain_panel(row):
+    """Below the candles: band + full option chain (OI/COI/vol/IV/premium + walls/max-pain/
+    PCR) + expiry + the HONEST read (context marker, never a machine trade)."""
+    def _kv(label, val, color="#cbd5e1"):
+        return html.Span([html.Span(f"{label} ", style={"color": "#64748b"}),
+                          html.Span(str(val), style={"color": color, "fontWeight": "600"})],
+                         style={"marginRight": "14px", "fontSize": "0.72rem"})
+
+    def _sec(t):
+        return html.Div(t, style={"color": "#64748b", "fontSize": "0.58rem", "fontWeight": "800",
+                        "letterSpacing": "0.12em", "margin": "10px 0 3px"})
+    cov = (f"{100*row['cover']:.0f}% ({row['cover_conf']})" if row.get("cover") is not None else "—")
+    age, stale = row.get("chain_age"), row.get("chain_stale")
+    head = [html.Span(row["label"], style={"fontWeight": "800", "fontSize": "0.95rem",
+                     "color": "#e2e8f0", "marginRight": "12px"}),
+            html.Span(f"{row['spot']:.2f}", style={"color": "#cbd5e1", "marginRight": "12px"}),
+            _kv("mood", row["mood"], "#a78bfa"), _kv("ER", row["er"] if row["er"] is not None else "—"),
+            _kv("expiry DTE", f"{row['expiry_dte']} ({'weekly' if row['weekly'] else 'monthly'})"),
+            _kv("band", f"[{row['band_lo']}, {row['band_hi']}]", "#40c4ff"), _kv("cover", cov)]
+    out = [html.Div(head, style={"display": "flex", "flexWrap": "wrap", "alignItems": "center",
+                    "marginTop": "6px"})]
+    # ── PHASE 2 — MTF PRICE ACTION, the user's THREE MASTER COMBOS (5×15, 10×30, 15×60) ──
+    # Each = a lower-TF entry confirmed by its higher-TF structure. CONTEXT for the user's own
+    # PA read (intraday MTF has no validated MACHINE edge — every gate failed OOS this session).
+    out.append(_sec("PHASE 2 — PRICE ACTION · MTF CONFIRMATION (3 combos · lower × higher)"))
+    for cb in (row.get("combos") or []):
+        sc = cb.get("color", "#94a3b8")
+        locpct = f"{100*cb['loc']:.0f}%" if cb.get("loc") is not None else "—"
+        out.append(html.Div([
+            html.Div([
+                html.Span(f"{cb.get('ltf_tf')}m→{cb.get('htf_tf')}m  ", style={"color": "#a78bfa",
+                          "fontSize": "0.62rem", "fontWeight": "800"}),
+                html.Span(f"LTF {cb.get('ltf_struct')}", style={"color": "#cbd5e1",
+                          "fontSize": "0.64rem", "fontWeight": "700"}),
+                html.Span(" conf.by ", style={"color": "#475569", "fontSize": "0.58rem"}),
+                html.Span(f"HTF {cb.get('htf_struct')}", style={"color": "#cbd5e1",
+                          "fontSize": "0.64rem", "fontWeight": "700"}),
+                html.Span(f"  box {locpct}", style={"color": "#64748b", "fontSize": "0.58rem"}),
+                html.Span(f"  {cb.get('tag','')}", style={"marginLeft": "6px", "color": "#0a0f1a",
+                          "background": sc, "borderRadius": "5px", "padding": "1px 8px",
+                          "fontWeight": "800", "fontSize": "0.62rem"}),
+            ]),
+            html.Div([
+                html.Span("entry candle ", style={"color": "#64748b", "fontSize": "0.58rem"}),
+                html.Span(f"{cb.get('ltf_tf')}m {cb.get('ltf_pattern','—')}",
+                          style={"color": "#fbbf24", "fontSize": "0.62rem", "fontWeight": "700"}),
+                html.Span(f"   · HTF confirm candle {cb.get('htf_tf')}m {cb.get('htf_pattern','—')}",
+                          style={"color": "#64748b", "fontSize": "0.58rem"}),
+            ], style={"marginTop": "1px"}),
+            html.Div(cb.get("read", ""), style={"color": "#94a3b8", "fontSize": "0.64rem",
+                     "marginTop": "2px"}),
+        ], style={"background": "#0a1220", "borderLeft": f"3px solid {sc}",
+                  "borderRadius": "6px", "padding": "6px 10px", "marginBottom": "4px"}))
+    out.append(html.Div("PHASE 1 = the option data below (your Charts engine) · PHASE 2 = these "
+                        "combos · YOU gate both with your PA — no machine auto-trade (fails OOS)",
+                        style={"color": "#64748b", "fontSize": "0.56rem", "fontStyle": "italic",
+                               "marginBottom": "4px"}))
+    out.append(_sec(f"PHASE 1 — OPTION CHAIN · OI · COI · VOL · IV · PREMIUM  "
+                    f"({'STALE ' + str(age) + 'm — context only' if stale else 'live ' + str(age) + 'm'})"))
+    if stale:
+        out.append(html.Div("chain stale (capture dies ~11am) — greyed, not scored",
+                            style={"color": "#f87171", "fontSize": "0.64rem"}))
+    if row.get("strikes"):
+        out.append(_tb_strike_table(row["strikes"], row.get("chain", {})))
+    out.append(_sec("READ — no validated machine trade"))
+    s = row.get("setup")
+    if s:
+        out.append(html.Div([
+            html.Span("⚠ stretch+rejection at band edge (CONTEXT for your own PA, NOT a trade): ",
+                      style={"color": "#fbbf24", "fontWeight": "700", "fontSize": "0.68rem"}),
+            _kv("side", s["side"].replace("-fade", ""), "#cbd5e1"),
+            _kv("edge~", s["entry"]), _kv("mean~", s["target"]),
+            _kv("band", f"{s['band_pct']}%"), _kv("clr", s["clr"]),
+        ]))
+    if row.get("note"):
+        out.append(html.Div("· " + row["note"], style={"color": "#94a3b8", "fontSize": "0.66rem",
+                            "fontStyle": "italic", "marginTop": "3px"}))
+    return html.Div(out, style={"padding": "6px 4px"})
+
+
+@app.callback(Output("tb-ledger-modal", "is_open"),
+              Input("tb-ledger-btn", "n_clicks"), prevent_initial_call=True)
+def _open_ledger(_n):
+    return True
+
+
+# outcome badges — SAME vocabulary as the Charts scout ledger (dashboard.py:5177)
+_LED_BADGE = {"band ↑ upper": ("⚡ band ↑ upper", "#22c55e"),
+              "band ↓ lower": ("⚡ band ↓ lower", "#22c55e"),
+              "SL hit": ("🛑 SL hit", "#f87171"),
+              "flipped · reversed out": ("↺ flipped · reversed out", "#f59e0b"),
+              "squared off at the bell": ("🔔 squared off at the bell", "#94a3b8")}
+
+
+def _tb_clock(vdate):
+    """TradeBoard clock from the MASTER date store (news-date). Viewing a PAST day → that
+    day's full-session replay (as_of 15:35); today → live now. Fixes the '0 closed' confusion
+    when the date scroller points at yesterday (the board was hardcoded live-now)."""
+    now = datetime.datetime.now(IST)
+    today = now.date().isoformat()
+    if vdate and vdate != today:
+        d0 = datetime.date.fromisoformat(vdate)
+        return vdate, datetime.datetime.combine(d0, datetime.time(15, 35), tzinfo=IST)
+    return None, now
+
+
+def _led_badge(outcome: str):
+    """Badge lookup — 'timed out (Xm)' carries a combo-dependent minute count, so it is
+    prefix-matched rather than keyed exactly."""
+    if outcome.startswith("timed out"):
+        return (f"⌛ {outcome}", "#a78bfa")
+    return _LED_BADGE.get(outcome, (outcome, "#94a3b8"))
+
+
+@app.callback(Output("tb-ledger", "children"), Output("tb-ledger-badge", "children"),
+              Input("sel-sym", "data"), Input("tb-scout-combo", "value"),
+              Input("news-date", "data"), Input("tb-refresh", "n_intervals"))
+def _fill_ledger(sel, combo, vdate, _tick):
+    """SCOUT day-ledger (Charts-parity) — today's PA level-trades, open + closed, with the same
+    exit vocabulary as the Charts ledger: band touch / SL hit / flipped / timed out (90m) /
+    squared off at the bell. Measures the method (2yr ~breakeven, MIDCAP marginally +) — NOT a
+    machine fire; the naked CE/PE is negative-EV, the LEVELS are the trade."""
+    from dash.exceptions import PreventUpdate
+    if sel != "TRADEBOARD":
+        raise PreventUpdate
+    import tradeboard as tb
+    vdt, now = _tb_clock(vdate)
+    ltf_tf, htf_tf = (int(x) for x in (combo or "15-60").split("-"))
+    try:
+        L = tb.scout_pa_ledger(vdt, now, ltf_tf, htf_tf)
+    except Exception as exc:
+        return html.Div(f"ledger error: {exc}", style={"color": "#f87171"}), ""
+    closed, openr = L["closed"], L["open"]
+    badge = html.Span(f"📋 {len(openr)} open · {L['n_closed']} closed", style={
+        "color": "#94a3b8", "fontWeight": "700"})
+
+    def _tbl(rows, is_open):
+        if not rows:
+            return html.Div("none", style={"color": "#64748b", "fontSize": "0.66rem"})
+        th = lambda t: html.Th(t, style={"padding": "3px 9px", "color": "#64748b",
+                                         "fontSize": "0.56rem", "fontWeight": "800",
+                                         "textAlign": "left"})
+        cols = (["INDEX", "SIDE", "STRIKE", "TRIGGER", "ENTRY ₹", "NOW ₹", "₹ P&L", "%", "STATUS"]
+                if is_open else
+                ["INDEX", "SIDE", "STRIKE", "TRIGGER", "EXIT ⏱", "ENTRY ₹", "EXIT ₹", "₹ P&L",
+                 "%", "OUTCOME"])
+        body = []
+        for r in rows:
+            ors = r.get("opt_rs")
+            pc = "#22c55e" if (ors or 0) > 0 else "#f87171" if (ors or 0) < 0 else "#94a3b8"
+
+            def td(v, c="#cbd5e1", b=False):
+                return html.Td("n/a" if v is None else str(v),
+                               style={"padding": "3px 9px", "fontSize": "0.68rem",
+                                      "color": c if v is not None else "#475569",
+                                      "fontWeight": "700" if b else "400"})
+            ep = r.get("e_prem"); xp = r.get("x_prem")
+            pnl_rs = (f"{ors:+,}" if ors is not None else None)
+            pnl_pc = (f"{r['opt_pct']:+}%" if r.get("opt_pct") is not None else None)
+            if is_open:
+                cells = [td(r["label"], "#e2e8f0", True),
+                         td(r["side"], "#22c55e" if r["side"] == "CE" else "#f87171"),
+                         td(r.get("strike")), td(r["since"]), td(ep, "#e2e8f0"), td(xp),
+                         td(pnl_rs, pc, True), td(pnl_pc, pc), td("● open", "#94a3b8")]
+            else:
+                bt, bc = _led_badge(r["outcome"])
+                _h = (r.get("held") or "→").split("→")
+                trig_t, exit_t = (_h + ["", ""])[:2]
+                cells = [td(r["label"], "#e2e8f0", True),
+                         td(r["side"], "#22c55e" if r["side"] == "CE" else "#f87171"),
+                         td(r.get("strike")), td(trig_t, "#e2e8f0"),
+                         td(exit_t, "#fbbf24", True), td(ep, "#e2e8f0"), td(xp),
+                         td(pnl_rs, pc, True), td(pnl_pc, pc), td(bt, bc, True)]
+            body.append(html.Tr(cells, style={"borderTop": "1px solid #1e293b"}))
+        return html.Table([html.Thead(html.Tr([th(c) for c in cols])), html.Tbody(body)],
+                          style={"width": "100%", "borderCollapse": "collapse"})
+    opt_rows = [r for r in closed if r.get("opt_rs") is not None]
+    opt_total = sum(r["opt_rs"] for r in opt_rows)
+    opt_wins = sum(1 for r in opt_rows if r["opt_rs"] > 0)
+    opt_txt = (f"   ·   OPTION ₹ P&L: {opt_total:+,} ({opt_wins}/{len(opt_rows)} win, "
+               f"chain-fresh rows)" if opt_rows else
+               "   ·   OPTION premiums: n/a (chain not fresh — dies ~11am)")
+    tc = "#22c55e" if opt_total > 0 else "#f87171" if opt_total < 0 else "#94a3b8"
+    _sup = L.get("suppressed", 0)
+    scoreboard = html.Div([
+        html.Span(f"{len(openr)} open · {L['n_closed']} closed", style={"color": "#e2e8f0",
+                  "fontWeight": "800", "fontSize": "0.78rem"}),
+        html.Span(f"  · {_sup} suppressed (dead-tape / 3-strikes)" if _sup else "",
+                  style={"color": "#f59e0b", "fontSize": "0.66rem"}),
+        html.Span(opt_txt, style={"color": tc, "fontSize": "0.72rem", "fontWeight": "700"}),
+        html.Span(f"   · index-level {L['avg_pct'] if L['avg_pct'] is not None else '—'}% avg / "
+                  f"{L['avg_r'] if L['avg_r'] is not None else '—'}R",
+                  style={"color": "#64748b", "fontSize": "0.66rem"})],
+        style={"marginBottom": "8px"})
+    body_div = html.Div([
+        scoreboard,
+        html.Div("● OPEN", style={"color": "#22c55e", "fontSize": "0.6rem", "fontWeight": "800",
+                 "margin": "6px 0 2px"}), _tbl(openr, True),
+        html.Div("○ CLOSED", style={"color": "#64748b", "fontSize": "0.6rem", "fontWeight": "800",
+                 "margin": "10px 0 2px"}), _tbl(closed, False),
+        html.Div("ENTRY ₹/NOW ₹/EXIT ₹ = the ATM CE/PE PREMIUM (1 lot) — from the captured chain, "
+                 "LIVE ONLY and only while FRESH: the chain dies ~11am so afternoon rows show n/a "
+                 "(no reliable premium) · exits: band touch / SL / flipped / 90m / bell · the "
+                 "naked CE/PE is MEASURED NEGATIVE-EV (theta+spread bleed the option even when "
+                 "the index level is ~breakeven) — this ledger SHOWS you that; the LEVELS are the "
+                 "edge, not the option", style={"color": "#64748b", "fontSize": "0.56rem",
+                 "fontStyle": "italic", "marginTop": "10px"}),
+    ])
+    return body_div, badge
+
+
+@app.callback(Output("tb-scout", "children"),
+              Input("sel-sym", "data"), Input("tb-scout-combo", "value"),
+              Input("news-date", "data"), Input("tb-refresh", "n_intervals"))
+def _fill_scout(sel, combo, vdate, _tick):
+    """Cross-index SCOUT table — scan all indices on the chosen combo, best setup first.
+    Discretionary-read scanner (which index has the cleanest MTF confluence), not a machine
+    buy (intraday PA doesn't mechanize — audited)."""
+    from dash.exceptions import PreventUpdate
+    if sel != "TRADEBOARD":
+        raise PreventUpdate
+    import tradeboard as tb
+    vdt, now = _tb_clock(vdate)
+    ltf_tf, htf_tf = (int(x) for x in (combo or "15-60").split("-"))
+    try:
+        rows = tb.scout_scan(vdt, now, ltf_tf, htf_tf)
+    except Exception as exc:
+        return html.Div(f"scout error: {exc}", style={"color": "#f87171"})
+    th = lambda t: html.Th(t, style={"padding": "3px 8px", "color": "#64748b",
+                                     "fontSize": "0.56rem", "fontWeight": "800",
+                                     "textAlign": "left"})
+    header = html.Tr([th("INDEX"), th(f"{ltf_tf}m ENTRY (struct · candle)"),
+                      th(f"{htf_tf}m CONFIRM (struct · candle)"), th("box"), th("VERDICT")])
+    body = []
+    for r in rows:
+        sc = r.get("color", "#94a3b8")
+        loc = f"{100*r['loc']:.0f}%" if r.get("loc") is not None else "—"
+
+        def td(children, **kw):
+            st = {"padding": "3px 8px", "fontSize": "0.66rem", **kw}
+            return html.Td(children, style=st)
+        body.append(html.Tr([
+            td(r["label"], color="#e2e8f0", fontWeight="800"),
+            td(f"{r.get('ltf_struct')} · {r.get('ltf_pattern')}", color="#cbd5e1"),
+            td(f"{r.get('htf_struct')} · {r.get('htf_pattern')}", color="#cbd5e1"),
+            td(loc, color="#64748b"),
+            html.Td(html.Span(r.get("tag", ""), style={"color": "#0a0f1a", "background": sc,
+                    "borderRadius": "5px", "padding": "2px 9px", "fontWeight": "800",
+                    "fontSize": "0.62rem"}), style={"padding": "3px 8px"}),
+        ], style={"borderTop": "1px solid #1e293b"}))
+        # levels line — band / S-R / strike / entry-target-SL (context; naked arrow = neg-EV)
+        lv = r.get("levels") or {}
+        if lv:
+            def _kv(lb, v, cl="#cbd5e1"):
+                return html.Span([html.Span(f"{lb} ", style={"color": "#475569"}),
+                                  html.Span(str(v), style={"color": cl, "fontWeight": "600"})],
+                                 style={"marginRight": "12px", "fontSize": "0.6rem"})
+            has_trade = lv.get("entry") is not None
+            if r.get("tape_dead"):
+                trade = [html.Span(f"🪫 DEAD TAPE (travel {r.get('tape_pct')}% < 0.45%) — stand "
+                                   f"down: no new setups; flat days = the measured loss sink "
+                                   f"(serial false-breaks + theta)",
+                                   style={"color": "#f59e0b", "fontSize": "0.62rem",
+                                          "fontWeight": "700"})]
+            elif has_trade:
+                trade = [_kv("strike", f"{lv.get('atm')} {lv.get('side')}", "#fbbf24"),
+                         _kv("entry", lv.get("entry"), "#e2e8f0"),
+                         _kv("target", lv.get("target"), "#22c55e"),
+                         _kv("SL", lv.get("sl"), "#f87171"), _kv("R:R", lv.get("rr")),
+                         html.Span(f"  tape {r.get('tape_pct')}%", style={"color": "#475569",
+                                   "fontSize": "0.58rem"})]
+            else:
+                trade = [html.Span("no directional entry — wait for the break / trade the band",
+                                   style={"color": "#64748b", "fontSize": "0.6rem"})]
+            _st, _rt = lv.get("sup_touches") or 0, lv.get("res_touches") or 0
+            _sup_txt = (f"{lv.get('support')} (×{_st})" if lv.get("support") else "None")
+            _res_txt = (f"{lv.get('resistance')} (×{_rt})" if lv.get("resistance") else "None")
+            _wall = ([html.Span(
+                f"  ⚠ {lv.get('headroom_atr')} ATR to a {lv.get('warn_touches')}-touch "
+                f"{lv.get('warn_tf')}m wall @{lv.get('warn_level')} — breaking it or buying "
+                f"into it? your call",
+                style={"color": "#fbbf24", "fontSize": "0.6rem", "fontWeight": "700"})]
+                if lv.get("wall_warn") else [])
+            _lsr = []
+            if lv.get("sup_l") or lv.get("res_l"):
+                _lsr = [_kv("15m S/R",
+                        f"{lv.get('sup_l') or '—'}(×{lv.get('sup_l_t') or 0}) / "
+                        f"{lv.get('res_l') or '—'}(×{lv.get('res_l_t') or 0})", "#a78bfa")]
+            if lv.get("confluence"):
+                _lsr.append(html.Span(f"◈ confluence @{', '.join(str(x) for x in lv['confluence'])}",
+                            style={"color": "#22d3ee", "fontSize": "0.6rem", "fontWeight": "700",
+                                   "marginRight": "10px"}))
+            body.append(html.Tr([html.Td([
+                _kv("band", f"[{lv.get('band_lo')}, {lv.get('band_hi')}]", "#40c4ff"),
+                _kv("60m S/R", f"{_sup_txt} / {_res_txt}", "#4ade80"),
+                *_lsr,
+                html.Span(" | ", style={"color": "#334155"}), *trade, *_wall,
+            ], colSpan=5, style={"padding": "1px 8px 5px 8px"})]))
+    return html.Div([
+        html.Table([html.Thead(header), html.Tbody(body)],
+                   style={"width": "100%", "borderCollapse": "collapse"}),
+        html.Div("ranked best-setup-first · band+S/R+levels = the PA edge (from past candle "
+                 "closings) · the ATM CE/PE strike is the VEHICLE, flagged: buying the naked "
+                 "arrow is MEASURED NEGATIVE-EV (−2 to −5%/trade) — trade the LEVELS with your "
+                 "discipline, not the option; overnight = the only validated directional edge",
+                 style={"color": "#64748b", "fontSize": "0.56rem", "fontStyle": "italic",
+                        "marginTop": "4px"}),
+    ], style={"background": "#0a1220", "borderRadius": "8px", "padding": "8px 12px",
+              "margin": "4px 0 8px"})
+
+
+@app.callback(
+    Output("tb-combo-ltf", "figure"), Output("tb-combo-htf", "figure"),
+    Output("tb-combo-read", "children"),
+    Input("sel-sym", "data"), Input("tb-idx-tabs", "active_tab"), Input("tb-combo", "value"),
+    Input("news-date", "data"), Input("tb-refresh", "n_intervals"))
+def _fill_combo_focus(sel, active_tab, combo, vdate, _tick):
+    """The MTF COMBO FOCUS panel — the dropdown-selected combo's LTF (entry) + HTF (confirm)
+    charts + its structure/pattern/synthesis read. Context, not a machine trade."""
+    from dash.exceptions import PreventUpdate
+    if sel != "TRADEBOARD":
+        raise PreventUpdate
+    import tradeboard as tb
+    vdt, now = _tb_clock(vdate)
+    sym = active_tab or INDEX_SYMBOLS[0]
+    ltf_tf, htf_tf = (int(x) for x in (combo or "5-15").split("-"))
+    try:
+        htf = tb._struct_full(sym, htf_tf, vdt, now, drop_forming=False)
+        ltf = tb._struct_full(sym, ltf_tf, vdt, now)
+        s = tb.synthesize(htf, ltf, ltf.get("last") or 0)
+    except Exception as exc:
+        e = go.Figure(); e.update_layout(template="plotly_dark", height=250,
+            paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD)
+        return e, e, html.Div(f"combo error: {exc}", style={"color": "#f87171"})
+    fl = _tb_candle_fig(sym, ltf_tf, vdt, now)
+    fh = _tb_candle_fig(sym, htf_tf, vdt, now)
+    sc = s.get("color", "#94a3b8")
+    locpct = f"{100*s['loc']:.0f}%" if s.get("loc") is not None else "—"
+    read = html.Div([
+        html.Div([
+            html.Span(f"{ltf_tf}m (ENTRY) ", style={"color": "#fbbf24", "fontWeight": "800",
+                      "fontSize": "0.72rem"}),
+            html.Span(f"{ltf.get('struct')} · {ltf.get('pattern')}", style={"color": "#e2e8f0",
+                      "fontWeight": "700", "fontSize": "0.72rem"}),
+            html.Span("   confirmed by   ", style={"color": "#64748b", "fontSize": "0.62rem"}),
+            html.Span(f"{htf_tf}m (CONFIRM) ", style={"color": "#40c4ff", "fontWeight": "800",
+                      "fontSize": "0.72rem"}),
+            html.Span(f"{htf.get('struct')} · {htf.get('pattern')}", style={"color": "#e2e8f0",
+                      "fontWeight": "700", "fontSize": "0.72rem"}),
+            html.Span(f"  price in HTF box {locpct}", style={"color": "#64748b",
+                      "fontSize": "0.6rem"}),
+            html.Span(f"  {s.get('tag','')}", style={"marginLeft": "8px", "color": "#0a0f1a",
+                      "background": sc, "borderRadius": "5px", "padding": "2px 10px",
+                      "fontWeight": "800", "fontSize": "0.66rem"}),
+        ]),
+        html.Div(s.get("read", ""), style={"color": "#cbd5e1", "fontSize": "0.7rem",
+                 "marginTop": "3px"}),
+        html.Div("HTF = confirmation · LTF = entry timing (the entry candle is the trigger) · "
+                 "CONTEXT for your PA, not a machine trade", style={"color": "#64748b",
+                 "fontSize": "0.56rem", "fontStyle": "italic", "marginTop": "2px"}),
+    ], style={"background": "#0a1220", "borderLeft": f"3px solid {sc}", "borderRadius": "8px",
+              "padding": "8px 12px", "marginBottom": "6px"})
+    return fl, fh, read
+
+
+@app.callback(
+    Output("tb-fig-1d", "figure"), Output("tb-daily", "children"),
+    Output("tb-fig-5", "figure"), Output("tb-fig-10", "figure"),
+    Output("tb-fig-15", "figure"), Output("tb-fig-30", "figure"),
+    Output("tb-fig-60", "figure"),
+    Output("tb-intro", "children"), Output("tb-chain", "children"),
+    Input("sel-sym", "data"), Input("tb-idx-tabs", "active_tab"),
+    Input("news-date", "data"), Input("tb-refresh", "n_intervals"))
+def _fill_tradeboard(sel, active_tab, vdate, _tick):
+    """Fill the TradeBoard page when it becomes the active section (sel-sym=='TRADEBOARD')
+    or the index tab changes. Skips when the page is not open (no wasted render)."""
+    from dash.exceptions import PreventUpdate
+    if sel != "TRADEBOARD":
+        raise PreventUpdate
+    import tradeboard as tb
+    vdt, now = _tb_clock(vdate)
+    sym = active_tab or INDEX_SYMBOLS[0]
+    intro = html.Div(
+        f"as of {now:%Y-%m-%d %H:%M} IST{' · REPLAY (past day, full session)' if vdt else ' · LIVE'} "
+        f"· multi-TF price action + structure + full option chain for "
+        f"YOUR read · NO machine trade (the fade edge was a fill artifact — loses at real "
+        f"fills) · blue band = risk map (~where price sits) · overnight (BTST) = only "
+        f"validated directional edge",
+        style={"color": "#94a3b8", "fontSize": "0.7rem", "margin": "8px 0",
+               "fontStyle": "italic"})
+    try:
+        row = tb.build_row(sym, vdt, now)
+    except Exception as exc:
+        e = go.Figure(); e.update_layout(template="plotly_dark", height=250,
+            paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD)
+        return e, html.Div(), e, e, e, e, intro, html.Div(f"row error: {exc}",
+            style={"color": "#f87171", "fontSize": "0.75rem"})
+    blo, bhi = row.get("band_lo"), row.get("band_hi")
+    _blank = go.Figure(); _blank.update_layout(template="plotly_dark", height=250,
+        paper_bgcolor=BG_CARD, plot_bgcolor=BG_CARD)
+
+    def _safe(fn, *a, fig=True):
+        try:
+            return fn(*a)
+        except Exception as exc:
+            return _blank if fig else html.Div(f"panel error: {exc}",
+                style={"color": "#f87171", "fontSize": "0.7rem"})
+    dfig = _safe(_tb_daily_fig, sym)
+    dpanel = _safe(_tb_daily_panel, row, fig=False)
+    figs = [_safe(_tb_candle_fig, sym, tf, vdt, now, blo, bhi) for tf in (5, 10, 15, 30, 60)]
+    chain = _safe(_tb_chain_panel, row, fig=False)
+    return dfig, dpanel, figs[0], figs[1], figs[2], figs[3], figs[4], intro, chain
 
 
 # One search box (modal top-right) filters BOTH ledger tables across every column, client
@@ -5851,6 +6688,7 @@ def _update_holiday_banner(date):
     Output("live-oi-panel",   "style"),
     Output("charts-panel",    "style"),
     Output("alerts-panel",    "style"),
+    Output("tradeboard-panel", "style"),
     Output("oc-title",        "children"),
     *[Output(f"nav-{_slug(s)}", "style") for s in INDEX_SYMBOLS],
     Input("sel-sym", "data"),
@@ -5860,7 +6698,9 @@ def toggle_view(sym):
     is_liveoi = (sym == "LIVEOI")
     is_charts = (sym == "CHARTS")
     is_alerts = (sym == "ALERTS")
-    is_index  = bool(sym) and not is_trades and not is_liveoi and not is_charts and not is_alerts
+    is_tboard = (sym == "TRADEBOARD")
+    is_index  = bool(sym) and not is_trades and not is_liveoi and not is_charts \
+        and not is_alerts and not is_tboard
 
     ov_style = {"display": "block"} if not sym else {"display": "none"}
     oc_style = {"display": "block"} if is_index else {"display": "none"}
@@ -5868,6 +6708,7 @@ def toggle_view(sym):
     lo_style = {"display": "block"} if is_liveoi else {"display": "none"}
     ch_style = {"display": "block"} if is_charts else {"display": "none"}
     al_style = {"display": "block"} if is_alerts else {"display": "none"}
+    tbd_style = {"display": "block"} if is_tboard else {"display": "none"}
 
     if is_index:
         color = COLORS[sym]
@@ -5882,7 +6723,8 @@ def toggle_view(sym):
         title = ""
 
     nav_styles = [_nav_chip_style(s, selected=(s == sym)) for s in INDEX_SYMBOLS]
-    return (ov_style, oc_style, tb_style, lo_style, ch_style, al_style, title, *nav_styles)
+    return (ov_style, oc_style, tb_style, lo_style, ch_style, al_style, tbd_style,
+            title, *nav_styles)
 
 
 # ── Callback 3: sidebar live prices + status ───────────────────────────────────
