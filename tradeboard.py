@@ -101,11 +101,53 @@ def _hist_5min(sym: str):
     return df
 
 
+def _prior_live_days(sym: str, before_day: str, want5: int):
+    """FALLBACK prior-day 5-min bars from the LIVE captures (data/intraday/live/<date>_ticks),
+    for when the historical parquet is MISSING/THIN — e.g. a fresh VM whose data/historical was
+    never populated (2026-07-27: VM ledger fired 0 trades because the 60m couldn't warm). The VM
+    captures every day, so its own prior live sessions ARE the warm-up bars; this makes the board
+    self-sufficient with zero historical-store maintenance. Builds 5-min per prior captured day
+    (most recent first) until >= want5 bars. Cached via _CONT_CACHE key."""
+    from core.constants import LIVE_DIR
+    import glob as _glob
+    ck = ("_pld", sym, before_day, want5)
+    hit = _CONT_CACHE.get(ck)
+    if hit is not None:
+        return hit
+    days = []
+    for p in _glob.glob(str(LIVE_DIR / "*_ticks.parquet")):
+        s = os.path.basename(p).split("_")[0]
+        if s < before_day:
+            try:
+                datetime.date.fromisoformat(s); days.append(s)
+            except ValueError:
+                pass
+    frames = []
+    got = 0
+    for d in sorted(days, reverse=True):          # newest prior day first
+        try:
+            ser = fc.build_series(sym, 5, d, None)
+            if ser.get("has_data") and ser.get("ts"):
+                frames.append(pd.DataFrame({
+                    "ts": pd.to_datetime(ser["ts"]), "open": ser["open"],
+                    "high": ser["high"], "low": ser["low"], "close": ser["close"]}))
+                got += len(ser["ts"])
+        except Exception:
+            continue
+        if got >= want5:
+            break
+    res = (pd.concat(frames, ignore_index=True) if frames else None)
+    _CONT_CACHE[ck] = res
+    return res
+
+
 def _bars_continuous(sym: str, tf: int, date, as_of, need: int = 24):
     """CONTINUOUS tf-min OHLC ending at as_of — stitches native 5-min history (PRIOR days) +
     today's LIVE 5-min session, resampled to tf by integer-chunking WITHIN each day (session-
     anchored to 09:15, cross-day continuous). This is what lets the 20-bar Kaufman ER warm on
-    30m/60m, which a single-day build_series never can. None if no history."""
+    30m/60m, which a single-day build_series never can. Prior days come from the historical
+    parquet; if that's MISSING/THIN, falls back to prior LIVE captures (self-sufficient VM).
+    None if no history at all."""
     hist = _hist_5min(sym)
     frames = []
     day = date or (as_of.date().isoformat() if as_of else None)
@@ -123,6 +165,19 @@ def _bars_continuous(sym: str, tf: int, date, as_of, need: int = 24):
         h = h.tail(want5)
         if len(h):
             frames.append(h[["ts", "open", "high", "low", "close"]])
+    # FALLBACK: historical missing/thin OR STALE → warm from prior LIVE captures. Stale check:
+    # if the newest historical prior-bar is >3 days before `day`, the 60m context would read
+    # weeks-old structure, so pull recent prior sessions from live captures and merge (dedup
+    # below keeps them). Makes the VM self-sufficient even as its historical store ages.
+    prior_have = sum(len(f) for f in frames)
+    stale = False
+    if day_start is not None and frames:
+        newest = max(f["ts"].max() for f in frames)
+        stale = (day_start - pd.Timestamp(newest)) > pd.Timedelta(days=3)
+    if day_start is not None and (prior_have < want5 or stale):
+        pld = _prior_live_days(sym, day, want5)
+        if pld is not None and len(pld):
+            frames.append(pld[pld["ts"] < day_start][["ts", "open", "high", "low", "close"]])
     try:
         ser = fc.build_series(sym, 5, date, as_of)
         if ser.get("has_data") and ser.get("ts"):
@@ -284,8 +339,11 @@ def _struct_full(sym: str, tf: int, date, as_of, lookback: int = _STRUCT_LB,
             "coil": coil, "pattern": pattern, "n": int(len(c)), "last": last}
 
 
-def _structure(sym: str, tf: int, date, as_of, lookback: int = 20) -> str:
-    """Structure label only (back-compat wrapper over _struct_full)."""
+def _structure(sym: str, tf: int, date, as_of, lookback: int = _STRUCT_LB) -> str:
+    """Structure label only (back-compat wrapper over _struct_full). AUDIT-FIX 2026-07-27:
+    default was a HARDCODED 20 — under the env A/B toggle (40/60) the htf15/htf60 display
+    labels in build_row would stay 20-bar while the rest of the board read 40-bar. Now tracks
+    _STRUCT_LB so the whole board is coherent when the config flips."""
     return _struct_full(sym, tf, date, as_of, lookback)["struct"]
 
 
