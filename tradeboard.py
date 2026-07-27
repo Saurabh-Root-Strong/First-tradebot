@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import os
 import sys
 
 import numpy as np
@@ -53,6 +54,19 @@ import paper_fade_logger as pf
 _FADE_LIQUID = {"NIFTY50", "NIFTYBANK"}
 _MKT_CLOSE = datetime.time(15, 30)   # NSE session close — post-close nothing is genuinely open
 _STALE_MIN = 15                      # option-chain context older than this = stale/greyed
+
+# ── LOOKBACK WINDOWS — env-toggleable A/B (2026-07-26). Two candidate configs:
+#   BASELINE 20/40 (DEFAULT, live) — best on the 29-day LIVE option ledger (win 48%, idx -0.012R,
+#     ex-jack +6,310) vs set C's (39%, -0.077R, -4,358) on the SAME days.
+#   SET C   40/60 — best on 2yr CLEAN candles index-level (+0.100R OOS 15m-1h) + sits out whipsaws
+#     (Friday 07-24: 1 trade vs baseline 7). But the 2yr gain did NOT confirm on the thin 29-day
+#     live sample (yellow flag — sample-size collision; 29 days can't separate them).
+# DECISION (user 2026-07-26): revert to 20/40 live; A/B set C forward, decide Fri evening on the
+# config with better LIVE accuracy. Flip without a code edit:
+#     $env:TRADEBOT_STRUCT_LB=40 ; $env:TRADEBOT_SL_WIN=60   (PowerShell) then restart dashboard.
+# Fair test = grade BOTH on the same captured days: python compare_lookback.py
+_STRUCT_LB = int(os.environ.get("TRADEBOT_STRUCT_LB", "20"))   # structure + ER lookback
+_SL_WIN = int(os.environ.get("TRADEBOT_SL_WIN", "40"))         # HTF pivot window for the SL
 
 # ── SCOUT BEHAVIOURAL GUARDS (25-day forensics 2026-07-17: every bad day = LOW-RANGE tape +
 # SERIAL re-fires of the same failed idea; e.g. 06-22 seven range-top breaks on a 0.39% day
@@ -195,7 +209,7 @@ def _candle_pattern(o, h, l, c, same_session: bool = True) -> str:
     return "bull-body" if bull else "bear-body"
 
 
-def _struct_full(sym: str, tf: int, date, as_of, lookback: int = 20,
+def _struct_full(sym: str, tf: int, date, as_of, lookback: int = _STRUCT_LB,
                  drop_forming: bool = True) -> dict:
     """Structure label + the CONTEXT a synthesis needs: the TF range hi/lo (the box price
     lives in), ER, coil tightness (recent range / ATR), n closed bars, last close. Uses a
@@ -593,7 +607,13 @@ _TAG_RANK = {
 }
 
 
-def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int = 6) -> dict:
+def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int = 6,
+                    sl_mode: str = "htf") -> dict:
+    """sl_mode: 'htf' (default, graded baseline — stop at the 60m structure pivot) ·
+    'ltf' (stop at the ENTRY-TF 15m swing — tighter, chartist-proper geometry) ·
+    'ltf_trail' (15m swing stop that RATCHETS behind each new completed favorable swing —
+    the dynamic structure-trailing stop; never loosens). Non-default modes are GRADED
+    experiments until they beat the baseline on the 25-day honest re-grade."""
     """TradeBoard SCOUT day-ledger — the level-trades the scout fired TODAY, graded (target/
     SL/timeout on the index) for closed ones, live status for open. Mirrors the Charts scout
     ledger. Level trade (index), 2yr-graded ~breakeven (MIDCAP marginally +, backtest_scout_pa)
@@ -603,8 +623,8 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
     SUP = 0                                                    # guard-suppressed fires (all idx)
     d0s = (as_of.date().isoformat() if as_of else date)
     for sym in INDEX_SYMBOLS:
-        contL = _bars_continuous(sym, ltf_tf, date, as_of, need=60)
-        contH = _bars_continuous(sym, htf_tf, date, as_of, need=45)
+        contL = _bars_continuous(sym, ltf_tf, date, as_of, need=max(60, _STRUCT_LB + 8))
+        contH = _bars_continuous(sym, htf_tf, date, as_of, need=_SL_WIN + 20)  # SL-pivot + warmup
         if contL is None or contH is None or len(contL) < 26 or len(contH) < 26:
             continue
         d0 = (as_of.date() if as_of else None)
@@ -652,6 +672,7 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
         open_until = -1                                        # serialize: ONE position per index
         strikes: dict = {}                                     # (tag, side) -> fires today
         n_suppressed = 0
+        _tf = pd.Timedelta(minutes=ltf_tf)                     # one LTF bar (close = start + _tf)
         for i in today_idx:
             if i <= open_until:                                # a trade is still live — no new fire
                 continue
@@ -701,7 +722,8 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
             if strikes.get(skey, 0) >= _MAX_STRIKES:
                 n_suppressed += 1
                 continue
-            his, los = _pivots(Hh_t[max(0, hj - 40):hj + 1], Hl_t[max(0, hj - 40):hj + 1], w=3)
+            his, los = _pivots(Hh_t[max(0, hj - _SL_WIN):hj + 1],
+                               Hl_t[max(0, hj - _SL_WIN):hj + 1], w=3)
             atr = float(np.mean(Hh_t[hj - 13:hj + 1] - Hl_t[hj - 13:hj + 1]))
             md = 0.25 * atr
             res = min((x for x in his if x > spot + md), default=spot + atr)
@@ -712,6 +734,17 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
             # band edge) / SL hit (structure stop) / flipped (LTF structure reverses) / timed
             # out (90m) / squared off at the bell. target = band edge, stop = structure S/R.
             target, stop = (band_hi, sup) if lean == "UP" else (band_lo, res)
+            # ── SL-MODE experiments: the ENTRY-TF (15m) structure stop — chartist-proper
+            # geometry (a 15m entry wearing a 60m stop = R:R < 1, observed live). ─────────
+            if sl_mode in ("ltf", "ltf_trail"):
+                atr_l = float(np.mean(Lh[i - 13:i + 1] - Ll[i - 13:i + 1]))
+                his_l, los_l = _pivots(Lh[max(0, i - 30):i + 1], Ll[max(0, i - 30):i + 1], w=2)
+                if lean == "UP":
+                    stop = max((x for x in los_l if x < entry - 0.25 * atr_l),
+                               default=entry - atr_l)
+                else:
+                    stop = min((x for x in his_l if x > entry + 0.25 * atr_l),
+                               default=entry + atr_l)
             if abs(entry - stop) < 1e-6:
                 continue
             hb = min(i + hold, len(Lc) - 1)                       # 90m hold (hold=6 x 15m)
@@ -727,7 +760,35 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
                         outcome, exitpx, exit_i = "SL hit", stop, j; break
                     if Ll[j] <= target:
                         outcome, exitpx, exit_i = "band ↓ lower", target, j; break
-                # FLIP — the LTF structure reverses against the position → exit at that close
+                # TRAILING (ltf_trail): after bar j COMPLETES, ratchet the stop behind the
+                # newest favorable 15m swing — tighten only, never loosen. Touch checks above
+                # still see the forming bar; the ratchet itself uses completed structure.
+                if sl_mode == "ltf_trail":
+                    _jc2 = pd.Timestamp(Lts[j]) + _tf
+                    _ok = True
+                    if as_of is not None:
+                        _n2 = pd.Timestamp(as_of).tz_localize(None) if pd.Timestamp(as_of).tz \
+                            else pd.Timestamp(as_of)
+                        _ok = _jc2 <= _n2
+                    if _ok:
+                        hs2, ls2 = _pivots(Lh[max(0, j - 30):j + 1], Ll[max(0, j - 30):j + 1], w=2)
+                        if lean == "UP":
+                            nw = max((x for x in ls2 if x < float(Lc[j])), default=None)
+                            if nw is not None and nw > stop:
+                                stop = nw
+                        else:
+                            nw = min((x for x in hs2 if x > float(Lc[j])), default=None)
+                            if nw is not None and nw < stop:
+                                stop = nw
+                # FLIP — the LTF structure reverses against the position → exit at that close.
+                # CLOSE-based read → COMPLETED bars only (a forming bar's structure repaints;
+                # SL/band above stay live on the forming bar because high/low are monotonic).
+                if as_of is not None:
+                    _jc = pd.Timestamp(Lts[j]) + _tf
+                    _nn = pd.Timestamp(as_of).tz_localize(None) if pd.Timestamp(as_of).tz \
+                        else pd.Timestamp(as_of)
+                    if _jc > _nn:
+                        continue
                 js = _struct_min(Lh, Ll, Lc, j)
                 if (lean == "UP" and js in _TREND_DN_S) or (lean == "DOWN" and js in _TREND_UP_S):
                     outcome, exitpx, exit_i = "flipped · reversed out", float(Lc[j]), j; break
@@ -747,6 +808,21 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
             _tf = pd.Timedelta(minutes=ltf_tf)
             entry_ts = pd.Timestamp(Lts[i]) + _tf             # entry = setup bar CLOSE
             if entry_ts.time() >= _MKT_CLOSE:                  # can't enter at/after the bell
+                continue
+            # CLOSED-BAR DOCTRINE (fix 2026-07-20): never FIRE on the forming bar — structure
+            # on a partial close REPAINTS (a trade could appear mid-bar and vanish if the bar
+            # retreats). Touch-exits below still scan the forming bar (high/low are monotonic
+            # — a pierce can't un-pierce), so SL/band detection stays ~real-time.
+            if as_of is not None:
+                _now_n = pd.Timestamp(as_of).tz_localize(None) if pd.Timestamp(as_of).tz \
+                    else pd.Timestamp(as_of)
+                if entry_ts > _now_n:
+                    continue
+            # OPENING WARMUP (standing rule, same as intraday_scout._OPEN_SETTLE): no trigger
+            # before 09:35 — the first 20min are auction noise / the opening range forming;
+            # the continuous-bar warmup is satisfied by PRIOR days so without this gate a gap
+            # day could fire on the 09:15-09:30 bar itself (observed live 2026-07-20).
+            if entry_ts.time() < scout._OPEN_SETTLE:
                 continue
             e_prem = _prem(entry_ts, atm, side)                # premium AT ENTRY (bar close)
             r = {"sym": sym, "label": LABELS.get(sym, sym), "lean": lean, "side": side,
@@ -795,7 +871,7 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
             "wins": wins, "avg_r": avg_r, "avg_pct": avg_pct, "suppressed": SUP}
 
 
-def _struct_min(h, l, c, i, lb=20):
+def _struct_min(h, l, c, i, lb=_STRUCT_LB):
     """Minimal structure label at bar i on arrays (for the ledger/backtest)."""
     if i < lb:
         return "n/a"
@@ -893,18 +969,21 @@ def _scout_levels(sym, ltf_tf, htf_tf, tag, htf, ltf, spot, date, as_of) -> dict
         lean = "NONE"
     up, dn = lean == "UP", lean == "DOWN"
     side = "CE" if up else "PE" if dn else "—"
-    # ── entry / target / SL on the LEVELS (structure), per setup family ──
+    # ── entry / target / SL — MIRRORS THE GRADED LEDGER (audit 2026-07-20: the display was
+    # advertising target=resistance-pivot R:R while the graded ruleset targets the BAND edge;
+    # a shown R:R 3.85 vs graded 1.77 misleads the decision). target = band edge in the trade
+    # direction, SL = structure pivot — exactly what the ledger books. ────────────────────
     entry = target = sl = None
     if "CONTINUATION" in tag or "BREAK (attempt)" in tag:
         if up:
-            entry, target, sl = spot, (res or band_hi), (sup or band_lo)
+            entry, target, sl = spot, band_hi, (sup or band_lo)
         elif dn:
-            entry, target, sl = spot, (sup or band_lo), (res or band_hi)
+            entry, target, sl = spot, band_lo, (res or band_hi)
     elif "PULLBACK" in tag:
         if up:                                    # buy the dip toward support
-            entry, target, sl = (sup or band_lo), (res or band_hi), round((sup or band_lo) * 0.997, 1)
+            entry, target, sl = (sup or band_lo), band_hi, round((sup or band_lo) * 0.997, 1)
         elif dn:
-            entry, target, sl = (res or band_hi), (sup or band_lo), round((res or band_hi) * 1.003, 1)
+            entry, target, sl = (res or band_hi), band_lo, round((res or band_hi) * 1.003, 1)
     # RANGE / SQUEEZE / TRAP → no directional entry (wait / fade the band, handled in text)
     rr = None
     if entry and target and sl and abs(entry - sl) > 0:
@@ -950,6 +1029,66 @@ def _scout_levels(sym, ltf_tf, htf_tf, tag, htf, ltf, spot, date, as_of) -> dict
         "target": round(target, 1) if target else None,
         "sl": round(sl, 1) if sl else None, "rr": rr,
     }
+
+
+def day_regime(date, as_of, sym: str = "NSE:NIFTY50-INDEX") -> dict:
+    """DAY-TYPE chip (display only). Kaufman ER on today's NIFTY 15m closes — morning (by
+    11:00, causal) and session-to-date — plus range%. MEASURED 28d: every combo bleeds on
+    CHOP/MID days; ALL the money is on TREND days. Morning ER does NOT forecast the day
+    (corr +0.06, 3/13 AM-trend days stayed trend) — so this chip is a STATE reading, never a
+    forecast and never an auto-gate."""
+    try:
+        c = _bars_continuous(sym, 15, date, as_of, need=120)   # ~5 prior sessions for the vol base
+        if c is None or not len(c):
+            return {}
+        d0 = (datetime.date.fromisoformat(date) if isinstance(date, str)
+              else (date or pd.Timestamp(as_of).date()))
+        ts = pd.to_datetime(c["ts"])
+        g = c[(ts.dt.date == d0).values]
+        if len(g) < 1:
+            return {}
+        if len(g) < 3:                       # 1-2 bars: show WARMING, not a blank slot
+            _o = float(g["open"].iloc[0])
+            return {"label": "WARMING", "bars": len(g),
+                    "rng": round((float(g["high"].max()) - float(g["low"].min())) / _o * 100, 2)
+                    if _o else 0.0}
+        # WARM-UP GUARD (audit 2026-07-23): ER on 3 closes is ~1.0 BY CONSTRUCTION (bias ≈
+        # 1/sqrt(n)) — the raw chip screamed "TREND · EXPANDING x2" every single morning, i.e.
+        # it was most wrong exactly when it's most read. No label until 6 bars (~10:45).
+        n_today = len(g)
+        seg = g["close"].to_numpy(float)
+        er = abs(seg[-1] - seg[0]) / max(np.abs(np.diff(seg)).sum(), 1e-9)
+        if n_today < 6:
+            return {"label": "WARMING", "bars": n_today,
+                    "rng": round((float(g["high"].max()) - float(g["low"].min()))
+                                 / float(g["open"].iloc[0]) * 100, 2)
+                    if float(g["open"].iloc[0]) else 0.0}
+        am = g[pd.to_datetime(g["ts"]).dt.time <= datetime.time(11, 0)]
+        s2 = am["close"].to_numpy(float)
+        er_am = (abs(s2[-1] - s2[0]) / max(np.abs(np.diff(s2)).sum(), 1e-9)
+                 if len(s2) > 2 else None)
+        o = float(g["open"].iloc[0])
+        rng = (float(g["high"].max()) - float(g["low"].min())) / o * 100 if o else 0.0
+        lab = "TREND" if er >= 0.35 else ("CHOP" if er < 0.20 else "MID")
+        # ── VOL STATE: today's live bar-size vs the PRIOR sessions' baseline (ATR14 on the
+        # same 15m grid). Ratio > 1.25 = expansion (bars getting bigger — stops/targets are
+        # auto-widening with it), < 0.80 = compression (coil/dead tape). Display only. ────
+        rows_today = (ts.dt.date == d0).values
+        prior = c[~rows_today]
+        vr = vnow = None
+        if len(g) >= 8 and len(prior) >= 20:     # >=8 bars: ATR14-ish needs real sample
+            vnow = float(np.mean((g["high"] - g["low"]).to_numpy(float)[-14:]))
+            base = float(np.mean((prior["high"] - prior["low"]).to_numpy(float)[-70:]))
+            if base > 0:
+                vr = vnow / base
+        vlab = ("EXPANDING" if vr and vr >= 1.25 else
+                "COMPRESSING" if vr and vr < 0.80 else "NORMAL" if vr else None)
+        return {"er": round(er, 2), "er_am": round(er_am, 2) if er_am is not None else None,
+                "rng": round(rng, 2), "label": lab, "bars": n_today,
+                "vol_ratio": round(vr, 2) if vr else None, "vol_label": vlab,
+                "atr_pts": round(vnow, 1) if vnow else None}
+    except Exception:
+        return {}
 
 
 def scout_scan(date, as_of, ltf_tf: int, htf_tf: int) -> list[dict]:

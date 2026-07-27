@@ -1660,6 +1660,8 @@ app.layout = dbc.Container([
                         {"label": "5m → 15m", "value": "5-15"},
                         {"label": "10m → 30m", "value": "10-30"},
                         {"label": "15m → 1h", "value": "15-60"}]),
+                    html.Div(id="tb-dayreg", style={"marginLeft": "14px",
+                             "fontSize": "0.62rem"}),
                     html.Div(id="tb-ledger-badge", style={"marginLeft": "auto",
                              "fontSize": "0.62rem"}),
                     html.Div("📋 SCOUT LEDGER", id="tb-ledger-btn", n_clicks=0, style={
@@ -4029,9 +4031,13 @@ def _fill_ledger(sel, combo, vdate, _tick):
     opt_rows = [r for r in closed if r.get("opt_rs") is not None]
     opt_total = sum(r["opt_rs"] for r in opt_rows)
     opt_wins = sum(1 for r in opt_rows if r["opt_rs"] > 0)
-    opt_txt = (f"   ·   OPTION ₹ P&L: {opt_total:+,} ({opt_wins}/{len(opt_rows)} win, "
-               f"chain-fresh rows)" if opt_rows else
-               "   ·   OPTION premiums: n/a (chain not fresh — dies ~11am)")
+    if opt_rows:
+        opt_txt = (f"   ·   OPTION ₹ P&L: {opt_total:+,} ({opt_wins}/{len(opt_rows)} win, "
+                   f"chain-fresh rows)")
+    elif closed:
+        opt_txt = "   ·   OPTION premiums: n/a on closed rows (chain stale at their exits)"
+    else:
+        opt_txt = "   ·   no closed trades yet — premiums live on the open rows"
     tc = "#22c55e" if opt_total > 0 else "#f87171" if opt_total < 0 else "#94a3b8"
     _sup = L.get("suppressed", 0)
     scoreboard = html.Div([
@@ -4061,7 +4067,7 @@ def _fill_ledger(sel, combo, vdate, _tick):
     return body_div, badge
 
 
-@app.callback(Output("tb-scout", "children"),
+@app.callback(Output("tb-scout", "children"), Output("tb-dayreg", "children"),
               Input("sel-sym", "data"), Input("tb-scout-combo", "value"),
               Input("news-date", "data"), Input("tb-refresh", "n_intervals"))
 def _fill_scout(sel, combo, vdate, _tick):
@@ -4077,7 +4083,7 @@ def _fill_scout(sel, combo, vdate, _tick):
     try:
         rows = tb.scout_scan(vdt, now, ltf_tf, htf_tf)
     except Exception as exc:
-        return html.Div(f"scout error: {exc}", style={"color": "#f87171"})
+        return html.Div(f"scout error: {exc}", style={"color": "#f87171"}), ""
     th = lambda t: html.Th(t, style={"padding": "3px 8px", "color": "#64748b",
                                      "fontSize": "0.56rem", "fontWeight": "800",
                                      "textAlign": "left"})
@@ -4148,6 +4154,39 @@ def _fill_scout(sel, combo, vdate, _tick):
                 *_lsr,
                 html.Span(" | ", style={"color": "#334155"}), *trade, *_wall,
             ], colSpan=5, style={"padding": "1px 8px 5px 8px"})]))
+    # DAY-TYPE chip — state reading, never a forecast (morning ER does NOT predict the day:
+    # corr +0.06 measured over 28 days). MEASURED: all combos bleed on CHOP/MID days; every
+    # rupee of the honest 28-day grade came from TREND days.
+    reg = tb.day_regime(vdt, now) or {}
+    chip = ""
+    if reg.get("label") == "WARMING":
+        chip = html.Span([
+            html.Span("DAY WARMING", style={"color": "#0a0f1a", "background": "#64748b",
+                      "borderRadius": "5px", "padding": "2px 8px", "fontWeight": "800"}),
+            html.Span(f"  {reg.get('bars', 0)}/6 bars · rng {reg.get('rng')}% — day-type needs "
+                      f"~6 bars (till ~10:45); an early ER reads ~1.0 by construction",
+                      style={"color": "#64748b", "fontStyle": "italic"})])
+        reg = {}
+    if reg:
+        _c = {"TREND": "#22c55e", "MID": "#fbbf24", "CHOP": "#f87171"}[reg["label"]]
+        _hint = {"TREND": "the only day-type that paid (28d)",
+                 "MID": "all combos bled here (28d)",
+                 "CHOP": "all combos bled here (28d) — smallest size / stand aside"}[reg["label"]]
+        _vl = reg.get("vol_label")
+        _vc = {"EXPANDING": "#f472b6", "COMPRESSING": "#38bdf8",
+               "NORMAL": "#94a3b8"}.get(_vl, "#94a3b8")
+        _varrow = {"EXPANDING": "↑", "COMPRESSING": "↓", "NORMAL": "="}.get(_vl, "")
+        chip = html.Span([
+            html.Span(f"DAY {reg['label']}", style={"color": "#0a0f1a", "background": _c,
+                      "borderRadius": "5px", "padding": "2px 8px", "fontWeight": "800"}),
+            html.Span(f"  ER {reg['er']}" + (f" · AM {reg['er_am']}" if reg.get("er_am") else "")
+                      + f" · rng {reg['rng']}% · {reg.get('bars', 0)} bars",
+                      style={"color": "#64748b", "fontStyle": "italic"}),
+            (html.Span(f"  VOL {_varrow}{_vl} ×{reg['vol_ratio']}"
+                       f" (bar {reg['atr_pts']}pt)",
+                       style={"color": _vc, "fontWeight": "700"}) if _vl else ""),
+            html.Span(f"  {_hint}", style={"color": "#64748b", "fontStyle": "italic"}),
+        ])
     return html.Div([
         html.Table([html.Thead(header), html.Tbody(body)],
                    style={"width": "100%", "borderCollapse": "collapse"}),
@@ -4158,7 +4197,7 @@ def _fill_scout(sel, combo, vdate, _tick):
                  style={"color": "#64748b", "fontSize": "0.56rem", "fontStyle": "italic",
                         "marginTop": "4px"}),
     ], style={"background": "#0a1220", "borderRadius": "8px", "padding": "8px 12px",
-              "margin": "4px 0 8px"})
+              "margin": "4px 0 8px"}), chip
 
 
 @app.callback(
