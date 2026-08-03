@@ -258,7 +258,11 @@ def main() -> None:
     try:
         import backtest_band_horizon as bh
         import calibration_engine as cal
-        bh.run(30, [15, 60])              # regenerate data/calibration/band_coverage.json
+        # Measure every horizon the UI can ask for. Was [15, 60] only, so a 5m or 30m
+        # selection silently borrowed the 15m cell and printed it as verified (n=612).
+        # 240m is deliberately absent: LAST_PRED is 15:00, so a 4h window never resolves
+        # inside the session and the cell would be permanently empty.
+        bh.run(30, [5, 15, 30, 60, 120])  # regenerate data/calibration/band_coverage.json
         cal.learn()                       # shrink-recalibrate band_multipliers.json
     except Exception as exc:
         print(f"        skipped: {exc}")

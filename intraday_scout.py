@@ -891,7 +891,10 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         if fwd.get("target") is not None:
             fwd["target"] = (round(spot + half, 1) if fwd["pdir"] == "UP"
                              else round(spot - half, 1) if fwd["pdir"] == "DOWN" else None)
-    bcov = hf.band_coverage(sym, horizon_min)          # HONEST measured coverage for this cell
+    # HONEST measured coverage for this cell — the DEPLOYED band (post L4/regime/tod),
+    # which is what the multipliers below actually draw. The ledger's base-band number
+    # ran ~6pp higher and used to be what the board printed.
+    bcov = hf.band_coverage(sym, horizon_min)
     verify = _verify(sym, date, as_of, horizon_min, spot,
                      fwd["pdir"], fwd["pred_lo"], fwd["pred_hi"], atm=atm)
     # Honor the poller anchor only when its side matches the live leg — a genuine flip
@@ -925,6 +928,10 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         "pred_lo": fwd["pred_lo"], "pred_hi": fwd["pred_hi"],
         "pred_move_pct": fwd["move_pct"], "verify": verify,
         "band_cover": bcov["cover"], "band_n": bcov["n"], "band_conf": bcov["conf"],
+        # non-None => this coverage was measured at a DIFFERENT horizon and borrowed
+        # (the ledger only carries the horizons eod_sync sweeps). The UI must not call
+        # a borrowed cell "measured at this horizon".
+        "band_borrowed": bcov.get("borrowed"),
     }
 
 

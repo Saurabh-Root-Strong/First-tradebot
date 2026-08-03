@@ -33,8 +33,10 @@ import pandas as pd
 
 from core.constants import IST, INDEX_SYMBOLS, LABELS, LIVE_DIR, DATA_DIR
 from core.mirror_io import read_mirror
+import footprint_chart as fcx           # 5-min series for the mood read (deployed band)
 import hour_forecast as hf
 import intraday_scout as scout          # deployed band exponent (_BAND_HURST) — keep in sync
+import regime_classifier as rc          # regime width multiplier (deployed band)
 
 SESSION_OPEN = dt.time(9, 15)
 FIRST_PRED = dt.time(9, 45)          # need ~30m of ticks for sigma1
@@ -68,9 +70,27 @@ def pred_times(day: str) -> list[dt.datetime]:
     return out
 
 
+def deployed_width_factor(sym: str, H_eff: int, as_of: dt.datetime, mood) -> float:
+    """The three multipliers intraday_scout applies ON TOP of the base band, in the same
+    order: L4 learned x regime-conditional x time-of-day. Kept here (not imported) so this
+    file stays the independent measurement of what scan_index actually draws."""
+    return (hf.band_multiplier(sym, H_eff)
+            * rc.band_width_mult(mood)
+            * hf.tod_width_mult(as_of, H_eff))
+
+
 def grade(ticks: pd.DataFrame, t: dt.datetime, H: int, spot: float,
-          band_pct_60: float) -> dict | None:
-    """Grade one (t, horizon) band against actual forward ticks. None if unresolved."""
+          band_pct_60: float, sym: str | None = None, mood=None) -> dict | None:
+    """Grade one (t, horizon) band against actual forward ticks. None if unresolved.
+
+    Two bands are graded from the same forward window:
+      base     — hour_forecast's raw band, horizon-scaled. This is what the L4 loop
+                 (calibration_engine) corrects against, so it must keep being reported.
+      deployed — base x L4 x regime x tod = the band actually DRAWN on the board. The
+                 UI used to print the BASE coverage next to the DEPLOYED band, which
+                 overstated it by ~6pp (measured 79.4% vs 73.4% at 60m over 30 days).
+                 Needs sym+mood; omitted -> deployed is None and only base is graded.
+    """
     band_pct = band_pct_60 * (H / 60.0) ** scout._BAND_HURST   # deployed horizon scaling
     half = spot * band_pct / 100.0
     lo, hi = spot - half, spot + half
@@ -83,12 +103,24 @@ def grade(ticks: pd.DataFrame, t: dt.datetime, H: int, spot: float,
         return None
     end_px = float(fwd.iloc[-1]["ltp"])
     hi_px, lo_px = float(fwd["ltp"].max()), float(fwd["ltp"].min())
-    return {
+    out = {
         "endpoint": bool(lo <= end_px <= hi),
         "envelope": bool(hi_px <= hi and lo_px >= lo),
         "band_pct": band_pct,
         "width_pts": 2 * half,
+        "deployed": None,
+        "deployed_env": None,
     }
+    if sym is not None and mood is not None:
+        # session_horizon clips near the close exactly as scan_index does, so the
+        # deployed band is reproduced for the window the board really showed.
+        H_eff = hf.session_horizon(H, t)
+        d_half = (spot * (band_pct_60 * (H_eff / 60.0) ** scout._BAND_HURST) / 100.0
+                  * deployed_width_factor(sym, H_eff, t, mood))
+        d_lo, d_hi = spot - d_half, spot + d_half
+        out["deployed"] = bool(d_lo <= end_px <= d_hi)
+        out["deployed_env"] = bool(hi_px <= d_hi and lo_px >= d_lo)
+    return out
 
 
 def run(n_days: int, horizons: list[int]) -> None:
@@ -102,8 +134,9 @@ def run(n_days: int, horizons: list[int]) -> None:
     print("=" * 90)
 
     # accumulators: per horizon (all indices) and per (horizon, index)
-    agg = {H: {"end": [], "env": [], "w": []} for H in horizons}
-    per_idx = {H: {s: {"end": [], "env": []} for s in INDEX_SYMBOLS} for H in horizons}
+    agg = {H: {"end": [], "env": [], "w": [], "dep": []} for H in horizons}
+    per_idx = {H: {s: {"end": [], "env": [], "dep": []} for s in INDEX_SYMBOLS}
+               for H in horizons}
 
     for day in days:
         # preload each index's full-day ticks once (answer key)
@@ -123,8 +156,15 @@ def run(n_days: int, horizons: list[int]) -> None:
                 if not fc.get("has_data") or fc.get("exp_move_pct") is None:
                     continue
                 spot, bp60 = fc["spot"], fc["exp_move_pct"]
+                # mood drives the regime width multiplier; read off a FIXED 5-min series
+                # (same pin as intraday_scout — the regime must not follow the chart tf).
+                try:
+                    mood = rc.classify_from_bars(fcx.build_series(s, 5, day, t),
+                                                 n=scout._MOOD_WIN)
+                except Exception:
+                    mood = None
                 for H in horizons:
-                    g = grade(tk[s], t, H, spot, bp60)
+                    g = grade(tk[s], t, H, spot, bp60, sym=s, mood=mood)
                     if g is None:
                         continue
                     agg[H]["end"].append(g["endpoint"])
@@ -132,23 +172,28 @@ def run(n_days: int, horizons: list[int]) -> None:
                     agg[H]["w"].append(g["band_pct"])
                     per_idx[H][s]["end"].append(g["endpoint"])
                     per_idx[H][s]["env"].append(g["envelope"])
+                    if g["deployed"] is not None:
+                        agg[H]["dep"].append(g["deployed"])
+                        per_idx[H][s]["dep"].append(g["deployed"])
 
     def pct(x):
         return f"{100 * np.mean(x):5.1f}%" if x else "   n/a"
 
-    print(f"\n  {'horizon':>8}  {'N':>5}  {'endpoint':>9}  {'envelope':>9}  {'avg band ±%':>12}")
-    print("  " + "-" * 56)
+    print(f"\n  {'horizon':>8}  {'N':>5}  {'endpoint':>9}  {'DEPLOYED':>9}  {'envelope':>9}"
+          f"  {'avg band ±%':>12}")
+    print("  " + "-" * 68)
     for H in horizons:
         a = agg[H]
         wid = f"±{np.mean(a['w']):.3f}%" if a["w"] else "n/a"
-        print(f"  {H:>6}m  {len(a['end']):>5}  {pct(a['end']):>9}  {pct(a['env']):>9}  {wid:>12}")
+        print(f"  {H:>6}m  {len(a['end']):>5}  {pct(a['end']):>9}  {pct(a['dep']):>9}"
+              f"  {pct(a['env']):>9}  {wid:>12}")
 
-    print(f"\n  per-index endpoint coverage")
+    print(f"\n  per-index DEPLOYED endpoint coverage (the band actually drawn)")
     print(f"  {'index':12}" + "".join(f"{str(H)+'m':>16}" for H in horizons))
     for s in INDEX_SYMBOLS:
         cells = ""
         for H in horizons:
-            e = per_idx[H][s]["end"]
+            e = per_idx[H][s]["dep"] or per_idx[H][s]["end"]
             cells += f"{pct(e)+' (n='+str(len(e))+')':>16}"
         print(f"  {LABELS.get(s, s):12}{cells}")
 
@@ -166,14 +211,19 @@ def run(n_days: int, horizons: list[int]) -> None:
         a = agg[H]
         led["overall"][str(H)] = {"n": len(a["end"]),
                                   "endpoint": round(float(np.mean(a["end"])), 4) if a["end"] else None,
+                                  "deployed": round(float(np.mean(a["dep"])), 4) if a["dep"] else None,
                                   "envelope": round(float(np.mean(a["env"])), 4) if a["env"] else None,
                                   "band_pct": round(float(np.mean(a["w"])), 4) if a["w"] else None}
     for s in INDEX_SYMBOLS:
         led["by_index"][s] = {}
         for H in horizons:
-            e = per_idx[H][s]["end"]
-            led["by_index"][s][str(H)] = {"n": len(e),
-                "endpoint": round(float(np.mean(e)), 4) if e else None}
+            e, d = per_idx[H][s]["end"], per_idx[H][s]["dep"]
+            # `endpoint` = BASE band — calibration_engine corrects against it, so the key
+            # keeps its meaning. `deployed` = the drawn band, what the UI must show.
+            led["by_index"][s][str(H)] = {
+                "n": len(e),
+                "endpoint": round(float(np.mean(e)), 4) if e else None,
+                "deployed": round(float(np.mean(d)), 4) if d else None}
     outp = DATA_DIR / "calibration"
     outp.mkdir(parents=True, exist_ok=True)
     (outp / "band_coverage.json").write_text(json.dumps(led, indent=2))

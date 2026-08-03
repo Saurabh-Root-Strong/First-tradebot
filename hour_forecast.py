@@ -177,9 +177,26 @@ _LEDGER = DATA_DIR / "calibration" / "band_coverage.json"
 _COV_CACHE: dict = {}
 
 
+# A borrowed cell within this ratio of the requested horizon is reported as-if measured.
+# Justified empirically: a 30-day / n~2,440-per-cell sweep across 5/10/15/30/60/120m found
+# coverage FLAT with horizon (deployed 72.9-73.9%), so the (H/60)^Hurst scaling holds and a
+# neighbouring cell's number is right. Outside the ratio the number is still returned but
+# conf is capped at 'soft' and 'borrowed' names the cell — no "verified at this horizon"
+# claim for a horizon nobody measured (the old code silently returned conf='ok' for 240m).
+_COV_H_TOL = 2.5
+
+
 def band_coverage(sym: str, horizon_min: int) -> dict:
-    """{'cover': pct|None, 'n': int, 'conf': tag} for this (index, horizon) from the ledger.
-    Nearest available horizon if the exact one isn't logged. conf: ok/soft/low/thin/none."""
+    """{'cover', 'n', 'conf', 'borrowed'} for this (index, horizon) from the ledger.
+
+    `cover` is the DEPLOYED band's coverage — base x L4 x regime x tod, i.e. the band the
+    board actually draws — falling back to the base band only for ledgers written before
+    the deployed column existed. Showing the BASE number (which is what this used to do)
+    overstated the drawn band by ~6pp: 79.4% base vs 73.4% deployed at 60m over 30 days,
+    because calibration_engine shrinks toward TARGET_COV=0.68 AFTER the ledger is measured.
+
+    Nearest available horizon if the exact one isn't logged. conf: ok/soft/low/thin/none.
+    """
     try:
         mt = _LEDGER.stat().st_mtime_ns
     except OSError:
@@ -194,11 +211,15 @@ def band_coverage(sym: str, horizon_min: int) -> dict:
         _COV_CACHE.clear(); _COV_CACHE[mt] = led
     cells = (led.get("by_index", {}) or {}).get(sym, {})
     if not cells:
-        return {"cover": None, "n": 0, "conf": "none"}
-    key = str(horizon_min) if str(horizon_min) in cells else \
+        return {"cover": None, "n": 0, "conf": "none", "borrowed": None}
+    exact = str(horizon_min) in cells
+    key = str(horizon_min) if exact else \
         min(cells, key=lambda k: abs(int(k) - horizon_min))
     c = cells.get(key, {}) or {}
-    cover, n = c.get("endpoint"), int(c.get("n", 0))
+    # deployed = the drawn band; endpoint = the base band (pre-L4/regime/tod) that
+    # calibration_engine corrects against. Prefer deployed; fall back for old ledgers.
+    cover = c.get("deployed") if c.get("deployed") is not None else c.get("endpoint")
+    n = int(c.get("n", 0))
     if cover is None or n < 20:
         conf = "thin"
     elif cover >= 0.66:
@@ -207,7 +228,13 @@ def band_coverage(sym: str, horizon_min: int) -> dict:
         conf = "soft"
     else:
         conf = "low"
-    return {"cover": cover, "n": n, "conf": conf}
+    borrowed = None
+    if not exact:
+        borrowed = int(key)
+        ratio = max(horizon_min, borrowed) / max(1, min(horizon_min, borrowed))
+        if ratio > _COV_H_TOL and conf == "ok":
+            conf = "soft"          # number is plausible, the EVIDENCE is not at this H
+    return {"cover": cover, "n": n, "conf": conf, "borrowed": borrowed}
 
 
 # ── TIME-OF-DAY band width — the intraday-vol U-shape correction ──────────────────
