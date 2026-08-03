@@ -68,6 +68,18 @@ _STALE_MIN = 15                      # option-chain context older than this = st
 _STRUCT_LB = int(os.environ.get("TRADEBOT_STRUCT_LB", "20"))   # structure + ER lookback
 _SL_WIN = int(os.environ.get("TRADEBOT_SL_WIN", "40"))         # HTF pivot window for the SL
 
+# ── GRANDPARENT (3rd) TIMEFRAME — the frame above the confirm frame. OPT-IN filter only.
+# MEASURED 2yr, lookahead-corrected (coarse bar truncated to the decision instant):
+#     5m-15m  + GP 30m : −0.009R vs −0.007R baseline  → adds NOTHING
+#     10m-30m + GP 1h  : −0.001R vs −0.001R baseline  → adds NOTHING
+#     15m-1h  + GP 4h  : +0.045R [+0.01,+0.09] n=709 vs +0.013R baseline → the ONE lift,
+#                        but win% DROPS 26.6→24.5 (fewer, bigger winners) and +0.045R is still
+#                        far under the ~0.2R option cost floor.
+# So it is a SELECTIVITY dial, not an edge: it keeps only setups whose grandparent frame is
+# actively trending your way (it is NOT a conflict-veto — barely any trade conflicts; most
+# baseline fires happen while the GP frame is merely RANGE/CONSOLIDATION).
+_GP_OF = {15: 30, 30: 60, 60: 240}
+
 # ── SCOUT BEHAVIOURAL GUARDS (25-day forensics 2026-07-17: every bad day = LOW-RANGE tape +
 # SERIAL re-fires of the same failed idea; e.g. 06-22 seven range-top breaks on a 0.39% day
 # = −9.2k). Thresholds IN-SAMPLE-TUNED on those 25 days (raw +81k → guarded +103k, trades
@@ -666,7 +678,7 @@ _TAG_RANK = {
 
 
 def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int = 6,
-                    sl_mode: str = "htf") -> dict:
+                    sl_mode: str = "htf", gp_only: bool = False) -> dict:
     """sl_mode: 'htf' (default, graded baseline — stop at the 60m structure pivot) ·
     'ltf' (stop at the ENTRY-TF 15m swing — tighter, chartist-proper geometry) ·
     'ltf_trail' (15m swing stop that RATCHETS behind each new completed favorable swing —
@@ -685,6 +697,12 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
         contH = _bars_continuous(sym, htf_tf, date, as_of, need=_SL_WIN + 20)  # SL-pivot + warmup
         if contL is None or contH is None or len(contL) < 26 or len(contH) < 26:
             continue
+        # GRANDPARENT series (opt-in filter only; fetched lazily so the default path is unchanged)
+        contG = None
+        if gp_only and _GP_OF.get(htf_tf):
+            contG = _bars_continuous(sym, _GP_OF[htf_tf], date, as_of, need=_STRUCT_LB + 12)
+            if contG is None or len(contG) < _STRUCT_LB + 2:
+                continue                      # cannot verify the grandparent → do not fire
         d0 = (as_of.date() if as_of else None)
         lot = LOT_SIZES.get(sym, 1)
         # today's captured option chain (premiums only exist for captured days, and the chain
@@ -717,6 +735,10 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
         Lc = contL["close"].to_numpy(float); Lts = contL["ts"].to_numpy()
         Hh = contH["high"].to_numpy(float); Hl = contH["low"].to_numpy(float)
         Hc = contH["close"].to_numpy(float); Hts = contH["ts"].to_numpy()
+        if contG is not None:
+            Gh = contG["high"].to_numpy(float); Gl = contG["low"].to_numpy(float)
+            Gc = contG["close"].to_numpy(float); Gts = contG["ts"].to_numpy()
+        gjx = 0
         # today's LTF bars only (setups fired today)
         today_idx = [i for i in range(24, len(Lc))
                      if d0 is None or pd.Timestamp(Lts[i]).date() == d0]
@@ -765,6 +787,29 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
             if lean is None or not any(k in tag for k in
                                        ("CONTINUATION", "BREAK (attempt)", "PULLBACK")):
                 continue
+            # ── OPT-IN GRANDPARENT GATE: the 3rd frame must be actively trending WITH the
+            # trade. Its current bar is TRUNCATED to this instant exactly like the HTF —
+            # a completed coarse bar would leak up to 4h of future (the lookahead that
+            # inflated the first version of this very test). ─────────────────────────────
+            if contG is not None:
+                while gjx + 1 < len(Gts) and Gts[gjx + 1] <= Lts[i]:
+                    gjx += 1
+                if gjx < _STRUCT_LB:
+                    n_suppressed += 1
+                    continue
+                g0 = i
+                while g0 > 0 and Lts[g0 - 1] >= Gts[gjx]:
+                    g0 -= 1
+                Gh_t = Gh[:gjx + 1].copy(); Gl_t = Gl[:gjx + 1].copy(); Gc_t = Gc[:gjx + 1].copy()
+                Gh_t[gjx] = float(Lh[g0:i + 1].max())
+                Gl_t[gjx] = float(Ll[g0:i + 1].min())
+                Gc_t[gjx] = float(Lc[i])
+                gs = _struct_min(Gh_t, Gl_t, Gc_t, gjx)
+                aligned = ((lean == "UP" and gs in _TREND_UP_S) or
+                           (lean == "DOWN" and gs in _TREND_DN_S))
+                if not aligned:
+                    n_suppressed += 1
+                    continue
             # ── GUARD 1 · DEAD-TAPE: no new fires while the tape hasn't travelled. travel =
             # max(today's range-so-far, |gap|) — the gap IS travel (a +3.9% gap day is alive
             # at 09:45 even before intraday range builds). ────────────────────────────────
@@ -1149,7 +1194,7 @@ def day_regime(date, as_of, sym: str = "NSE:NIFTY50-INDEX") -> dict:
         return {}
 
 
-def scout_scan(date, as_of, ltf_tf: int, htf_tf: int) -> list[dict]:
+def scout_scan(date, as_of, ltf_tf: int, htf_tf: int, gp_only: bool = False) -> list[dict]:
     """Cross-index price-action SCOUT: scans all indices on the chosen combo (LTF entry × HTF
     confirm), returns each index's structure + candle pattern (both TFs) + the synthesis
     verdict, RANKED best-setup-first. A discretionary-read scanner (which index has the
@@ -1162,6 +1207,15 @@ def scout_scan(date, as_of, ltf_tf: int, htf_tf: int) -> list[dict]:
             spot = ltf.get("last") or 0
             s = synthesize(htf, ltf, spot)
             lv = _scout_levels(sym, ltf_tf, htf_tf, s.get("tag", ""), htf, ltf, spot, date, as_of)
+            # OPT-IN grandparent state (3rd frame). Computed ONLY when asked, so the default
+            # render pays nothing. drop_forming=False = same live read as the HTF confirm.
+            gp_struct = gp_aligned = None
+            if gp_only and _GP_OF.get(htf_tf):
+                gp = _struct_full(sym, _GP_OF[htf_tf], date, as_of, drop_forming=False)
+                gp_struct = gp.get("struct")
+                _ln = lv.get("lean")
+                gp_aligned = bool((_ln == "UP" and gp_struct in _TREND_UP_S) or
+                                  (_ln == "DOWN" and gp_struct in _TREND_DN_S))
             # DEAD-TAPE state (guard 1, live): travel = max(today's range-so-far, |gap|)
             tape_pct, tape_dead = None, False
             cont5 = _bars_continuous(sym, ltf_tf, date, as_of, need=60)
@@ -1185,6 +1239,7 @@ def scout_scan(date, as_of, ltf_tf: int, htf_tf: int) -> list[dict]:
                 "tag": s.get("tag", ""), "read": s.get("read", ""),
                 "color": s.get("color", "#94a3b8"), "loc": s.get("loc"),
                 "levels": lv, "tape_pct": tape_pct, "tape_dead": tape_dead,
+                "gp_tf": _GP_OF.get(htf_tf), "gp_struct": gp_struct, "gp_aligned": gp_aligned,
             })
         except Exception:
             rows.append({"sym": sym, "label": LABELS.get(sym, sym), "tag": "n/a",
