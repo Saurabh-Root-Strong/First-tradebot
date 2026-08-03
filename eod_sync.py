@@ -67,6 +67,60 @@ def _scp(host: str, key: str, remote_path: str, local_path: Path, timeout: int =
     return r.returncode == 0
 
 
+def _push_calibration(host: str, key: str, quiet: bool) -> int:
+    """Ship the freshly-learned calibration ledgers TO the VM.
+
+    WHY THIS EXISTS (the VM was running blind). eod_sync's LEARN step runs on the LAPTOP and
+    writes data/calibration/*.json there. data/ is gitignored, so a deploy never carries them
+    and the VM cannot generate them itself (it has no archive to measure). Checked 2026-08-03:
+    the VM had NO band_coverage.json at all, so hour_forecast.band_coverage returned
+    conf='none' and the VM board showed no coverage tag next to the band whatsoever.
+
+    Same failure class as the historical 5min store: silently missing, board looks fine.
+    Hand-copying fixes it for a week and then rots, so it belongs in the nightly loop.
+
+    ROUTE: the VM's data/ is a ROOT-OWNED bind mount, so `ubuntu` cannot scp into it
+    directly (Permission denied). Land in /tmp, then `docker compose cp` as root — which
+    writes through to the bind mount and survives container rebuilds.
+    """
+    src = DATA_DIR / "calibration"
+    files = [p for p in (src / "band_coverage.json", src / "band_multipliers.json")
+             if p.exists()]
+    if not files:
+        if not quiet:
+            print("        no local calibration ledgers to push (run the LEARN step first)")
+        return 0
+    sent = 0
+    for p in files:
+        r = subprocess.run(
+            ["scp", "-q", "-o", "ConnectTimeout=20", "-o", "StrictHostKeyChecking=accept-new",
+             "-i", key, str(p), f"{host}:/tmp/{p.name}"],
+            capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"    scp -> VM failed {p.name}: {(r.stderr or '').strip()}", file=sys.stderr)
+            continue
+        # ATOMIC: land under a .tmp name inside the container, then rename. `docker compose cp`
+        # streams the file, so a live dashboard reading band_coverage.json mid-copy would hit
+        # a truncated document — hour_forecast swallows the JSON error and silently drops to
+        # cover=None (no tag on the board) until the next mtime change. A same-directory mv is
+        # atomic, so a reader sees either the whole old file or the whole new one.
+        out = _ssh(host, key,
+                   f"cd {REMOTE_ROOT} && docker compose exec -T tradebot "
+                   f"mkdir -p /app/data/calibration && "
+                   f"docker compose cp /tmp/{p.name} tradebot:/app/data/calibration/{p.name}.tmp "
+                   f"&& docker compose exec -T tradebot "
+                   f"mv /app/data/calibration/{p.name}.tmp /app/data/calibration/{p.name} "
+                   f"&& rm -f /tmp/{p.name} && echo OK", timeout=120)
+        if "OK" in out:
+            sent += 1
+            if not quiet:
+                print(f"    + VM calibration/{p.name}  ({p.stat().st_size/1024:.1f} KB)")
+        else:
+            print(f"    VM copy failed for {p.name} (container down?)", file=sys.stderr)
+    print(f"        pushed {sent}/{len(files)} calibration ledger(s) to the VM")
+    return sent
+
+
 def _remote_listing(host: str, key: str, *globs: str) -> dict[str, int]:
     """{remote_path: size_bytes} for the given remote globs (missing globs ignored)."""
     cmd = "ls -la --time-style=+%s " + " ".join(globs) + " 2>/dev/null"
@@ -264,6 +318,13 @@ def main() -> None:
         # inside the session and the cell would be permanently empty.
         bh.run(30, [5, 15, 30, 60, 120])  # regenerate data/calibration/band_coverage.json
         cal.learn()                       # shrink-recalibrate band_multipliers.json
+    except Exception as exc:
+        print(f"        skipped: {exc}")
+    # LEARN runs here, on the laptop — so ship the result to the VM, which cannot compute it
+    # and (checked 2026-08-03) had no coverage ledger at all.
+    print("  [6b/7] PUSH calibration ledgers -> VM")
+    try:
+        _push_calibration(args.host, args.key, q)
     except Exception as exc:
         print(f"        skipped: {exc}")
     # Purge LAST — only after every fetch/merge above has safely landed locally.

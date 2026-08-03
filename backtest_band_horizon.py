@@ -123,6 +123,27 @@ def grade(ticks: pd.DataFrame, t: dt.datetime, H: int, spot: float,
     return out
 
 
+# A hole this long in the tick stream makes every reading that touches it a fiction.
+# 2026-07-04 lost 1h52m mid-session on three indices: the forecast's spot went STALE (it
+# reads ticks <= t, and the newest was two hours old), so the band was anchored at a price
+# the market had long left and the sample scored as a miss that never happened. Normal
+# cadence is ~1 tick/sec, so 3 min is far outside anything healthy.
+GAP_S = 180
+WARM_MIN = 15          # pre-window that must also be clean, else `spot` at t is stale
+
+
+def gap_edges(ticks: pd.DataFrame) -> list[tuple]:
+    """[(hole_start, hole_end)] for every break in the tick stream longer than GAP_S."""
+    t = ticks["ts"].sort_values()
+    d = t.diff().dt.total_seconds()
+    return [(t.shift(1).loc[i], t.loc[i]) for i in d[d > GAP_S].index]
+
+
+def clean_window(gaps: list[tuple], lo, hi) -> bool:
+    """True if no capture hole overlaps [lo, hi]."""
+    return not any(gs < hi and ge > lo for gs, ge in gaps)
+
+
 def run(n_days: int, horizons: list[int]) -> None:
     days = captured_days(n_days)
     if not days:
@@ -138,17 +159,27 @@ def run(n_days: int, horizons: list[int]) -> None:
     per_idx = {H: {s: {"end": [], "env": [], "dep": []} for s in INDEX_SYMBOLS}
                for H in horizons}
 
+    n_gap_streams = n_skipped = 0
     for day in days:
         # preload each index's full-day ticks once (answer key)
-        tk = {}
+        tk, gp = {}, {}
         for s in INDEX_SYMBOLS:
             df = read_mirror("ticks", day, None, s)
             if df is not None and len(df):
                 tk[s] = df[["ts", "ltp"]].copy()
+                gp[s] = gap_edges(tk[s])
+                if gp[s]:
+                    n_gap_streams += 1
         for s in INDEX_SYMBOLS:
             if s not in tk:
                 continue
             for t in pred_times(day):
+                # a hole just before t leaves `spot` stale, anchoring the band at a price
+                # the market has already left — the sample is noise, not a miss
+                if not clean_window(gp[s], pd.Timestamp(t) - pd.Timedelta(minutes=WARM_MIN),
+                                    pd.Timestamp(t)):
+                    n_skipped += 1
+                    continue
                 try:
                     fc = hf.forecast(s, as_of=t, date=day)
                 except Exception:
@@ -164,6 +195,12 @@ def run(n_days: int, horizons: list[int]) -> None:
                 except Exception:
                     mood = None
                 for H in horizons:
+                    # the OUTCOME window must be gap-free too — an endpoint read across a
+                    # hole is the price after an unobserved move, not after this band's move
+                    if not clean_window(gp[s], pd.Timestamp(t),
+                                        pd.Timestamp(t) + pd.Timedelta(minutes=H)):
+                        n_skipped += 1
+                        continue
                     g = grade(tk[s], t, H, spot, bp60, sym=s, mood=mood)
                     if g is None:
                         continue
@@ -175,6 +212,9 @@ def run(n_days: int, horizons: list[int]) -> None:
                     if g["deployed"] is not None:
                         agg[H]["dep"].append(g["deployed"])
                         per_idx[H][s]["dep"].append(g["deployed"])
+
+    print(f"\n  capture-gap filter: {n_gap_streams} (day,index) tick streams had holes "
+          f">{GAP_S}s; {n_skipped} samples skipped as gap-contaminated")
 
     def pct(x):
         return f"{100 * np.mean(x):5.1f}%" if x else "   n/a"
