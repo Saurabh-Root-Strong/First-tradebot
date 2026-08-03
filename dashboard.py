@@ -1660,6 +1660,33 @@ app.layout = dbc.Container([
                         {"label": "5m → 15m", "value": "5-15"},
                         {"label": "10m → 30m", "value": "10-30"},
                         {"label": "15m → 1h", "value": "15-60"}]),
+                    dbc.Checklist(id="tb-gp-only", value=[], switch=True,
+                                  style={"marginLeft": "12px", "fontSize": "0.62rem"},
+                                  options=[{"label": "3rd-TF confirm", "value": "on"}]),
+                    html.Span("ⓘ", id="tb-gp-info", style={
+                        "marginLeft": "4px", "color": "#64748b", "cursor": "help",
+                        "fontSize": "0.7rem"}),
+                    dbc.Tooltip(
+                        [html.Div("3rd-TF confirm — one more, BIGGER timeframe must agree",
+                                  style={"fontWeight": "800", "marginBottom": "4px"}),
+                         html.Div("Normally the board checks 2 timeframes: the small one for "
+                                  "the entry, the bigger one to confirm. Tick this and a THIRD, "
+                                  "even bigger timeframe must ALSO be trending your way."),
+                         html.Div("15m→1h adds 4h  ·  10m→30m adds 1h  ·  5m→15m adds 30m",
+                                  style={"color": "#38bdf8", "marginTop": "4px"}),
+                         html.Div("ON  = far fewer setups (about 1 in 3), only when the big "
+                                  "trend agrees. Some days show nothing — that is normal.",
+                                  style={"marginTop": "4px"}),
+                         html.Div("OFF = the usual scan (this is the default)."),
+                         html.Div("HONEST: measured on 2 years — it adds nothing on 5m and 10m, "
+                                  "and only a little on 15m→1h, still not enough to pay an "
+                                  "option's cost. Treat it as a 'show me only the cleanest "
+                                  "setups' filter, not a money edge.",
+                                  style={"color": "#fbbf24", "marginTop": "4px",
+                                         "fontStyle": "italic"})],
+                        target="tb-gp-info", placement="bottom",
+                        style={"maxWidth": "420px", "fontSize": "0.66rem",
+                               "textAlign": "left"}),
                     html.Div(id="tb-dayreg", style={"marginLeft": "14px",
                              "fontSize": "0.62rem"}),
                     html.Div(id="tb-ledger-badge", style={"marginLeft": "auto",
@@ -1674,8 +1701,35 @@ app.layout = dbc.Container([
                     dbc.ModalHeader(dbc.ModalTitle(
                         "📋 Scout day ledger — open + closed (PA level-trades)"),
                         close_button=True),
-                    dbc.ModalBody(dcc.Loading(html.Div(id="tb-ledger"), type="circle",
-                                              color="#22d3ee")),
+                    # SPLIT BODY, and NO dcc.Loading. Two reasons, both from watching a live
+                    # session: (1) Loading blanked the entire body to a spinner on every 30s
+                    # tick, wiping the table out from under the reader; (2) even without the
+                    # spinner, returning one big children tree re-renders the CLOSED rows —
+                    # which cannot change — and yanks the scroll position mid-read. So the
+                    # closed table is its own Output that is left at no_update unless the set
+                    # of closed trades actually changed. Only OPEN rows (live premium/P&L)
+                    # and the one-line scoreboard redraw on the tick.
+                    dbc.ModalBody([
+                        html.Div(id="tb-ledger-head"),
+                        html.Div("● OPEN", style={
+                            "color": "#22c55e", "fontSize": "0.6rem",
+                            "fontWeight": "800", "margin": "6px 0 2px"}),
+                        html.Div(id="tb-ledger-open"),
+                        html.Div("○ CLOSED", style={
+                            "color": "#64748b", "fontSize": "0.6rem",
+                            "fontWeight": "800", "margin": "10px 0 2px"}),
+                        html.Div(id="tb-ledger-closed"),
+                        html.Div(
+                            "ENTRY ₹/NOW ₹/EXIT ₹ = the ATM CE/PE PREMIUM (1 lot) — from the "
+                            "captured chain, LIVE ONLY and only while FRESH: the chain dies "
+                            "~11am so afternoon rows show n/a (no reliable premium) · exits: "
+                            "band touch / SL / flipped / 90m / bell · the naked CE/PE is "
+                            "MEASURED NEGATIVE-EV (theta+spread bleed the option even when the "
+                            "index level is ~breakeven) — this ledger SHOWS you that; the "
+                            "LEVELS are the edge, not the option",
+                            style={"color": "#64748b", "fontSize": "0.56rem",
+                                   "fontStyle": "italic", "marginTop": "10px"}),
+                    ]),
                 ], id="tb-ledger-modal", is_open=False, size="xl", scrollable=True),
                 dbc.Tabs([dbc.Tab(label=LABELS.get(s, s), tab_id=s) for s in INDEX_SYMBOLS],
                          id="tb-idx-tabs", active_tab=INDEX_SYMBOLS[0]),
@@ -3966,24 +4020,48 @@ def _led_badge(outcome: str):
     return _LED_BADGE.get(outcome, (outcome, "#94a3b8"))
 
 
-@app.callback(Output("tb-ledger", "children"), Output("tb-ledger-badge", "children"),
+# Which finished-day ledger has already been rendered — the guard that stops the 30s tick
+# from re-walking an immutable session. Single-slot: any change of day/combo/gp recomputes.
+_LEDGER_DONE: dict = {}
+
+
+@app.callback(Output("tb-ledger-head", "children"), Output("tb-ledger-open", "children"),
+              Output("tb-ledger-closed", "children"), Output("tb-ledger-badge", "children"),
               Input("sel-sym", "data"), Input("tb-scout-combo", "value"),
-              Input("news-date", "data"), Input("tb-refresh", "n_intervals"))
-def _fill_ledger(sel, combo, vdate, _tick):
+              Input("news-date", "data"), Input("tb-refresh", "n_intervals"),
+              Input("tb-gp-only", "value"))
+def _fill_ledger(sel, combo, vdate, _tick, gp_val):
     """SCOUT day-ledger (Charts-parity) — today's PA level-trades, open + closed, with the same
     exit vocabulary as the Charts ledger: band touch / SL hit / flipped / timed out (90m) /
     squared off at the bell. Measures the method (2yr ~breakeven, MIDCAP marginally +) — NOT a
     machine fire; the naked CE/PE is negative-EV, the LEVELS are the trade."""
     from dash.exceptions import PreventUpdate
+    from dash import no_update
     if sel != "TRADEBOARD":
         raise PreventUpdate
     import tradeboard as tb
     vdt, now = _tb_clock(vdate)
     ltf_tf, htf_tf = (int(x) for x in (combo or "15-60").split("-"))
+    # A FINISHED day's ledger is immutable — a past date, or today after the bell. The 30s
+    # tb-refresh tick was re-walking the whole session anyway (4 indices, seconds of work)
+    # and re-rendering the popup on top of whoever was reading it. On a finished day, let the
+    # TICK do nothing; every other trigger (page load, date, combo, 3rd-TF switch) still
+    # renders. Gating on the TRIGGER and not merely on a cached key matters: a browser
+    # reload re-fires this callback with an EMPTY tb-ledger, and a key-only guard would
+    # PreventUpdate and leave the modal and badge permanently blank.
+    from dash import callback_context as _ctx
+    _by_tick = bool(_ctx.triggered) and _ctx.triggered[0]["prop_id"].startswith("tb-refresh.")
+    _final = bool(vdt) or _session_over(True)
+    _key = (vdt or "today", ltf_tf, htf_tf, bool(gp_val))
+    if _by_tick and _final and _LEDGER_DONE.get("key") == _key:
+        raise PreventUpdate
     try:
-        L = tb.scout_pa_ledger(vdt, now, ltf_tf, htf_tf)
+        L = tb.scout_pa_ledger(vdt, now, ltf_tf, htf_tf, gp_only=bool(gp_val))
     except Exception as exc:
-        return html.Div(f"ledger error: {exc}", style={"color": "#f87171"}), ""
+        err = html.Div(f"ledger error: {exc}", style={"color": "#f87171"})
+        return err, no_update, no_update, ""
+    if _final:
+        _LEDGER_DONE["key"] = _key
     closed, openr = L["closed"], L["open"]
     badge = html.Span(f"📋 {len(openr)} open · {L['n_closed']} closed", style={
         "color": "#94a3b8", "fontWeight": "700"})
@@ -4050,27 +4128,65 @@ def _fill_ledger(sel, combo, vdate, _tick):
                   f"{L['avg_r'] if L['avg_r'] is not None else '—'}R",
                   style={"color": "#64748b", "fontSize": "0.66rem"})],
         style={"marginBottom": "8px"})
-    body_div = html.Div([
-        scoreboard,
-        html.Div("● OPEN", style={"color": "#22c55e", "fontSize": "0.6rem", "fontWeight": "800",
-                 "margin": "6px 0 2px"}), _tbl(openr, True),
-        html.Div("○ CLOSED", style={"color": "#64748b", "fontSize": "0.6rem", "fontWeight": "800",
-                 "margin": "10px 0 2px"}), _tbl(closed, False),
-        html.Div("ENTRY ₹/NOW ₹/EXIT ₹ = the ATM CE/PE PREMIUM (1 lot) — from the captured chain, "
-                 "LIVE ONLY and only while FRESH: the chain dies ~11am so afternoon rows show n/a "
-                 "(no reliable premium) · exits: band touch / SL / flipped / 90m / bell · the "
-                 "naked CE/PE is MEASURED NEGATIVE-EV (theta+spread bleed the option even when "
-                 "the index level is ~breakeven) — this ledger SHOWS you that; the LEVELS are the "
-                 "edge, not the option", style={"color": "#64748b", "fontSize": "0.56rem",
-                 "fontStyle": "italic", "marginTop": "10px"}),
-    ])
-    return body_div, badge
+    # A closed trade is FROZEN — entry, exit, premium and outcome can never move again. Rebuild
+    # its table only when the closed SET changes (a new trade closes, or the day/combo/gp switch
+    # changes what qualifies); otherwise hand back no_update so React leaves those DOM nodes
+    # completely alone and the row you are reading does not jump on the 30s tick.
+    sig = (_key, tuple((r.get("label"), r.get("side"), r.get("strike"), r.get("held"),
+                        r.get("e_prem"), r.get("x_prem"), r.get("opt_rs"), r.get("outcome"))
+                       for r in closed))
+    # Only the TICK may be skipped. A page reload re-fires this callback against an EMPTY
+    # tb-ledger-closed, and a signature-only check would return no_update and leave the closed
+    # table permanently blank — the same trap as the finished-day guard above.
+    if _by_tick and _LEDGER_DONE.get("closed_sig") == sig:
+        closed_div = no_update
+    else:
+        closed_div = _tbl(closed, False)
+        _LEDGER_DONE["closed_sig"] = sig
+    return scoreboard, _tbl(openr, True), closed_div, badge
+
+
+def _dayreg_chip(vdt, now):
+    """DAY-type chip — extracted so the gp-filter empty-state can show it too."""
+    import tradeboard as tb
+    reg = tb.day_regime(vdt, now) or {}
+    chip = ""
+    if reg.get("label") == "WARMING":
+        chip = html.Span([
+            html.Span("DAY WARMING", style={"color": "#0a0f1a", "background": "#64748b",
+                      "borderRadius": "5px", "padding": "2px 8px", "fontWeight": "800"}),
+            html.Span(f"  {reg.get('bars', 0)}/6 bars · rng {reg.get('rng')}% — day-type needs "
+                      f"~6 bars (till ~10:45); an early ER reads ~1.0 by construction",
+                      style={"color": "#64748b", "fontStyle": "italic"})])
+        reg = {}
+    if reg:
+        _c = {"TREND": "#22c55e", "MID": "#fbbf24", "CHOP": "#f87171"}[reg["label"]]
+        _hint = {"TREND": "the only day-type that paid (28d)",
+                 "MID": "all combos bled here (28d)",
+                 "CHOP": "all combos bled here (28d) — smallest size / stand aside"}[reg["label"]]
+        _vl = reg.get("vol_label")
+        _vc = {"EXPANDING": "#f472b6", "COMPRESSING": "#38bdf8",
+               "NORMAL": "#94a3b8"}.get(_vl, "#94a3b8")
+        _varrow = {"EXPANDING": "↑", "COMPRESSING": "↓", "NORMAL": "="}.get(_vl, "")
+        chip = html.Span([
+            html.Span(f"DAY {reg['label']}", style={"color": "#0a0f1a", "background": _c,
+                      "borderRadius": "5px", "padding": "2px 8px", "fontWeight": "800"}),
+            html.Span(f"  ER {reg['er']}" + (f" · AM {reg['er_am']}" if reg.get("er_am") else "")
+                      + f" · rng {reg['rng']}% · {reg.get('bars', 0)} bars",
+                      style={"color": "#64748b", "fontStyle": "italic"}),
+            (html.Span(f"  VOL {_varrow}{_vl} ×{reg['vol_ratio']}"
+                       f" (bar {reg['atr_pts']}pt)",
+                       style={"color": _vc, "fontWeight": "700"}) if _vl else ""),
+            html.Span(f"  {_hint}", style={"color": "#64748b", "fontStyle": "italic"}),
+        ])
+    return chip
 
 
 @app.callback(Output("tb-scout", "children"), Output("tb-dayreg", "children"),
               Input("sel-sym", "data"), Input("tb-scout-combo", "value"),
-              Input("news-date", "data"), Input("tb-refresh", "n_intervals"))
-def _fill_scout(sel, combo, vdate, _tick):
+              Input("news-date", "data"), Input("tb-refresh", "n_intervals"),
+              Input("tb-gp-only", "value"))
+def _fill_scout(sel, combo, vdate, _tick, gp_val):
     """Cross-index SCOUT table — scan all indices on the chosen combo, best setup first.
     Discretionary-read scanner (which index has the cleanest MTF confluence), not a machine
     buy (intraday PA doesn't mechanize — audited)."""
@@ -4081,7 +4197,22 @@ def _fill_scout(sel, combo, vdate, _tick):
     vdt, now = _tb_clock(vdate)
     ltf_tf, htf_tf = (int(x) for x in (combo or "15-60").split("-"))
     try:
-        rows = tb.scout_scan(vdt, now, ltf_tf, htf_tf)
+        gp_only = bool(gp_val)
+        rows = tb.scout_scan(vdt, now, ltf_tf, htf_tf, gp_only=gp_only)
+        if gp_only:
+            rows = [r for r in rows if r.get("gp_aligned")]
+        if not rows:                     # empty table reads as "broken"; say WHY it is empty
+            _gp = {15: "30m", 30: "1h", 60: "4h"}.get(htf_tf, "3rd TF")
+            return html.Div([
+                html.Div(f"3rd-TF confirm ON — no index currently has its {_gp} frame trending "
+                         f"with the setup, so nothing passes.", style={
+                             "color": "#fbbf24", "fontSize": "0.7rem", "fontWeight": "700"}),
+                html.Div("This filter is STRICT by design (keeps ~1 setup in 3, measured). "
+                         "Untick it to see the normal scan.",
+                         style={"color": "#64748b", "fontSize": "0.6rem",
+                                "fontStyle": "italic", "marginTop": "3px"}),
+            ], style={"background": "#0a1220", "borderRadius": "8px", "padding": "10px 12px",
+                      "margin": "4px 0 8px"}), _dayreg_chip(vdt, now)
     except Exception as exc:
         return html.Div(f"scout error: {exc}", style={"color": "#f87171"}), ""
     th = lambda t: html.Th(t, style={"padding": "3px 8px", "color": "#64748b",
@@ -4157,36 +4288,7 @@ def _fill_scout(sel, combo, vdate, _tick):
     # DAY-TYPE chip — state reading, never a forecast (morning ER does NOT predict the day:
     # corr +0.06 measured over 28 days). MEASURED: all combos bleed on CHOP/MID days; every
     # rupee of the honest 28-day grade came from TREND days.
-    reg = tb.day_regime(vdt, now) or {}
-    chip = ""
-    if reg.get("label") == "WARMING":
-        chip = html.Span([
-            html.Span("DAY WARMING", style={"color": "#0a0f1a", "background": "#64748b",
-                      "borderRadius": "5px", "padding": "2px 8px", "fontWeight": "800"}),
-            html.Span(f"  {reg.get('bars', 0)}/6 bars · rng {reg.get('rng')}% — day-type needs "
-                      f"~6 bars (till ~10:45); an early ER reads ~1.0 by construction",
-                      style={"color": "#64748b", "fontStyle": "italic"})])
-        reg = {}
-    if reg:
-        _c = {"TREND": "#22c55e", "MID": "#fbbf24", "CHOP": "#f87171"}[reg["label"]]
-        _hint = {"TREND": "the only day-type that paid (28d)",
-                 "MID": "all combos bled here (28d)",
-                 "CHOP": "all combos bled here (28d) — smallest size / stand aside"}[reg["label"]]
-        _vl = reg.get("vol_label")
-        _vc = {"EXPANDING": "#f472b6", "COMPRESSING": "#38bdf8",
-               "NORMAL": "#94a3b8"}.get(_vl, "#94a3b8")
-        _varrow = {"EXPANDING": "↑", "COMPRESSING": "↓", "NORMAL": "="}.get(_vl, "")
-        chip = html.Span([
-            html.Span(f"DAY {reg['label']}", style={"color": "#0a0f1a", "background": _c,
-                      "borderRadius": "5px", "padding": "2px 8px", "fontWeight": "800"}),
-            html.Span(f"  ER {reg['er']}" + (f" · AM {reg['er_am']}" if reg.get("er_am") else "")
-                      + f" · rng {reg['rng']}% · {reg.get('bars', 0)} bars",
-                      style={"color": "#64748b", "fontStyle": "italic"}),
-            (html.Span(f"  VOL {_varrow}{_vl} ×{reg['vol_ratio']}"
-                       f" (bar {reg['atr_pts']}pt)",
-                       style={"color": _vc, "fontWeight": "700"}) if _vl else ""),
-            html.Span(f"  {_hint}", style={"color": "#64748b", "fontStyle": "italic"}),
-        ])
+    chip = _dayreg_chip(vdt, now)
     return html.Div([
         html.Table([html.Thead(header), html.Tbody(body)],
                    style={"width": "100%", "borderCollapse": "collapse"}),
@@ -5058,10 +5160,16 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False, session_over=
     if r.get("band_cover") is not None:
         _cc = {"ok": "#22c55e", "soft": "#fbbf24", "low": "#f87171", "thin": "#64748b"}
         _cm = {"ok": "✓", "soft": "~", "low": "⚠ low", "thin": "· thin"}
+        _bor = r.get("band_borrowed")
         pred_kids.append(html.Span(
-            f"  cover {r['band_cover']*100:.0f}% {_cm.get(r['band_conf'], '')} (n{r['band_n']})",
-            title="measured endpoint coverage of this band at this horizon "
-                  "(backtest_band_horizon.py ledger); trust the band only where this is high",
+            f"  cover {r['band_cover']*100:.0f}% {_cm.get(r['band_conf'], '')} (n{r['band_n']}"
+            + (f", {_bor}m cell" if _bor else "") + ")",
+            title=("measured endpoint coverage of the band AS DRAWN — base × L4 × regime × "
+                   "time-of-day (backtest_band_horizon.py ledger). Trust the band only where "
+                   "this is high."
+                   + (f" NOTE: no cell measured at this horizon — borrowed from the {_bor}m "
+                      f"cell. Coverage measured flat across 5-120m, so the number is sound, "
+                      f"but it was not verified at this horizon." if _bor else "")),
             style={"color": _cc.get(r["band_conf"], "#94a3b8"), "fontWeight": "700",
                    "cursor": "help"}))
     v = r.get("verify")
