@@ -446,12 +446,61 @@ def _spot_at(sym: str, date, t) -> Optional[float]:
     return float(s.iloc[-1]["ltp"])
 
 
-# Round-trip option cost as % of premium (entry half-spread + exit half-spread +
-# brokerage/slippage). Index weekly ATM is liquid but the bid/ask still bites; 3%
-# of premium is a conservative-but-realistic intraday round trip. The P&L "win" is
-# net of this — a directionally-right call that didn't move the option past costs
-# is correctly graded a LOSS (the whole point of the option-P&L audit).
-_OPT_RT_COST = 3.0
+# ── ROUND-TRIP OPTION COST, % of premium ──────────────────────────────────────────────
+# WAS a flat 3.0 "conservative-but-realistic" GUESS. It was never measured, and it is the
+# single constant every intraday conclusion on this desk died against. Measured 2026-08-04
+# over 34 captured days (measure_cost_floor.py): chain_snapshots carries no bid/ask, so the
+# effective spread was recovered with a Roll (1984) estimator on the DELTA-STRIPPED residual
+#     residual = dLTP - delta*dSPOT
+# whose serial covariance isolates bid-ask bounce from real price movement (30s snapshots
+# make naive Roll unusable). Reported as roll_quiet/roll_resid, ATM, per index:
+#
+#     NIFTY   spread 1.16-1.38%   BANK  0.52-0.81%   FIN 0.73-1.41%   MIDCAP 0.57-1.26%
+#
+# Percentage spread scales INVERSELY with premium — NIFTY's cheap ~Rs100 ATM is the widest
+# in % terms despite being the most liquid contract.
+# Fees on top: Rs20x2 brokerage + 0.10% STT + ~0.10% exchange + 18% GST ~= 0.84% on ONE
+# NIFTY lot, ~0.42% at five (the flat brokerage amortises). The table below uses the 1-lot
+# figure, so it is the conservative end for anyone trading size.
+#
+# ⚠ THETA IS DELIBERATELY NOT IN HERE. This constant is applied to a REALIZED premium move
+# (entry premium -> exit premium), which already contains the decay that actually happened.
+# Adding theta would double-count it. Theta is a separate term ONLY in index-bps space,
+# where no real premium was touched — see theta_bps_60m() below.
+_OPT_RT_COST = 2.0                       # all-index default (spread ~1.2% + fees ~0.84%)
+_OPT_RT_COST_BY_SYM = {                  # measured per index, spread + 1-lot fees
+    "NSE:NIFTY50-INDEX":   2.1,
+    "NSE:NIFTYBANK-INDEX": 1.5,
+    "NSE:FINNIFTY-INDEX":  1.7,
+    "NSE:MIDCPNIFTY-INDEX": 1.8,
+}
+
+
+def opt_rt_cost(sym: Optional[str] = None) -> float:
+    """Round-trip option cost (% of premium) for `sym` — spread + fees, NO theta."""
+    return _OPT_RT_COST_BY_SYM.get(sym or "", _OPT_RT_COST)
+
+
+# ── THETA, the term the flat cost constant hid ────────────────────────────────────────
+# Measured 2026-08-04 (measure_theta_dte.py) from the same residual: its COVARIANCE gives
+# the spread, its MEAN per unit time gives decay. Sampled only where the index barely moved
+# AND implied vol barely moved, so gamma and vega do not contaminate it. NIFTY weekly, ATM:
+#
+#     DTE 0: -16.2%/hr    DTE 1: -4.65%/hr    DTE 4-6: -1.7 to -2.0%/hr
+#
+# Expiry-day decay is ~10x the start of the cycle. Expressed below as the INDEX bps a 60-min
+# hold must overcome before it breaks even, which is the unit the signal sweeps report in.
+# CAVEAT: per-bucket n is 6-26 index-days and some non-NIFTY buckets returned physically
+# impossible POSITIVE theta — the error bars are wide. Treat as an order-of-magnitude map,
+# not a precise coefficient.
+_THETA_BPS_60M = {0: 9.65, 1: 3.59, 2: 2.6, 3: 2.4, 4: 1.68, 5: 2.35, 6: 2.10}
+
+
+def theta_bps_60m(dte: int) -> float:
+    """Index bps a 60-min ATM option hold must clear just to pay for decay at this DTE."""
+    if dte is None or dte < 0:
+        return _THETA_BPS_60M[6]
+    return _THETA_BPS_60M.get(int(dte), 1.9 if dte > 6 else _THETA_BPS_60M[6])
 
 
 def _opt_premium(sym: str, date, t, strike, side: str, expiry="weekly") -> Optional[float]:
@@ -550,7 +599,8 @@ def _verify(sym: str, date, as_of, horizon_min: int, spot0: float,
         exit_ = _opt_premium(sym, date, t_end, atm, side)
         if entry and exit_:
             pnl = (exit_ / entry - 1.0) * 100.0
-            net = pnl - _OPT_RT_COST
+            net = pnl - opt_rt_cost(sym)      # per-index measured spread+fees (no theta:
+            #                                   pnl is a REAL premium move, decay included)
             out.update({"opt_side": side, "opt_entry": round(entry, 2),
                         "opt_exit": round(exit_, 2), "opt_pnl_pct": round(pnl, 1),
                         "opt_net_pct": round(net, 1), "opt_win": bool(net > 0)})

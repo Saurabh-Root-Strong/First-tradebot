@@ -5058,6 +5058,27 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False, session_over=
                 title="1 day to expiry — accelerating theta decay on the ATM arrow "
                       "(option-net −8.5% mean in the scenario map). Size down / avoid.",
                 style={"color": "#f59e0b", "fontWeight": "700", "cursor": "help"})
+        elif _dte >= 2:
+            # The other half of the DTE (Days To Expiry) axis. The board warned about the
+            # cliff but said nothing about the CHEAP window, so every non-expiry day looked
+            # alike. Measured 2026-08-04 over 34 captured days: theta at DTE 4-6 is ~1.7-2.4
+            # index bps per 60-min hold vs 9.65 at DTE 0 — a ~5x swing in the dominant cost
+            # term. Shown as CONTEXT (how much decay you are paying), never as a go signal:
+            # the gross edge it would have to clear is itself not significant.
+            import intraday_scout as _sc
+            _tb = _sc.theta_bps_60m(_dte)
+            _rt = _sc.opt_rt_cost(r["sym"])
+            _cheap = _tb <= 2.5
+            theta_badge = html.Span(
+                f"  θ {_dte}d · {_tb:.1f}bps/60m" + (" · theta-cheap" if _cheap else ""),
+                title=(f"DTE (Days To Expiry) = {_dte}. Measured decay on the ATM arrow is "
+                       f"~{_tb:.1f} index bps per 60-minute hold, vs 9.65 bps on expiry day "
+                       f"— theta is the dominant cost and it swings ~5x across the cycle. "
+                       f"Round-trip spread+fees for this index measures ~{_rt:.1f}% of "
+                       f"premium (was assumed a flat 3%). CONTEXT, not a signal: this says "
+                       f"what the trade COSTS, not that there is an edge to collect."),
+                style={"color": "#34d399" if _cheap else "#94a3b8",
+                       "fontWeight": "700", "cursor": "help"})
     # REVERSAL-ACCUMULATION flag — writers secretly closing shorts (OI↓ prem↑) + fresh
     # buying = a positioning flip that can precede a move (gamma-squeeze near expiry). Rare
     # by design (~1/36 day-cells); DISPLAY CONTEXT ONLY, never a trade trigger (cheap = the
