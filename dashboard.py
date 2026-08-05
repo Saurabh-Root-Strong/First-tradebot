@@ -5881,9 +5881,10 @@ def _scout_openpos_body(today: str, as_of):
                  "MIDCAP churn hits 120× per ₹, so its red trades dominate the day's total. "
                  "GROSS: the exchange's number, before charges.",
         "cost": "Zerodha round-trip charges at ONE lot: ₹20/order brokerage (×2 = ₹40, FLAT — "
-                "the only leg that does NOT scale with size) + STT 0.10% on the sell + "
-                "exchange 0.03503% + SEBI 0.0001% + stamp 0.003% on the buy + 18% GST. "
-                "Typically ₹68–100 a trade. Hover a cost cell for that trade's breakdown.",
+                "the only leg that does NOT scale with size) + STT 0.15% on the sell "
+                "(raised from 0.10% on 1-Apr-2026) + exchange 0.03553% + SEBI 0.0001% + "
+                "stamp 0.003% on the buy + 18% GST. Rates verified against zerodha.com/charges "
+                "on 2026-08-05. Hover a cost cell for that trade's breakdown.",
         "net": "₹/lot gross − costs = what actually reaches the account at 1 lot. A row "
                "highlighted red here was a GROSS winner the charges turned into a loss — the "
                "cost floor, visible per trade. Trading more lots amortises the ₹40 brokerage "
@@ -5982,7 +5983,7 @@ def _scout_openpos_body(today: str, as_of):
         "until it flips / hits SL / target / breaks the σ-band. CLOSED P&L is realized (entry→exit on the "
         f"arrow's option); ₹/lot gross = that move × the index lot size (MIDCAP's 120-lot "
         "dominates the day). COSTS are the real Zerodha round-trip bill at ONE lot — ₹40 flat "
-        "brokerage + STT + exchange + SEBI + stamp + GST, ~₹68–100 a trade — and ₹ NET is what "
+        "brokerage + STT 0.15% + exchange + SEBI + stamp + GST — and ₹ NET is what "
         "the account actually keeps. Brokerage is per ORDER, so the drag shown is the worst "
         "case; it amortises as you add lots, the turnover charges do not. Alert-log state, "
         f"tf={_ALERT_TF}m. Decision-support only — the arrow is negative-EV; trade the "

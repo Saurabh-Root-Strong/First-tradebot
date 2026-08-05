@@ -12,28 +12,46 @@ overstate the drag for anyone trading size, and a ledger that ignores costs unde
 everyone. Hence `lots` is an explicit argument and the breakdown is always available.
 
 RATES (Zerodha, index options, F&O segment). These change with budgets and exchange circulars
--- STT on option SELL doubled to 0.10% on 2024-10-01, and NSE has revised transaction charges
-more than once. They are constants HERE, in one place, so a change is a one-line edit and
-never a hunt through the dashboard:
+-- VERIFIED 2026-08-05 against zerodha.com/charges, the STT support article and the
+1-Apr-2026 revision bulletin (SOURCES at the bottom of this docstring). They are constants
+HERE, in one place, so a change is a one-line edit and never a hunt through the dashboard:
 
     brokerage      Rs 20 per executed order, flat  (buy + sell = Rs 40)
-    STT            0.10%  of SELL-side premium turnover only
-    exchange txn   0.03503% of premium turnover, BOTH sides (NSE options)
+    STT            0.15%  of SELL-side premium turnover only
+    exchange txn   0.03553% of premium turnover, BOTH sides (NSE options)
     SEBI fees      0.0001% of premium turnover (Rs 10 per crore)
     GST            18% on (brokerage + exchange txn + SEBI fees)
     stamp duty     0.003% of BUY-side premium turnover only
 
+STT HISTORY -- the biggest variable leg, and the easiest one to get stale:
+    0.0625%  ->  0.10%   on 2024-10-01
+    0.10%    ->  0.15%   on 2026-04-01  (Budget 2026-27)   <-- CURRENT
+A stale 0.10% understates the STT leg by a third and the whole bill by roughly 8%.
+
+THE EXPIRY TRAP, deliberately not modelled: an option SOLD pays 0.15% of the PREMIUM, but one
+left to expire in-the-money and EXERCISED pays 0.15% of the INTRINSIC VALUE -- on a deep ITM
+contract that is orders of magnitude larger. This ledger always closes by SELLING (band / SL /
+flip / timeout / squared off at the bell), so premium-side STT is the right model here. If a
+position is ever allowed to expire ITM, this function will understate the bill badly.
+
 Deliberately NOT included: DP charges (equity delivery only, not F&O), auto-square-off
 penalties, and the bid-ask spread. The spread is a real cost but it is not a CHARGE -- it is
 already inside the entry/exit premiums the ledger records, so adding it here would double-count.
+
+SOURCES (fetched 2026-08-05):
+    https://zerodha.com/charges/
+    https://support.zerodha.com/category/account-opening/resident-individual/ri-charges/
+        articles/how-is-the-securities-transaction-tax-stt-calculated
+    https://zerodha.com/marketintel/bulletin/445377/
+        revision-in-stt-securities-transaction-tax-from-1st-april-2026
 """
 from __future__ import annotations
 
 # ── rate table — the only place these numbers live ────────────────────────────────
 BROKERAGE_PER_ORDER = 20.0      # Rs, flat, per executed order
 ORDERS_PER_ROUNDTRIP = 2        # one buy + one sell
-STT_SELL = 0.0010               # 0.10%  of sell premium turnover (options: sell side only)
-EXCH_TXN = 0.0003503            # 0.03503% of premium turnover, both sides (NSE options)
+STT_SELL = 0.0015               # 0.15%  of sell premium turnover, sell side only (1-Apr-2026)
+EXCH_TXN = 0.0003553            # 0.03553% of premium turnover, both sides (NSE options)
 SEBI_FEES = 0.000001            # 0.0001% of premium turnover
 GST_RATE = 0.18                 # 18% on brokerage + exchange txn + SEBI
 STAMP_BUY = 0.00003             # 0.003% of buy premium turnover (buy side only)
