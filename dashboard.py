@@ -5613,6 +5613,7 @@ def _scout_openpos_body(today: str, as_of):
     from dash import dash_table
     from dash.dash_table.Format import Format, Group, Scheme, Sign, Symbol
     from core.constants import LOT_SIZES
+    from core import broker_costs as bcosts
     _rupee = Format(precision=2, scheme=Scheme.fixed).symbol(Symbol.yes).symbol_prefix("₹")
     _pctf = Format(precision=1, scheme=Scheme.percentage).sign(Sign.positive)
     # ₹ P&L at ONE lot = (exit − entry) × index lot size. This is what actually hits the
@@ -5627,6 +5628,20 @@ def _scout_openpos_body(today: str, as_of):
         if not (lot and entry and exit_p):
             return None
         return round((exit_p - entry) * lot)
+
+    # ── REAL money: the gross ₹ above is the exchange's number, not the account's. Zerodha
+    # takes ₹20 per order flat plus STT / exchange / SEBI / GST / stamp on turnover, so a
+    # round trip costs ~₹68-100 at one lot. On a ₹282 winner that is 35% of the P&L. The
+    # brokerage half is per ORDER, so it does NOT scale with size — the drag shown here is
+    # the WORST case (1 lot) and shrinks fast if you trade more. Rates: core/broker_costs.py
+    def _cost_rs(sym, entry, exit_p):
+        c = bcosts.roundtrip_total(entry, exit_p, LOT_SIZES.get(sym))
+        return round(c) if c is not None else None
+
+    def _net_rs(sym, entry, exit_p):
+        g = _pnl_rs(sym, entry, exit_p)
+        c = _cost_rs(sym, entry, exit_p)
+        return None if (g is None or c is None) else g - c
     _ledger_side_pnl_cond = [
         {"if": {"filter_query": "{side} = CE", "column_id": "side"},
          "color": "#34d399", "fontWeight": "700"},
@@ -5638,9 +5653,14 @@ def _scout_openpos_body(today: str, as_of):
          "color": "#22c55e", "fontWeight": "700"},
     ]
 
-    def _ledger_table(data, columns, extra_cond, tips=None, header_tips=None, tbl_id=None):
+    def _ledger_table(data, columns, extra_cond, tips=None, header_tips=None, tbl_id=None,
+                      row_tips=None):
         return dash_table.DataTable(
             id=tbl_id, data=data, columns=columns,
+            # per-ROW tooltips (row_tips[i] = {col: markdown}). tooltip_conditional keys off a
+            # filter_query and so can only say generic things; the charge breakdown differs on
+            # every row, so it has to come from the row itself.
+            tooltip_data=row_tips or [],
             sort_action="native", sort_mode="single", page_action="none",
             style_as_list_view=True,
             style_table={"marginBottom": "6px", "overflowX": "auto"},
@@ -5792,6 +5812,8 @@ def _scout_openpos_body(today: str, as_of):
             "entry": e.get("entry"), "exit": e.get("exit"),
             "pnl": (pnl / 100.0) if pnl is not None else None,
             "rupee": _pnl_rs(e["sym"], e.get("entry"), e.get("exit")),
+            "cost": _cost_rs(e["sym"], e.get("entry"), e.get("exit")),
+            "net": _net_rs(e["sym"], e.get("entry"), e.get("exit")),
             "outcome": badge,
         })
     closed_cols = [
@@ -5802,7 +5824,9 @@ def _scout_openpos_body(today: str, as_of):
         {"name": "Entry", "id": "entry", "type": "numeric", "format": _rupee},
         {"name": "Exit", "id": "exit", "type": "numeric", "format": _rupee},
         {"name": "P&L (real.)", "id": "pnl", "type": "numeric", "format": _pctf},
-        {"name": "₹/lot (real.)", "id": "rupee", "type": "numeric", "format": _rupee0},
+        {"name": "₹/lot gross", "id": "rupee", "type": "numeric", "format": _rupee0},
+        {"name": "− costs", "id": "cost", "type": "numeric", "format": _rupee0},
+        {"name": "₹ NET", "id": "net", "type": "numeric", "format": _rupee0},
         {"name": "Outcome", "id": "outcome"},
     ]
     closed_extra_cond = [
@@ -5810,6 +5834,15 @@ def _scout_openpos_body(today: str, as_of):
          "color": "#f87171", "fontWeight": "700"},
         {"if": {"filter_query": "{rupee} >= 0", "column_id": "rupee"},
          "color": "#22c55e", "fontWeight": "700"},
+        # costs are always a subtraction — render them as the drag they are, never green
+        {"if": {"column_id": "cost"}, "color": "#fb923c", "fontWeight": "600"},
+        {"if": {"filter_query": "{net} < 0", "column_id": "net"},
+         "color": "#f87171", "fontWeight": "800"},
+        {"if": {"filter_query": "{net} >= 0", "column_id": "net"},
+         "color": "#22c55e", "fontWeight": "800"},
+        # THE row that matters: gross said you won, costs said otherwise.
+        {"if": {"filter_query": "{rupee} > 0 && {net} < 0", "column_id": "net"},
+         "backgroundColor": "rgba(248,113,113,0.16)", "color": "#fca5a5", "fontWeight": "800"},
         {"if": {"filter_query": '{outcome} contains "SL"', "column_id": "outcome"},
          "color": "#f87171", "fontWeight": "600"},
         {"if": {"filter_query": '{outcome} contains "target"', "column_id": "outcome"},
@@ -5845,11 +5878,28 @@ def _scout_openpos_body(today: str, as_of):
         "pnl": "Realised P&L = exit / entry − 1.",
         "rupee": "Realised ₹ at ONE lot = (exit − entry) × index lot size "
                  "(NIFTY 65 · BANK 30 · FIN 60 · MIDCAP 120). The real account move — "
-                 "MIDCAP churn hits 120× per ₹, so its red trades dominate the day's total.",
+                 "MIDCAP churn hits 120× per ₹, so its red trades dominate the day's total. "
+                 "GROSS: the exchange's number, before charges.",
+        "cost": "Zerodha round-trip charges at ONE lot: ₹20/order brokerage (×2 = ₹40, FLAT — "
+                "the only leg that does NOT scale with size) + STT 0.10% on the sell + "
+                "exchange 0.03503% + SEBI 0.0001% + stamp 0.003% on the buy + 18% GST. "
+                "Typically ₹68–100 a trade. Hover a cost cell for that trade's breakdown.",
+        "net": "₹/lot gross − costs = what actually reaches the account at 1 lot. A row "
+               "highlighted red here was a GROSS winner the charges turned into a loss — the "
+               "cost floor, visible per trade. Trading more lots amortises the ₹40 brokerage "
+               "and shrinks this gap; the other charges scale with turnover and never go away.",
         "outcome": "How the episode closed.",
     }
+    # per-trade charge breakdown, one dict per closed row (same order as closed_records)
+    closed_row_tips = [
+        {"cost": {"value": "**Zerodha charges, this trade**  \n"
+                           + bcosts.explain(e.get("entry"), e.get("exit"),
+                                            LOT_SIZES.get(e["sym"])).replace(" · ", "  \n"),
+                  "type": "markdown"}}
+        for e in closed]
     closed_tbl = _ledger_table(closed_records, closed_cols, closed_extra_cond,
-                               closed_tips, closed_header_tips, tbl_id="scout-closed-table")
+                               closed_tips, closed_header_tips, tbl_id="scout-closed-table",
+                               row_tips=closed_row_tips)
 
     # ── day summary — realized win-rate + the ACCOUNT-TRUE ₹ total at 1 lot ───────
     rp = [e["pnl"] for e in closed if e.get("pnl") is not None]
@@ -5857,13 +5907,23 @@ def _scout_openpos_body(today: str, as_of):
     avg = round(sum(rp) / len(rp), 1) if rp else None
     # Real ₹ at ONE lot per index — the number the % Σ hides. Summing %s across trades
     # that sit on different premiums AND different lot sizes is meaningless; ₹ is not.
-    rs_by_idx, net_rs = {}, 0
+    # GROSS is what the exchange printed; NET is what the account keeps. Track both, and
+    # break the per-index tally on NET — a per-index line that ignores charges is the same
+    # flattering number one level down.
+    rs_by_idx, gross_rs, cost_rs, net_rs = {}, 0, 0, 0
+    n_costed = 0                       # trades whose charges we could actually compute
+    net_wins = 0
     for e in closed:
         r = _pnl_rs(e.get("sym"), e.get("entry"), e.get("exit"))
         if r is None:
             continue
-        net_rs += r
-        rs_by_idx[e["label"]] = rs_by_idx.get(e["label"], 0) + r
+        c = _cost_rs(e.get("sym"), e.get("entry"), e.get("exit")) or 0
+        gross_rs += r
+        cost_rs += c
+        net_rs += r - c
+        n_costed += 1
+        net_wins += 1 if (r - c) > 0 else 0
+        rs_by_idx[e["label"]] = rs_by_idx.get(e["label"], 0) + (r - c)
     summ_c = "#22c55e" if (avg or 0) >= 0 else "#f87171"
     net_c = "#22c55e" if net_rs >= 0 else "#f87171"
     summary = html.Div([
@@ -5874,17 +5934,41 @@ def _scout_openpos_body(today: str, as_of):
             if rp else html.Span(""),
             html.Span(f"  ·  avg {avg:+.1f}%" if avg is not None else "",
                       style={"color": summ_c, "fontWeight": "700"}),
-            # THE headline number: real rupees at 1 lot each. Not %-summed.
-            html.Span(f"  ·  Σ ₹{net_rs:+,} (1 lot)" if rs_by_idx else "",
-                      title="Realised ₹ if you traded exactly ONE lot of each — "
-                            "Σ (exit − entry) × index lot size. The account-true total; "
-                            "the arrow is negative-EV over large samples.",
+            # GROSS first, struck through in spirit — it is the number the ledger used to
+            # stop at, and the one that flatters the arrow.
+            html.Span(f"  ·  gross ₹{gross_rs:+,}" if rs_by_idx else "",
+                      title="Σ (exit − entry) × lot size, before any charge. The exchange's "
+                            "number, not the account's.",
+                      style={"color": "#64748b", "fontWeight": "600", "cursor": "help"}),
+            html.Span(f"  −  costs ₹{cost_rs:,}" if rs_by_idx else "",
+                      title=f"Zerodha round-trip charges on {n_costed} closed trades at ONE "
+                            f"lot each. Brokerage alone is ₹{40 * n_costed:,} "
+                            f"({n_costed} × ₹40) and is FLAT — it does not grow with size, so "
+                            f"this drag shrinks fast if you trade more lots.",
+                      style={"color": "#fb923c", "fontWeight": "700", "cursor": "help"}),
+            # THE headline number: real rupees at 1 lot each, AFTER charges. Not %-summed.
+            html.Span(f"  =  Σ ₹{net_rs:+,} NET (1 lot)" if rs_by_idx else "",
+                      title="What actually reaches the account if you traded exactly ONE lot "
+                            "of each — gross minus every Zerodha charge. This is the honest "
+                            "day total; the arrow is negative-EV over large samples.",
                       style={"color": net_c, "fontWeight": "800", "cursor": "help",
                              "fontSize": "0.74rem"}),
         ]),
-        # per-index ₹ breakdown, worst → best — makes the heavy-lot index's damage obvious
+        # win-rate AFTER charges — the count that changes most. A 12/22 gross day can be
+        # 9/22 net, because the small winners are exactly the ones ~₹80 of charges kills.
+        html.Div(
+            [html.Span(f"net of costs: {net_wins}/{n_costed} win",
+                       style={"color": "#22c55e" if net_wins * 2 >= n_costed else "#f87171",
+                              "fontWeight": "700"}),
+             html.Span(f"   ({wins - net_wins} gross winner"
+                       f"{'' if (wins - net_wins) == 1 else 's'} turned negative by charges)"
+                       if (wins - net_wins) > 0 else "",
+                       style={"color": "#fb923c"})],
+            style={"fontSize": "0.62rem", "marginTop": "3px"}) if n_costed else html.Span(""),
+        # per-index NET ₹ breakdown, worst → best — heavy-lot damage, after charges
         html.Div([
             html.Span(f"{lbl} ₹{v:+,}   ",
+                      title="NET of Zerodha charges, at 1 lot.",
                       style={"color": "#22c55e" if v >= 0 else "#f87171",
                              "fontWeight": "700", "marginRight": "4px"})
             for lbl, v in sorted(rs_by_idx.items(), key=lambda kv: kv[1])
@@ -5896,8 +5980,11 @@ def _scout_openpos_body(today: str, as_of):
         "search box (top-right) to filter both tables across all columns (e.g. NIFTY, PE, "
         "flipped, contradicts). One stance per index; OPEN holds through NO-TRADE blinks "
         "until it flips / hits SL / target / breaks the σ-band. CLOSED P&L is realized (entry→exit on the "
-        f"arrow's option); ₹/lot = that move × the index lot size (the real account P&L — "
-        "MIDCAP's 120-lot dominates the day). Alert-log state, "
+        f"arrow's option); ₹/lot gross = that move × the index lot size (MIDCAP's 120-lot "
+        "dominates the day). COSTS are the real Zerodha round-trip bill at ONE lot — ₹40 flat "
+        "brokerage + STT + exchange + SEBI + stamp + GST, ~₹68–100 a trade — and ₹ NET is what "
+        "the account actually keeps. Brokerage is per ORDER, so the drag shown is the worst "
+        "case; it amortises as you add lots, the turnover charges do not. Alert-log state, "
         f"tf={_ALERT_TF}m. Decision-support only — the arrow is negative-EV; trade the "
         "range band, not the arrow.",
         style={"color": "#64748b", "fontSize": "0.58rem", "lineHeight": "1.4"})
