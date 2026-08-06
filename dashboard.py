@@ -1733,8 +1733,8 @@ app.layout = dbc.Container([
                         html.Div(id="tb-ledger-closed"),
                         html.Div(
                             "ENTRY ₹/NOW ₹/EXIT ₹ = the ATM CE/PE PREMIUM (1 lot) — from the "
-                            "captured chain, LIVE ONLY and only while FRESH: the chain dies "
-                            "~11am so afternoon rows show n/a (no reliable premium) · exits: "
+                            "captured chain, LIVE ONLY and only while FRESH: a row shows n/a "
+                            "whenever its snapshot is stale (no reliable premium) · exits: "
                             "band touch / SL / flipped / 90m / bell · the naked CE/PE is "
                             "MEASURED NEGATIVE-EV (theta+spread bleed the option even when the "
                             "index level is ~breakeven) — this ledger SHOWS you that; the "
@@ -3732,7 +3732,7 @@ def _tradeboard_body():
         body.append(_sec(f"OPTION CHAIN — OI · COI · VOL · IV · PREMIUM   "
                          f"({'STALE ' + str(age) + 'm — context only' if stale else 'live ' + str(age) + 'm'})"))
         if stale:
-            body.append(html.Div("chain data stale (capture dies ~11am) — greyed, not scored",
+            body.append(html.Div("chain data stale — greyed, not scored",
                                  style={"color": "#f87171", "fontSize": "0.64rem",
                                         "marginBottom": "4px"}))
         if r.get("strikes"):
@@ -3978,7 +3978,7 @@ def _tb_chain_panel(row):
     out.append(_sec(f"PHASE 1 — OPTION CHAIN · OI · COI · VOL · IV · PREMIUM  "
                     f"({'STALE ' + str(age) + 'm — context only' if stale else 'live ' + str(age) + 'm'})"))
     if stale:
-        out.append(html.Div("chain stale (capture dies ~11am) — greyed, not scored",
+        out.append(html.Div("chain stale — greyed, not scored",
                             style={"color": "#f87171", "fontSize": "0.64rem"}))
     if row.get("strikes"):
         out.append(_tb_strike_table(row["strikes"], row.get("chain", {})))

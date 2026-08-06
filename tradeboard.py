@@ -706,7 +706,12 @@ def scout_pa_ledger(date, as_of, ltf_tf: int = 15, htf_tf: int = 60, hold: int =
         d0 = (as_of.date() if as_of else None)
         lot = LOT_SIZES.get(sym, 1)
         # today's captured option chain (premiums only exist for captured days, and the chain
-        # DIES ~11am — so a premium read is trusted only when its snapshot is FRESH (<=20min old
+        # can DIE MID-SESSION on a REST-quota exhaustion — so a premium read is trusted only
+        # when its snapshot is FRESH (<=20min old
+        # NOTE (measured 2026-08-06, 10 sessions): the historical "~11am death" is no longer
+        # the normal case — 9/10 sessions captured 09:14→15:23-15:30 (403-431 snapshots) with
+        # 0-1 min staleness at 14:00. The freshness gate below is the authority either way;
+        # it keys off ACTUAL snapshot age, never off a hardcoded hour.
         # at the query time), else 'n/a'. Read once per sym.
         try:
             _chain = read_mirror("chain_snapshots", d0s, as_of, sym)

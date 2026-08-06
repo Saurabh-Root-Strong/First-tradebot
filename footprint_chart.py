@@ -17,8 +17,12 @@ Series produced (whole session 9:15 -> now, resampled to tf-minute bars):
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 from core.constants import IST, LIVE_DIR, NSE_NAME, STRIKE_DISPLAY_STEP, STRIKE_STEP, today_iso
 from core.mirror_io import read_mirror as _read_raw
@@ -187,6 +191,7 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
 
     # CE/PE totals from oi_snapshots (canonical); fall back to chain if absent.
     iv_atm = prem_ce = prem_pe = None
+    _oi_degraded = False          # True → OI totals came from the churning chain-sum fallback
     if oi is not None and "total_call_oi" in oi.columns:
         oi_i = oi.set_index("ts").sort_index()
         oi_ce, oi_pe = oi_i["total_call_oi"], oi_i["total_put_oi"]
@@ -197,8 +202,30 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
         if "atm_call_prem" in oi_i.columns:         # per-leg ATM premium → buy/write splitter
             prem_ce, prem_pe = oi_i["atm_call_prem"], oi_i["atm_put_prem"]
     else:
+        # ── FALLBACK — NOT equivalent to the canonical source, and it can be very wrong ──
+        # oi_snapshots' totals are computed by the capturer on a stable basis. This sum is
+        # taken over WHATEVER STRIKES THE CHAIN HAPPENS TO HOLD at each ts, and the capture
+        # width churns between 31 and 51 strikes on 33.7% of snapshots (measured 2026-08-06,
+        # 10 sessions). Every width change adds/removes ~20 strikes of standing OI at once,
+        # so the bar-to-bar DIFF of this series is dominated by the strike set rather than by
+        # trading: |Δ| on width-change snapshots runs 65-476x the width-stable median.
+        #
+        # That makes d_oi_ce/d_oi_pe — and therefore the `flow` (0.40) and `div` (0.25)
+        # signal legs — unreliable in both magnitude and SIGN whenever this branch is taken.
+        # It used to be taken silently. Flag it so a missing oi_snapshots shows up as a data
+        # problem instead of quietly becoming a 100x error in a directional read.
         oi_ce = chain[chain["side"] == "CE"].groupby("ts")["oi"].sum().sort_index()
         oi_pe = chain[chain["side"] == "PE"].groupby("ts")["oi"].sum().sort_index()
+        _oi_degraded = True
+        try:
+            _nw = chain.groupby("ts")["strike"].nunique()
+            _churn = float((_nw.diff().abs() > 0).mean()) if len(_nw) > 1 else 0.0
+        except Exception:
+            _churn = 0.0
+        log.warning(
+            "%s %s: oi_snapshots missing — OI totals fell back to the chain sum over a "
+            "strike set that churns on %.0f%% of snapshots. d_oi (and the flow/div signal "
+            "legs built on it) are UNRELIABLE for this day.", sym, date or "", 100 * _churn)
 
     if not len(strad) and not len(cum_vol):
         return {"has_data": False, "sym": sym, "tf": tf_min, "note": "warming up"}
@@ -327,8 +354,31 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
     _common = (res_ce + res_pe) / 2.0
     res_ce = res_ce - _common
     res_pe = res_pe - _common
-    eps_ce = max(1.0, 0.10 * float(d_oi_ce.abs().median() or 0))
-    eps_pe = max(1.0, 0.10 * float(d_oi_pe.abs().median() or 0))
+    # ── OI DEADBAND, calibrated 2026-08-06 (was 0.10 = no filtering at all) ──────────
+    # `_act` branches on the SIGN of d_oi, so the sign has to mean something. Measured by
+    # comparing this series against an independent reconstruction of the same quantity
+    # (per-strike chain diff, summed) over 8 sessions, n=188 bars: correlation only +0.46
+    # and the two agree on SIGN just 61.7% of the time. The disagreement is concentrated
+    # entirely in small bars — by |d_oi| quintile the agreement runs
+    #     q1 235k → 47.4%   q2 1.2M → 62.2%   q3 2.2M → 50.0%
+    #     q4 5.0M → 67.6%   q5 14.6M → 81.6%
+    # i.e. the smallest fifth is a coin flip. At the old 0.10 multiplier the deadband kept
+    # 95.7% of bars, so that coin flip flowed straight into flow (0.40) and div (0.25).
+    #
+    #     mult   bars kept   sign agreement
+    #     0.10       95.7%        61.1%     <- old
+    #     0.50       73.9%        66.9%
+    #     1.00       50.5%        68.4%     <- chosen
+    #     2.00       23.9%        71.1%
+    #     3.00       15.4%        62.1%     (n=29, degrades — not a real improvement)
+    #
+    # 1.0 is the knee: the best agreement still backed by half the sample. 2.0 buys ~3pp
+    # more for another 27% of bars and 3.0 falls apart, so this is not tuned to the max.
+    # HONEST COST: half of all bars now read "flat" instead of a direction. That is the
+    # point — they were never distinguishable from noise.
+    _OI_EPS_MULT = 1.0
+    eps_ce = max(1.0, _OI_EPS_MULT * float(d_oi_ce.abs().median() or 0))
+    eps_pe = max(1.0, _OI_EPS_MULT * float(d_oi_pe.abs().median() or 0))
 
     def _act(d_oi, resid, eps):
         if pd.isna(d_oi) or abs(d_oi) < eps:
@@ -343,6 +393,10 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
     _wc = _wallclock(bar.index)
     return {
         "has_data": True, "sym": sym, "tf": tf_min,
+        # True → OI totals came from the chain-sum fallback over a churning strike set, so
+        # d_oi / flow / div are unreliable here. Consumers should degrade the OI read
+        # rather than present it as equal-confidence.
+        "oi_degraded": _oi_degraded,
         "ts":      [t.to_pydatetime() for t in _wc],
         "premium": [None if pd.isna(v) else round(float(v), 2) for v in bar["premium"]],
         "oi_ce":   [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in bar["oi_ce"]],

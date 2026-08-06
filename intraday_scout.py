@@ -248,7 +248,21 @@ def _divergence_signal(ser: dict) -> tuple[float, str]:
 def _crossover_signal(ser: dict) -> tuple[float, str]:
     """CE/PE OI tilt g and whether it FLIPPED recently (the crossover event).
     g=(putOI-callOI)/(putOI+callOI). Returns the flip event lean (not the standing
-    tilt — that is _tilt_signal)."""
+    tilt — that is _tilt_signal).
+
+    STRUCTURALLY DORMANT — measured 2026-08-06 over 8 sessions x 4 indices: this fired
+    ZERO times. Not a bug, a self-defeating condition. Firing needs g to change SIGN while
+    |g| > _TILT_DB at BOTH endpoints — but to change sign g must pass THROUGH the ±_TILT_DB
+    band, so on any ordinary crossing one endpoint is inside it and the test fails. Only a
+    jump clean across the whole band within the window qualifies. g does cross zero (NIFTY
+    16, BANK 1, FIN 10, MIDCAP 13 times), so the crossings are real — the gate just cannot
+    see them. MIDCAP additionally sits inside ±0.05 for 79.4% of the session.
+
+    LEFT DORMANT ON PURPOSE. The obvious "fix" is to widen the window or drop the deadband
+    so it fires — do NOT. The standing CE/PE crossover has measured IC ≈ 0 and is mildly
+    CONTRARIAN (see the crossover backtest); making a known-null signal fire would inject
+    noise into `strength` at weight 0.15, not add information. Its 0.0 return is the correct
+    contribution. Delete it only with the weights renormalised deliberately."""
     oc = _last(ser.get("oi_ce") or [], _RECENT + 2)
     op = _last(ser.get("oi_pe") or [], _RECENT + 2)
     if len(oc) < 3 or len(op) < 3:
