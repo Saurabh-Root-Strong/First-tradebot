@@ -1532,7 +1532,12 @@ app.layout = dbc.Container([
                         options=[{"label": "5m → 15m band", "value": 5},
                                  {"label": "10m → 30m band", "value": 10},
                                  {"label": "15m → 1h band", "value": 15},
-                                 {"label": "60m → 1h band", "value": 60}],
+                                 # NOT a pair — trigger and horizon are the same frame, so
+                                 # the arrow would be a lie. This is the classic single-frame
+                                 # read: one look per hour off the completed 1h bar. It trades
+                                 # the SAME 1h band as "15m → 1h" (identical calibration cell,
+                                 # identical coverage); only the observation rate differs.
+                                 {"label": "1h · single frame", "value": 60}],
                         value=60, style={"fontSize": "0.72rem"}), md=2),
                     # Replay: pick ANY cutoff minute (truncate every chart at that
                     # time to study what the market did next). Cleared = full/live
@@ -6090,9 +6095,13 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
     # Overlay the live trade brain ONLY for the live 15m view (the alert detector that
     # fills scout-seen scans at 15m). On replay / a different TF the per-bar scan is the
     # honest source, so no overlay.
-    # The alert detector that fills scout-seen runs headless at _ALERT_TF. Overlay it only
-    # when the page is on that SAME trigger frame — on any other horizon the per-bar scan
-    # is the honest source and a 60m overlay would describe a different trade.
+    # NOTE (verified 2026-08-05): this is effectively DEAD in the live path. The row overlay
+    # below reads `_lmem` when live — the authoritative poller log — and only falls back to
+    # `seen` (the browser's own second-engine copy) on replay/ghost, where this guard has
+    # already blanked it. Rendering with seen=<full dict> vs seen={} is byte-identical at
+    # every timeframe. Kept as a correctness guard, not because it changes what you see:
+    # the headless alert poller runs at _ALERT_TF regardless of this dropdown, so picking a
+    # different trade horizon does NOT cost you the live alert overlay.
     seen = seen if (live and _tf == _ALERT_TF) else {}
     when = ("LIVE" if live else
             f"👻 GHOST {date} @ {as_of_dt:%H:%M} — practice, future hidden" if
@@ -6130,7 +6139,10 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
                "borderRadius": "4px", "padding": "1px 8px", "cursor": "pointer"})
         if live else None)
     title = html.Div([
-        html.Span(f"🎯 SCOUT — {_tf}m trigger → next {_hz}m band  ·  {when}  ·  ", title=(
+        html.Span(("🎯 SCOUT — " + (f"{_tf}m single frame → next {_hz}m band"
+                                    if _tf == _hz else
+                                    f"{_tf}m trigger → next {_hz}m band")
+                   + f"  ·  {when}  ·  "), title=(
             "GHOST PRACTICE: a past captured session replayed on today's wall clock — "
             "advances by itself, the future is hidden until the real 15:30, then the "
             "day grades your calls. Pick the day via the date strip (bottom bar). "
@@ -6152,8 +6164,17 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
         # HORIZON chip — says which frame is the trigger and which is the product, and
         # refuses to imply the pairing is an edge. The band is calibrated per horizon and
         # holds 72-80% at every one of them; the ARROW is not validated at any of them.
-        html.Span(f"  ·  hold ≈{_hz}m",
-                  title=(f"Trigger read on the {_tf}m frame; the RANGE band you trade is the "
+        html.Span(f"  ·  hold ≈{_hz}m" + ("  · 1 look/bar" if _tf == _hz else
+                                          f"  · {max(1, _hz // _tf)} looks"),
+                  title=(("SINGLE FRAME: trigger and horizon are the same bar, so there is no "
+                          "multi-timeframe split here — you get ONE look per horizon, off the "
+                          "completed bar. It trades the SAME band as the 15m → 1h setting "
+                          "(same calibration cell, same coverage); only the observation rate "
+                          "differs.\n\n"
+                          if _tf == _hz else
+                          f"{_hz // _tf} looks per horizon: the trigger updates on the {_tf}m "
+                          f"frame while the band you are trading stays the {_hz}m one.\n\n")
+                         + f"Trigger read on the {_tf}m frame; the RANGE band you trade is the "
                          f"{_hz}m one, because that is the horizon it was calibrated and "
                          f"graded on (nightly, n≈569/cell, 72-80% coverage at every horizon "
                          f"— it does not get less honest when you shorten it).\n\n"
