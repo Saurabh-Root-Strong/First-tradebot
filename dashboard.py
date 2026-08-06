@@ -1521,11 +1521,18 @@ app.layout = dbc.Container([
                         id="charts-idx", clearable=False,
                         options=[{"label": LABELS[s], "value": s} for s in INDEX_SYMBOLS],
                         value="NSE:NIFTY50-INDEX", style={"fontSize": "0.72rem"}), md=2),
+                    # TRADE HORIZON, not a bare bar-size. The value stays the TRIGGER
+                    # timeframe (an int, so the chart callback is unchanged) and
+                    # _HORIZON_OF maps it to the FORECAST horizon the band is drawn and
+                    # graded over. The pairing is the point: you read the trigger on the
+                    # fast frame, but the product you are trading — the RANGE band — is
+                    # the slower frame's, because that is the frame it was calibrated on.
                     dbc.Col(dcc.Dropdown(
                         id="charts-tf", clearable=False,
-                        options=[{"label": "5 min", "value": 5},
-                                 {"label": "15 min", "value": 15},
-                                 {"label": "60 min", "value": 60}],
+                        options=[{"label": "5m → 15m band", "value": 5},
+                                 {"label": "10m → 30m band", "value": 10},
+                                 {"label": "15m → 1h band", "value": 15},
+                                 {"label": "60m → 1h band", "value": 60}],
                         value=60, style={"fontSize": "0.72rem"}), md=2),
                     # Replay: pick ANY cutoff minute (truncate every chart at that
                     # time to study what the market did next). Cleared = full/live
@@ -5268,6 +5275,44 @@ def _ghost_boot(_path, cur):
 # breaks less often (each RANGE BREAK more meaningful).
 _ALERT_TF = 60
 
+# TRADE HORIZON MAP — trigger timeframe (the charts-tf value) → FORECAST horizon in
+# minutes (what the RANGE band is drawn and graded over).
+#
+# WHY THE PAIR, AND WHY ONLY THESE PAIRS. The band is the one validated product on this
+# board, and `hour_forecast` calibrates it PER HORIZON nightly — measured deployed
+# coverage on 2026-08-05 (n=569 per cell, target 68%):
+#
+#       horizon      5m     15m     30m     60m    120m
+#       NIFTY     79.2%   77.4%   79.0%   79.8%   76.8%
+#       BANK      75.5%   75.7%   76.7%   75.9%   77.5%
+#       FIN       75.2%   74.2%   76.6%   76.1%   75.4%
+#       MIDCAP    72.6%   72.2%   74.2%   72.4%   73.0%
+#
+# It holds at EVERY horizon, so the horizon is a free choice — the band does not get
+# less honest at 15m than at 60m. That is what makes this dropdown legitimate.
+#
+# WHAT IT IS NOT. Pairing a fast trigger with a slow confirm does NOT create a
+# directional edge: the multi-timeframe alignment sweep beat the base rate in 9 of 9
+# cells but the best cell was +3.38 bps with CI [−1.5, 8.33], and a control arm of
+# random round-100 levels matched the "wall break" at 2 of 3 holds. So the horizon
+# changes WHICH BAND you are trading and how often you look — not whether the arrow
+# is worth taking. The arrow stays NO-TRADE-by-default at every setting.
+#
+# Shorter horizons are for shorter HOLDS, which matters because theta is the thing
+# that kills a bought option — but a shorter hold also means the cost floor is spread
+# over a smaller move. 5m→15m is the scalp end and the least forgiving of costs.
+_HORIZON_OF = {5: 15, 10: 30, 15: 60, 60: 60}
+
+
+def _horizon_for(tf) -> int:
+    """Forecast horizon (minutes) for a trigger timeframe. Falls back to the tf itself
+    so any timeframe not in the map behaves exactly as it did before this map existed."""
+    try:
+        tf = int(tf)
+    except (TypeError, ValueError):
+        return _ALERT_TF
+    return _HORIZON_OF.get(tf, tf)
+
 # Max-hold TIMEOUT (minutes): a scout position that never hit SL/target/band/flip is
 # force-CLOSED in the ledger once it has been open this long — the poller itself holds a
 # dangling position all day (2026-07-09 BANK CE opened 10:02, still open 15:56, ~6h of
@@ -6029,7 +6074,13 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
                     continue
         except Exception:
             anchors = None
-    rows = scout.scan(int(tf_min or 15), date, as_of_dt, anchors=anchors)
+    # TRIGGER frame vs FORECAST horizon. The dropdown picks the trigger; _horizon_for maps
+    # it to the horizon the band is drawn and graded over (5→15, 10→30, 15→60, 60→60).
+    # Passing them separately is what makes "read it on 15m, trade the 1h band" possible —
+    # scan/scan_index already accepted horizon_min; the page was collapsing both into one.
+    _tf = int(tf_min or 15)
+    _hz = _horizon_for(_tf)
+    rows = scout.scan(_tf, date, as_of_dt, horizon_min=_hz, anchors=anchors)
     # PRACTICE: the verify line grades t→t+H against the FULL captured file — on a
     # past day that is the future. Blank it while the ghost session runs so the user
     # can't peek; after the real 15:30 the grades unlock and the day self-scores.
@@ -6039,7 +6090,10 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
     # Overlay the live trade brain ONLY for the live 15m view (the alert detector that
     # fills scout-seen scans at 15m). On replay / a different TF the per-bar scan is the
     # honest source, so no overlay.
-    seen = seen if (live and int(tf_min or _ALERT_TF) == _ALERT_TF) else {}
+    # The alert detector that fills scout-seen runs headless at _ALERT_TF. Overlay it only
+    # when the page is on that SAME trigger frame — on any other horizon the per-bar scan
+    # is the honest source and a 60m overlay would describe a different trade.
+    seen = seen if (live and _tf == _ALERT_TF) else {}
     when = ("LIVE" if live else
             f"👻 GHOST {date} @ {as_of_dt:%H:%M} — practice, future hidden" if
             (practice and as_of_dt and not _ghost_done()) else
@@ -6076,7 +6130,7 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
                "borderRadius": "4px", "padding": "1px 8px", "cursor": "pointer"})
         if live else None)
     title = html.Div([
-        html.Span(f"🎯 SCOUT — predict next {tf_min}m  ·  {when}  ·  ", title=(
+        html.Span(f"🎯 SCOUT — {_tf}m trigger → next {_hz}m band  ·  {when}  ·  ", title=(
             "GHOST PRACTICE: a past captured session replayed on today's wall clock — "
             "advances by itself, the future is hidden until the real 15:30, then the "
             "day grades your calls. Pick the day via the date strip (bottom bar). "
@@ -6095,6 +6149,23 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
                         "actually open.",
                   style={"color": "#94a3b8", "fontSize": "0.62rem", "cursor": "help"}),
         sb, openbtn,
+        # HORIZON chip — says which frame is the trigger and which is the product, and
+        # refuses to imply the pairing is an edge. The band is calibrated per horizon and
+        # holds 72-80% at every one of them; the ARROW is not validated at any of them.
+        html.Span(f"  ·  hold ≈{_hz}m",
+                  title=(f"Trigger read on the {_tf}m frame; the RANGE band you trade is the "
+                         f"{_hz}m one, because that is the horizon it was calibrated and "
+                         f"graded on (nightly, n≈569/cell, 72-80% coverage at every horizon "
+                         f"— it does not get less honest when you shorten it).\n\n"
+                         f"This sets your HOLD and how often you look. It does NOT make the "
+                         f"direction tradeable: the multi-timeframe alignment sweep won 9 of "
+                         f"9 cells but the best was +3.38 bps with CI [-1.5, 8.33], and a "
+                         f"random-level control matched the wall-break at 2 of 3 holds. "
+                         f"Shorter holds bleed less theta but spread the SAME cost floor "
+                         f"over a smaller move."),
+                  style={"color": "#67e8f9", "fontSize": "0.58rem", "cursor": "help",
+                         "border": "1px solid #164e63", "borderRadius": "4px",
+                         "padding": "1px 6px", "marginLeft": "8px"}),
     ], style={"marginBottom": "5px"})
     note = html.Div([
         html.Span("⛔ MEASURED OPTION P&L (backtest_scout, 8d, n=73): buying the ATM "
