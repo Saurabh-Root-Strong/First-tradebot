@@ -57,6 +57,85 @@ GST_RATE = 0.18                 # 18% on brokerage + exchange txn + SEBI
 STAMP_BUY = 0.00003             # 0.003% of buy premium turnover (buy side only)
 
 
+# ── the OTHER two terms of a long-option round trip ───────────────────────────────
+# Charges above are only part of what a bought option pays. The spread is crossed once
+# per round trip and does NOT shrink with size; theta runs the whole time you hold.
+#
+# SPREAD — Roll (1984) effective spread recovered from the delta-stripped residual of the
+# captured chain (measure_cost_floor), % of ATM premium, per index. Measured, not quoted.
+SPREAD_PCT = {"NSE:NIFTY50-INDEX": 1.25, "NSE:NIFTYBANK-INDEX": 0.70,
+              "NSE:FINNIFTY-INDEX": 0.95, "NSE:MIDCPNIFTY-INDEX": 1.10}
+SPREAD_PCT_DEFAULT = 1.10
+
+# THETA — %/hour of ATM premium, by days-to-expiry. Recovered from the same residual by
+# conditioning on quiet spot AND quiet IV so gamma and vega cannot contaminate it. The
+# cliff at DTE 0 is the single largest term in the whole model.
+THETA_PCT_HR = {0: -16.18, 1: -4.65, 2: -2.60, 3: -2.40, 4: -1.68, 5: -2.35, 6: -2.10}
+THETA_PCT_HR_FAR = -1.90        # DTE > 6
+
+
+def theta_pct(dte, horizon_min) -> float | None:
+    """Theta cost as % of premium over a hold of `horizon_min`, positive = cost."""
+    if horizon_min is None:
+        return None
+    try:
+        h = float(horizon_min)
+        d = None if dte is None else int(dte)
+    except (TypeError, ValueError):
+        return None
+    if d is None:
+        # UNKNOWN EXPIRY → refuse. There is no safe default: theta spans 16.18%/hr at DTE 0
+        # to 1.68%/hr at DTE 4, so guessing "far-dated" would flatter a real expiry-day trade
+        # by ~8x, and guessing DTE 0 would condemn every far-dated one. Caller shows nothing.
+        return None
+    rate = THETA_PCT_HR.get(d, THETA_PCT_HR_FAR) if d <= 6 else THETA_PCT_HR_FAR
+    return abs(rate) * h / 60.0
+
+
+def spread_pct(sym: str | None) -> float:
+    return SPREAD_PCT.get(sym or "", SPREAD_PCT_DEFAULT)
+
+
+def option_ev(band_pct: float | None, sym: str | None, dte, horizon_min,
+              prem: float | None = None, lot: int | None = None) -> dict | None:
+    """Expected value of BUYING the ATM arrow and holding it for `horizon_min`, as % of
+    premium. `band_pct` = the forecast band's half-width expressed in premium terms
+    (delta x index_half / premium).
+
+    WHY THE TARGET PLACEMENT IS NOT AN INPUT. The band is symmetric and the arrow has no
+    measured directional edge (7-day sweep, 4 settings, all beaten by a coin-flip control
+    at the same instants). So the favourable-edge and adverse-edge legs carry equal
+    probability and equal magnitude — they CANCEL — and what survives is
+
+        EV = -(theta + cost)
+
+    a constant with respect to where the stop and target sit. Moving them redistributes
+    probability across outcomes whose mean is already fixed by decay and friction. That is
+    why this function takes no SL/target argument: they cannot change the answer.
+
+    Returns None when any input is missing rather than guessing — a confident EV built on
+    a stale premium is worse than no EV.
+    """
+    if band_pct is None or horizon_min is None:
+        return None
+    th = theta_pct(dte, horizon_min)
+    if th is None:
+        return None
+    charges = None
+    if prem and lot:
+        c = roundtrip(prem, prem, lot)
+        charges = 100.0 * c["total"] / (prem * lot) if c else None
+    if charges is None:                    # no premium/lot → charges-only fallback ~0.5%
+        charges = 0.50
+    sp = spread_pct(sym)
+    cost = charges + sp
+    return {"band_pct": round(band_pct, 2), "theta_pct": round(th, 2),
+            "spread_pct": round(sp, 2), "charges_pct": round(charges, 2),
+            "cost_pct": round(cost, 2),
+            "win_pct": round(band_pct - th - cost, 2),      # rode to the favourable edge
+            "ev_pct": round(-(th + cost), 2)}               # the constant that survives
+
+
 def roundtrip(entry_prem: float | None, exit_prem: float | None,
               lot_size: int | None, lots: int = 1) -> dict | None:
     """Full round-trip charge breakdown for a bought-then-sold option position.

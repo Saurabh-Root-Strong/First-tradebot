@@ -5002,6 +5002,61 @@ def _scout_dte(sym, today):
     return _mc.days_to_expiry(day, weekly=(sym == _NIFTY))
 
 
+def _scout_ev_chip(r, lc, today):
+    """The arithmetic behind the SL/target the card just printed.
+
+    WHY THIS EXISTS. `SL ₹510 · T ₹1093` reads like a trade plan. Measured, it is not one:
+    the target sits 7-12.5x outside the ±1σ band the same model just forecast, so it cannot
+    be reached inside the horizon. And because the band is symmetric while the arrow has no
+    measured directional edge, the favourable and adverse legs cancel and
+
+        EV = -(theta + cost)
+
+    — a constant, unchanged by where the levels sit. Printing levels without that number is
+    the board's most actionable-looking lie. Returns an empty Span when any input is missing
+    (stale chain, no band, unknown expiry) rather than showing a confident wrong figure.
+    """
+    from core import broker_costs as _bc
+    from core.constants import LOT_SIZES as _LOTS
+    lo, hi = r.get("pred_lo"), r.get("pred_hi")
+    prem = (lc or {}).get("entry_prem")
+    hz = r.get("horizon") or r.get("tf")
+    if not (lo and hi and prem and hz) or prem <= 0:
+        return html.Span("")
+    # index band half → premium terms. delta≈0.5 at the ATM strike the card quotes; the
+    # captured per-strike delta would be exact, but 0.5 is within ~±0.05 at the money.
+    band_pct = 0.5 * ((hi - lo) / 2.0) / prem * 100.0
+    try:
+        dte = _scout_dte(r["sym"], today)
+    except Exception:
+        dte = None
+    ev = _bc.option_ev(band_pct, r.get("sym"), dte, hz,
+                       prem=prem, lot=_LOTS.get(r.get("sym")))
+    if not ev:
+        return html.Span("")
+    c = "#f87171" if ev["ev_pct"] < -3 else "#fb923c" if ev["ev_pct"] < 0 else "#22c55e"
+    return html.Span(
+        f"EV {ev['ev_pct']:+.1f}%  ",
+        title=(f"EXPECTED VALUE of buying this ATM arrow and holding it {hz}m, "
+               f"as % of premium.\n\n"
+               f"  1σ band reach   {ev['band_pct']:+.1f}%   (what a GOOD move pays)\n"
+               f"  theta {'(DTE ' + str(dte) + ')' if dte is not None else '(DTE ?)':<12} "
+               f"−{ev['theta_pct']:.1f}%\n"
+               f"  spread          −{ev['spread_pct']:.2f}%   (crossed once, does NOT "
+               f"shrink with size)\n"
+               f"  charges         −{ev['charges_pct']:.2f}%\n"
+               f"  ────────────────────────\n"
+               f"  best case (rode to the favourable band edge)  {ev['win_pct']:+.1f}%\n"
+               f"  EV                                            {ev['ev_pct']:+.1f}%\n\n"
+               f"The band is symmetric and the arrow has no measured directional edge "
+               f"(7-day sweep, 4 horizons, all beaten by a coin-flip control). So the "
+               f"favourable and adverse legs cancel, leaving EV = −(theta + cost). Moving "
+               f"the SL or the target does NOT change this number — it only redistributes "
+               f"which outcome you land in. The levers that DO move it: avoid DTE 0 "
+               f"(−17.9% vs −3.4% at 60m), hold shorter, trade less often."),
+        style={"color": c, "fontWeight": "700", "cursor": "help"})
+
+
 def _session_over(live: bool) -> bool:
     """Is the cash session finished? The arrow is an INTRADAY product — it is flat overnight,
     always. Without this the board kept rendering a live TRADE leg with a running age long
@@ -5155,6 +5210,7 @@ def _scout_row(r, mem=None, today=None, live=True, practice=False, session_over=
                       f"→ ₹{lc.get('cur_prem')} ", style={"color": "#cbd5e1"}),
             html.Span((f"({pnl:+.0f}%)  " if pnl is not None else ""), style={"color": pnlclr, "fontWeight": "700"}),
             html.Span(f"SL ₹{lc.get('sl')}  T ₹{lc.get('target')}   ", style={"color": "#64748b"}),
+            _scout_ev_chip(r, lc, today),
             html.Span(f"▸ {mng}", style={"color": mclr, "fontWeight": "700",
                                          "background": "#2a0a0a" if mng.startswith("CLOSE") else "transparent",
                                          "padding": "0 4px", "borderRadius": "3px"}),
