@@ -103,7 +103,36 @@ def _expiry_date(sym: str) -> Optional[str]:
 
 # Premium SL / first-target as % of entry, by timeframe (from trade_setup.TF_PROFILES).
 # Wider stop + further target the longer the hold.
-_SLT = {5: (0.30, 0.50), 15: (0.32, 0.55), 60: (0.35, 0.65)}
+_SLT = {5: (0.30, 0.50), 15: (0.32, 0.55), 30: (0.33, 0.60), 60: (0.35, 0.65),
+        120: (0.38, 0.72)}
+
+
+def _slt_for(horizon_min) -> tuple:
+    """(sl_pct, t1_pct) for a HOLD of `horizon_min`, interpolating to the nearest defined
+    profile rather than falling through to a hardcoded default (30m and 120m are reachable
+    horizons via the Charts dropdown and used to silently land on the 15m profile).
+
+    ⚠ KNOWN MIS-SPECIFICATION — these are chartist conventions, NOT derived from the band.
+    Measured 2026-08-07 (4 sessions x 4 indices x 3 times of day, ATM premium ~276):
+        horizon   band half as % of premium    target %    target / band
+          15m               4.0%                 50%          12.5x
+          30m               5.9%                 55%           9.4x
+          60m               7.9%                 65%           8.3x
+    The target sits 7-12.5x OUTSIDE the ±1σ band the same model just predicted, so it
+    cannot be reached inside the horizon — only over a much longer hold (the live legs run
+    to the poller's 90m cap, which is what these levels are really sized for). Keying on
+    the horizon fixes the DECOUPLING bug; it does not fix the levels themselves. A coherent
+    rebuild would derive both from the band (target = entry x (1 + k x delta x half/prem)),
+    which would put a 15m target near +4-6% — barely above the ~2% round-trip cost floor.
+    That is a deliberate design decision, not a refactor: do it with measurement, not here.
+    """
+    try:
+        h = int(horizon_min or 60)
+    except (TypeError, ValueError):
+        return _SLT[60]
+    if h in _SLT:
+        return _SLT[h]
+    return _SLT[min(_SLT, key=lambda k: abs(k - h))]
 _MKT_OPEN = datetime.time(9, 15)
 _OR_END = datetime.time(9, 30)       # opening-range window = first 15 min (09:15-09:30)
 _OPEN_SETTLE = datetime.time(9, 35)  # NO trade before this — market still cooling off
@@ -665,7 +694,11 @@ def _lifecycle(sym, tf_min, date, as_of, direction, horizon_min,
     # legacy/"weekly" bucket); _expiry_kind is the honest DISPLAY label only.
     entry = _opt_premium(sym, date, trig_t, trig_atm, side) if trig_atm else None
     cur = _opt_premium(sym, date, as_of, trig_atm, side) if trig_atm else None
-    sl_pct, t1_pct = _SLT.get(tf_min, (0.32, 0.55))
+    # SL/target belong to the HOLD, not to the frame you happened to read the trigger on.
+    # These were keyed on tf_min, which was equivalent while trigger == horizon. The Charts
+    # trade-horizon dropdown decoupled them (5m trigger → 15m band), so a 5m→15m card was
+    # wearing the 5m SCALP stop while forecasting a 15m hold. Key on the horizon.
+    sl_pct, t1_pct = _slt_for(horizon_min)
     cur_spot = _spot_at(sym, date, as_of)
     out = {"trigger": trig_t.strftime("%H:%M"), "entry_strike": trig_atm,
            "entry_spot": round(spot_trig, 2) if spot_trig else None,   # INDEX level at trigger
