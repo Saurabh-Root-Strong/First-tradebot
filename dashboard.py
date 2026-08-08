@@ -3313,14 +3313,29 @@ def _open_scout_openpos(_n, asof, date):
     """Populate + open the open-positions popup at the strip's current clock (respects an
     explicit Replay minute; else live now). Reconstructs held state fresh on each click."""
     today = datetime.datetime.now(IST).date().isoformat()
-    if asof and asof not in ("full", "ghost"):
-        day = date or today
+    day = date or today
+    if asof and asof not in ("full", "ghost"):          # explicit Replay minute
         try:
             as_of = datetime.datetime.fromisoformat(f"{day}T{asof}:00+05:30")
         except Exception:
             day, as_of = today, datetime.datetime.now(IST)
-    else:
-        day, as_of = today, datetime.datetime.now(IST)
+    elif asof == "ghost":                               # practice — the ghost clock seals
+        try:                                            # the future; never use the bell
+            _gd, _gh = _ghost_ctx(date)
+            day, as_of = _gd, datetime.datetime.fromisoformat(f"{_gd}T{_gh}:00+05:30")
+        except Exception:
+            day, as_of = today, datetime.datetime.now(IST)
+    elif day != today:
+        # PAST DAY. This used to fall through to `today`, so opening the popup while
+        # viewing Friday loaded Saturday's (empty) ledger instead of Friday's 15 trades.
+        # Anchor at that day's bell so every episode resolves.
+        try:
+            as_of = datetime.datetime.combine(datetime.date.fromisoformat(day),
+                                              datetime.time(15, 30), tzinfo=IST)
+        except Exception:
+            day, as_of = today, datetime.datetime.now(IST)
+    else:                                               # live today
+        as_of = datetime.datetime.now(IST)
     return True, _scout_openpos_body(day, as_of), ""
 
 
@@ -6178,14 +6193,33 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
                            "fontSize": "0.62rem", "fontWeight": "700"})
           if graded else
           html.Span(_pend, style={"color": "#475569", "fontSize": "0.58rem"}))
-    if live:
-        # MUST pass as_of — without it the 90m TIMEOUT never fires and the badge disagrees
-        # with the popup it opens (badge said "1 open · 6 closed", popup said "0 open · 7").
-        # One source of truth for "what is open": _scout_episodes(today, as_of).
-        _op, _cl = _scout_episodes(today, as_of=datetime.datetime.now(IST))
-        n_open, n_closed = len(_op), len(_cl)
-    else:
-        n_open = n_closed = 0
+    # LEDGER COUNTS — for the day being VIEWED, not only for today. The alert log is
+    # persisted per day, so a past session's ledger reconstructs perfectly (2026-08-07
+    # replays 0 open / 15 closed). Gating this on `live` hid a full day of real trades
+    # behind a button that silently vanished the moment the date strip left today.
+    #
+    # as_of drives the 90m TIMEOUT, so it must be the right instant or the badge disagrees
+    # with the popup it opens (that bug: badge "1 open · 6 closed", popup "0 open · 7").
+    #   live            → now
+    #   ghost/practice  → the ghost clock (as_of_dt) — NEVER the bell, or the sealed
+    #                     future leaks into the ledger before the real 15:30
+    #   explicit replay → that minute
+    #   full past day   → that day's bell, so every episode resolves
+    _led_asof = (datetime.datetime.now(IST) if live else as_of_dt)
+    if _led_asof is None and date:
+        try:
+            _led_asof = datetime.datetime.combine(
+                datetime.date.fromisoformat(date), datetime.time(15, 30), tzinfo=IST)
+        except Exception:
+            _led_asof = None
+    n_open = n_closed = 0
+    _op = _cl = []
+    if date and _led_asof is not None:
+        try:
+            _op, _cl = _scout_episodes(date, as_of=_led_asof)
+            n_open, n_closed = len(_op), len(_cl)
+        except Exception:
+            n_open = n_closed = 0
     openbtn = (html.Button(
         f"📋 {n_open} open · {n_closed} closed",
         id="scout-openpos-btn", n_clicks=0, title="the day's scout ledger — open positions "
@@ -6193,7 +6227,10 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
         style={"marginLeft": "10px", "fontSize": "0.58rem", "color": "#67e8f9",
                "background": "#0b2530", "border": "1px solid #164e63",
                "borderRadius": "4px", "padding": "1px 8px", "cursor": "pointer"})
-        if live else None)
+        # show it whenever there is a ledger to open — live, or any past/replay day whose
+        # persisted alert log reconstructs episodes. Was `if live`, which hid Friday's 15
+        # closed trades from anyone looking at Friday on a Saturday.
+        if (live or n_open or n_closed) else None)
     title = html.Div([
         html.Span(("🎯 SCOUT — " + (f"{_tf}m single frame → next {_hz}m band"
                                     if _tf == _hz else
