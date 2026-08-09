@@ -3304,15 +3304,34 @@ def _open_help_modal(_n):
 
 
 @app.callback(Output("scout-openpos-modal", "is_open"),
-              Output("scout-openpos-body", "children"),
               Output("scout-search", "value"),
               Input("scout-openpos-btn", "n_clicks"),
+              prevent_initial_call=True)
+def _open_scout_modal(_n):
+    """OPEN THE SHELL IMMEDIATELY, then let the body callback fill it.
+
+    These used to be one callback returning (is_open, body, search) together, which meant
+    the modal could not appear until the body had finished building. Once the body started
+    simulating a per-horizon ledger that is 14s at 15m and 51s at 5m, clicking did nothing
+    visible for up to a minute — and the dcc.Loading spinner could not help, because it
+    lives INSIDE the modal that had not opened yet. The button looked dead.
+
+    Splitting it means the shell + spinner appear on the click, and the slow work streams
+    in behind them."""
+    return True, ""
+
+
+@app.callback(Output("scout-openpos-body", "children"),
+              Input("scout-openpos-modal", "is_open"),
               State("charts-asof", "value"), State("news-date", "data"),
               State("charts-tf", "value"),
               prevent_initial_call=True)
-def _open_scout_openpos(_n, asof, date, ltf):
-    """Populate + open the open-positions popup at the strip's current clock (respects an
-    explicit Replay minute; else live now). Reconstructs held state fresh on each click."""
+def _fill_scout_openpos(is_open, asof, date, ltf):
+    """Populate the open-positions popup at the strip's current clock (respects an
+    explicit Replay minute; else live now). Reconstructs held state fresh on each open."""
+    from dash.exceptions import PreventUpdate
+    if not is_open:                       # closing → leave the rendered body alone
+        raise PreventUpdate
     today = datetime.datetime.now(IST).date().isoformat()
     day = date or today
     if asof and asof not in ("full", "ghost"):          # explicit Replay minute
@@ -3337,7 +3356,7 @@ def _open_scout_openpos(_n, asof, date, ltf):
             day, as_of = today, datetime.datetime.now(IST)
     else:                                               # live today
         as_of = datetime.datetime.now(IST)
-    return True, _scout_openpos_body(day, as_of, ltf=ltf), ""
+    return _scout_openpos_body(day, as_of, ltf=ltf)
 
 
 def _btst_body():
