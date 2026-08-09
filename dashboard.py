@@ -1538,7 +1538,11 @@ app.layout = dbc.Container([
                                  # the SAME 1h band as "15m → 1h" (identical calibration cell,
                                  # identical coverage); only the observation rate differs.
                                  {"label": "1h · single frame", "value": 60}],
-                        value=60, style={"fontSize": "0.72rem"}), md=2),
+                        # Default = 15 → 1h: the 1h band is the validated product, and the
+                        # 15m trigger gives 4 looks per horizon instead of 1, so an entry
+                        # is not held hostage to one hourly print. Same calibration cell as
+                        # "1h · single frame" — only the observation rate differs.
+                        value=15, style={"fontSize": "0.72rem"}), md=2),
                     # Replay: pick ANY cutoff minute (truncate every chart at that
                     # time to study what the market did next). Cleared = full/live
                     # session — the as_of cutoff is leakage-safe (enforced at the
@@ -5363,8 +5367,9 @@ def _ghost_boot(_path, cur):
 
 
 # Timeframe the ALERT poller runs at (NEW/FLIP/BAND detection + the forward band the
-# RANGE-BREAK checks against). Set to 60 to match the charts-tf UI default (60m band =
-# the validated RANGE product). The poller is a headless server loop and CANNOT read the
+# RANGE-BREAK checks against). 60 = the FORECAST HORIZON of the charts-tf UI default
+# ("15m → 1h band"), i.e. the same 60m band the board grades — the UI default moved to a
+# 15m TRIGGER, the traded band did not. The poller is a headless server loop and CANNOT read the
 # per-browser charts-tf dropdown, so its tf lives here as the single source of truth —
 # threaded into scan(), the "broke the {tf}m band" label, and the live-overlay gate.
 # 60m structure flips far less than 15m (kills the whipsaw churn) and the wider band
