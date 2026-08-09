@@ -3308,8 +3308,9 @@ def _open_help_modal(_n):
               Output("scout-search", "value"),
               Input("scout-openpos-btn", "n_clicks"),
               State("charts-asof", "value"), State("news-date", "data"),
+              State("charts-tf", "value"),
               prevent_initial_call=True)
-def _open_scout_openpos(_n, asof, date):
+def _open_scout_openpos(_n, asof, date, ltf):
     """Populate + open the open-positions popup at the strip's current clock (respects an
     explicit Replay minute; else live now). Reconstructs held state fresh on each click."""
     today = datetime.datetime.now(IST).date().isoformat()
@@ -3336,7 +3337,7 @@ def _open_scout_openpos(_n, asof, date):
             day, as_of = today, datetime.datetime.now(IST)
     else:                                               # live today
         as_of = datetime.datetime.now(IST)
-    return True, _scout_openpos_body(day, as_of), ""
+    return True, _scout_openpos_body(day, as_of, ltf=ltf), ""
 
 
 def _btst_body():
@@ -5667,7 +5668,112 @@ def _btst_section(today: str):
     ]
 
 
-def _scout_openpos_body(today: str, as_of):
+def _horizon_ledger_block(day, as_of, ltf):
+    """The ledger the SELECTED trade horizon would have produced, simulated off the same
+    captured ticks/chain — because no such ledger exists: only the poller writes legs, and
+    it runs at _ALERT_TF for every viewer. Labelled SIMULATED throughout; it sizes a
+    horizon before you trade it, it is not a track record."""
+    if not day or not ltf:
+        return html.Span("")
+    hz = _horizon_for(ltf)
+    try:
+        import horizon_ledger as hlz
+        res = hlz.simulate(day, int(ltf), int(hz), as_of=as_of)
+    except Exception as exc:                                       # noqa: BLE001
+        return html.Div(f"horizon ledger unavailable ({type(exc).__name__}: {exc})",
+                        style={"color": "#f87171", "fontSize": "0.6rem"})
+    s, cl = res.get("stats") or {}, res.get("closed") or []
+    if not s or not s.get("n_closed"):
+        return html.Div(
+            f"⚙ {ltf}m → {hz}m simulated ledger: no legs on {day} "
+            f"(one position per index · no new leg after 15:10 · hold = {hz}m).",
+            style={"color": "#64748b", "fontSize": "0.6rem", "margin": "6px 0"})
+    net = s.get("net") or 0
+    nc = "#22c55e" if net >= 0 else "#f87171"
+    rows = [{"index": e["label"], "side": e["dir"], "strike": e.get("strike"),
+             "held": (e["open_ts"].strftime("%H:%M") + "→" +
+                      (e["close_ts"].strftime("%H:%M") if e.get("close_ts") else "—")),
+             "entry": e.get("entry"), "exit": e.get("exit"),
+             "idx": (e["idx_pct"] / 100.0) if e.get("idx_pct") is not None else None,
+             "gross": e.get("gross"), "cost": e.get("cost"), "net": e.get("net"),
+             "outcome": e.get("outcome")} for e in cl]
+    from dash import dash_table
+    from dash.dash_table.Format import Format, Group, Scheme, Sign, Symbol
+    _r2 = Format(precision=2, scheme=Scheme.fixed).symbol(Symbol.yes).symbol_prefix("₹")
+    _r0 = (Format(precision=0, scheme=Scheme.fixed).group(Group.yes).sign(Sign.positive)
+           .symbol(Symbol.yes).symbol_prefix("₹"))
+    _pc = Format(precision=2, scheme=Scheme.percentage).sign(Sign.positive)
+    tbl = dash_table.DataTable(
+        data=rows, sort_action="native", page_action="none", style_as_list_view=True,
+        columns=[{"name": "Index", "id": "index"}, {"name": "Side", "id": "side"},
+                 {"name": "Strike", "id": "strike", "type": "numeric"},
+                 {"name": "Held", "id": "held"},
+                 {"name": "Entry", "id": "entry", "type": "numeric", "format": _r2},
+                 {"name": "Exit", "id": "exit", "type": "numeric", "format": _r2},
+                 {"name": "Index move", "id": "idx", "type": "numeric", "format": _pc},
+                 {"name": "₹ gross", "id": "gross", "type": "numeric", "format": _r0},
+                 {"name": "− costs", "id": "cost", "type": "numeric", "format": _r0},
+                 {"name": "₹ NET", "id": "net", "type": "numeric", "format": _r0},
+                 {"name": "Exit why", "id": "outcome"}],
+        style_table={"marginBottom": "6px", "overflowX": "auto"},
+        style_header={"backgroundColor": "#1e293b", "color": "#e2e8f0",
+                      "fontSize": "0.6rem", "textTransform": "uppercase",
+                      "border": "none", "fontWeight": "700"},
+        style_cell={"backgroundColor": "#0f172a", "color": "#e2e8f0",
+                    "fontSize": "0.7rem", "border": "none", "padding": "4px 8px",
+                    "textAlign": "left"},
+        style_data_conditional=[
+            {"if": {"filter_query": "{net} < 0", "column_id": "net"},
+             "color": "#f87171", "fontWeight": "800"},
+            {"if": {"filter_query": "{net} >= 0", "column_id": "net"},
+             "color": "#22c55e", "fontWeight": "800"},
+            {"if": {"column_id": "cost"}, "color": "#fb923c"},
+            {"if": {"filter_query": "{side} = CE", "column_id": "side"},
+             "color": "#34d399", "fontWeight": "700"},
+            {"if": {"filter_query": "{side} = PE", "column_id": "side"},
+             "color": "#f87171", "fontWeight": "700"},
+        ])
+    return html.Div([
+        html.Div([
+            html.Span(f"⚙ {ltf}m → {hz}m  SIMULATED LEDGER", style={
+                "color": "#a78bfa", "fontWeight": "800", "fontSize": "0.68rem"}),
+            html.Span(f"   {s['n_closed']} trades", style={"color": "#e2e8f0",
+                                                           "fontWeight": "700"}),
+            html.Span(f" · {s['wins']}W/{s['losses']}L"
+                      + (f" = {s['win_pct']}% net-of-cost" if s.get("win_pct")
+                         is not None else ""),
+                      style={"color": "#94a3b8"}),
+            html.Span((f"  ·  direction right {s['idx_win_pct']}%"
+                       if s.get("idx_win_pct") is not None else ""),
+                      title="How often the INDEX moved the way the arrow said — before "
+                            "theta and spread. The gap between this and the net-of-cost "
+                            "win rate IS the cost floor.",
+                      style={"color": "#67e8f9", "cursor": "help"}),
+            html.Span(f"  ·  gross ₹{s.get('gross', 0):+,}",
+                      style={"color": "#64748b"}),
+            html.Span(f" − costs ₹{s.get('cost', 0):,}", style={"color": "#fb923c"}),
+            html.Span(f" = ₹{net:+,} NET (1 lot)", style={"color": nc,
+                                                          "fontWeight": "800"}),
+            html.Span(f"  ·  avg hold {s.get('avg_hold') or '—'}m",
+                      style={"color": "#64748b"}),
+        ], style={"fontSize": "0.66rem", "marginBottom": "4px"}),
+        html.Div(
+            "SIMULATED, not traded — no alert was written and no order placed. Rebuilt "
+            f"from this day's captured ticks + chain at the horizon you selected, with the "
+            f"live ledger's discipline: ONE position per index, open only on a directional "
+            f"TRADE verdict, no new leg after 15:10, hold = {hz}m (not the poller's 90m "
+            "cap), exit on horizon / flip / bell. Fills are captured mid-prices, so this is "
+            "if anything OPTIMISTIC. The ACTUAL legs below are the poller's, always "
+            f"{_ALERT_TF}m — changing the horizon dropdown does not create real trades.",
+            style={"color": "#64748b", "fontSize": "0.56rem", "lineHeight": "1.4",
+                   "marginBottom": "5px"}),
+        tbl,
+    ], style={"border": "1px solid #4c1d95", "borderRadius": "6px",
+              "padding": "8px 10px", "margin": "6px 0 10px",
+              "background": "#0d0a1a"})
+
+
+def _scout_openpos_body(today: str, as_of, ltf=None):
     """Popup body: the day's scout ledger — OPEN positions (with a live cross-check +
     unrealized P&L) on top, then CLOSED episodes (outcome + realized P&L), newest-first.
     All reconstructed from the persisted alert log (tf = _ALERT_TF). BTST carries are
@@ -6115,8 +6221,12 @@ def _scout_openpos_body(today: str, as_of):
         dcc.Store(id="scout-open-store", data=open_records),
         dcc.Store(id="scout-closed-store", data=closed_records),
         summary,
-        html.Div("● OPEN", style={"color": "#34d399", "fontSize": "0.6rem",
-                 "fontWeight": "700", "marginBottom": "3px"}),
+        # the SELECTED horizon's own ledger, simulated — the thing the dropdown implies
+        # exists and otherwise does not
+        _horizon_ledger_block(today, as_of, ltf),
+        html.Div(f"● OPEN  ·  actual poller legs ({_ALERT_TF}m)",
+                 style={"color": "#34d399", "fontSize": "0.6rem",
+                        "fontWeight": "700", "marginBottom": "3px"}),
         open_tbl,
         html.Div("○ CLOSED", style={"color": "#94a3b8", "fontSize": "0.6rem",
                  "fontWeight": "700", "margin": "8px 0 3px"}),
