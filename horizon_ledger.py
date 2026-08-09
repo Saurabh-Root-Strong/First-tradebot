@@ -44,10 +44,29 @@ OPEN_SETTLE = dt.time(9, 35)     # same warmup gate the live scout uses
 NO_NEW_AFTER = dt.time(15, 10)   # do not open what the bell will immediately close
 BELL = dt.time(15, 30)
 
+# DECISION CADENCE — how often you LOOK. Deliberately independent of the bar timeframe.
+#
+# This was the bug in the first cut. The dropdown's `ltf` is the BAR SIZE the structure is
+# computed on, NOT the polling interval: the live poller runs on the 30s setup-tick and
+# calls scan(_ALERT_TF=60), i.e. 60-minute bars evaluated ~750 times a day. Building the
+# grid from `ltf` gave 60m→60m just 6 decisions a day against the poller's 750, so the sim
+# found 0-6 trades where the real ledger had 10-22.
+#
+# It also CONFOUNDED the comparison it exists to make: varying the sample rate and the hold
+# together meant "fewer trades at longer horizons" was partly just coarser sampling, not the
+# hold doing work. Fixing the cadence isolates the hold, which is the only thing the
+# dropdown actually changes.
+#
+# 5 minutes is the compromise: 72 instants x 4 indices = 288 scans (~49s cold, cached
+# after). The live poller is 10x finer at 30s, so this still UNDERCOUNTS legs — but it
+# undercounts every horizon equally, so cross-horizon comparison stays honest.
+POLL_MIN = 5
+
 
 def _grid(day: str, ltf: int, as_of: dt.datetime | None) -> list:
-    """Decision instants: every ltf-minute mark from the settle to the bell, capped at
-    as_of so a sealed practice session cannot be walked past its own clock."""
+    """Decision instants: every POLL_MIN mark from the settle to the bell, capped at
+    as_of so a sealed practice session cannot be walked past its own clock. `ltf` is the
+    bar size handed to the engine, NOT the cadence — see POLL_MIN."""
     from intraday_scout import IST
     d = dt.date.fromisoformat(day)
     t = dt.datetime.combine(d, OPEN_SETTLE).replace(tzinfo=IST)
@@ -56,9 +75,10 @@ def _grid(day: str, ltf: int, as_of: dt.datetime | None) -> list:
         a = as_of if as_of.tzinfo else as_of.replace(tzinfo=IST)
         end = min(end, a)
     out = []
+    step = dt.timedelta(minutes=POLL_MIN)
     while t <= end:
         out.append(t)
-        t += dt.timedelta(minutes=ltf)
+        t += step
     return out
 
 
