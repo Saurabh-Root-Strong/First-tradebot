@@ -95,7 +95,32 @@ def _wallclock(idx):
     return idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
 
 
-_SERIES_CACHE: dict = {}   # (sym,tf,date,as_of_iso,expiry) -> (chain_sig, result)
+_SERIES_CACHE: dict = {}   # (sym,tf,date,as_of_iso,expiry) -> (chain_sig, result, covered)
+
+# How far past the cutoff both source frames must already reach before a truncated
+# prefix is treated as FINAL despite a later append. Capture writes in exchange-feed
+# time order, but a snapshot poll can land a row a few seconds out of order, so the
+# margin buys the reordering window rather than assuming perfect ordering.
+_PREFIX_FINAL_MARGIN = pd.Timedelta(seconds=60)
+
+
+def _ts_ist(x):
+    """as_of -> tz-aware IST Timestamp (the frames' ts column is tz-aware)."""
+    t = pd.Timestamp(x)
+    return t.tz_localize(IST) if t.tzinfo is None else t
+
+
+def _covered_until(day, sym):
+    """Newest ts present in BOTH source frames for the day, or None. Reads the FULL-day
+    frames, which `_read` already caches — so this is a dict hit, not a parquet parse."""
+    try:
+        t = _read("ticks", day, None, sym)
+        c = _read("chain_snapshots", day, None, sym)
+        if t is None or c is None or not len(t) or not len(c):
+            return None
+        return min(t["ts"].max(), c["ts"].max())
+    except Exception:
+        return None
 
 
 def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") -> dict:
@@ -103,7 +128,15 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
     as_of) series repeatedly (every 30s tick re-walks the same minutes; post-close the
     clamped as_of is constant), and each rebuild is a ~0.2s pivot+loop. Cache the result
     keyed by the chain file's (mtime,size) so a live append invalidates it. This is what
-    turns the live scout render from ~25s (120 rebuilds) into ~instant after the first."""
+    turns the live scout render from ~25s (120 rebuilds) into ~instant after the first.
+
+    PREFIX FINALITY. The (mtime,size) signature alone is too blunt for a LIVE session:
+    the chain file is appended every ~30-60s, which invalidated every cached entry —
+    including the hundreds pinned to as_of cutoffs hours in the past, whose answer new
+    rows cannot possibly change. The horizon-ledger walk pays this worst: 288 truncated
+    builds that all had to be redone every time capture wrote a row. So an entry whose
+    sources already extended past its own cutoff (plus a reordering margin) survives a
+    signature change — it is a COMPLETE prefix, not a partial one."""
     day = date or today_iso()
     try:
         st = (LIVE_DIR / f"{day}_chain_snapshots.parquet").stat()
@@ -112,12 +145,25 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
         sig = None
     key = (sym, tf_min, day, as_of.isoformat() if as_of is not None else None, expiry)
     hit = _SERIES_CACHE.get(key)
-    if hit is not None and hit[0] == sig:
-        return hit[1]
+    if hit is not None:
+        _sig, _res, _cov = hit
+        if _sig == sig:
+            return _res
+        try:
+            if (as_of is not None and _cov is not None
+                    and _cov >= _ts_ist(as_of) + _PREFIX_FINAL_MARGIN):
+                return _res
+        except Exception:                  # never let a cache heuristic break the read
+            pass
     res = _build_series_impl(sym, tf_min, date, as_of, expiry)
-    _SERIES_CACHE[key] = (sig, res)
-    if len(_SERIES_CACHE) > 2000:          # bound for the t3.micro (OOM-sensitive)
-        _SERIES_CACHE.clear()
+    _SERIES_CACHE[key] = (sig, res, _covered_until(day, sym) if as_of is not None else None)
+    # Bound for the t3.micro (OOM-sensitive). EVICT OLDEST, do not clear(): one horizon
+    # ledger walk is 288 entries and switching all four horizons on one day is ~1150, so
+    # a wipe at the bound threw away work that had just cost 40s and made the next popup
+    # cold all over again. dict preserves insertion order, so the head is the oldest.
+    if len(_SERIES_CACHE) > 2000:
+        for k in list(_SERIES_CACHE)[:500]:
+            _SERIES_CACHE.pop(k, None)
     return res
 
 

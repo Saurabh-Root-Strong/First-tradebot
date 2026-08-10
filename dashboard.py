@@ -1619,9 +1619,19 @@ app.layout = dbc.Container([
                     ], style={"display": "flex", "alignItems": "center",
                               "justifyContent": "space-between", "width": "100%",
                               "gap": "12px"}), close_button=True),
-                    dbc.ModalBody(dcc.Loading(
-                        html.Div(id="scout-openpos-body"),
-                        type="circle", color="#67e8f9")),
+                    # TWO bodies, filled by TWO callbacks, on purpose. The real poller
+                    # ledger is a log replay (fast); the simulated horizon ledger is a
+                    # 288-scan walk (tens of seconds cold). Building them in one callback
+                    # meant the fast half waited on the slow half and the whole popup sat
+                    # on a spinner. Split, the actual legs land immediately and the
+                    # simulation streams in underneath them — and because it renders
+                    # BELOW, its arrival does not shove the tables down the page.
+                    dbc.ModalBody([
+                        dcc.Loading(html.Div(id="scout-openpos-body"),
+                                    type="circle", color="#67e8f9"),
+                        dcc.Loading(html.Div(id="scout-horizon-sim"),
+                                    type="circle", color="#a78bfa"),
+                    ]),
                 ], id="scout-openpos-modal", is_open=False, size="lg", scrollable=True),
                 # BTST overnight paper ledger — the ONE validated edge, finally visible.
                 dbc.Modal([
@@ -3325,17 +3335,11 @@ def _open_scout_modal(_n):
     return True, ""
 
 
-@app.callback(Output("scout-openpos-body", "children"),
-              Input("scout-openpos-modal", "is_open"),
-              State("charts-asof", "value"), State("news-date", "data"),
-              State("charts-tf", "value"),
-              prevent_initial_call=True)
-def _fill_scout_openpos(is_open, asof, date, ltf):
-    """Populate the open-positions popup at the strip's current clock (respects an
-    explicit Replay minute; else live now). Reconstructs held state fresh on each open."""
-    from dash.exceptions import PreventUpdate
-    if not is_open:                       # closing → leave the rendered body alone
-        raise PreventUpdate
+def _scout_popup_clock(asof, date):
+    """(day, as_of) the ledger popup reads at — the strip's current clock, honouring an
+    explicit Replay minute / the ghost seal / a past viewed day. Shared by BOTH popup
+    callbacks so the real ledger and the simulated one can never resolve to different
+    instants and quietly disagree."""
     today = datetime.datetime.now(IST).date().isoformat()
     day = date or today
     if asof and asof not in ("full", "ghost"):          # explicit Replay minute
@@ -3360,7 +3364,36 @@ def _fill_scout_openpos(is_open, asof, date, ltf):
             day, as_of = today, datetime.datetime.now(IST)
     else:                                               # live today
         as_of = datetime.datetime.now(IST)
-    return _scout_openpos_body(day, as_of, ltf=ltf)
+    return day, as_of
+
+
+@app.callback(Output("scout-openpos-body", "children"),
+              Input("scout-openpos-modal", "is_open"),
+              State("charts-asof", "value"), State("news-date", "data"),
+              prevent_initial_call=True)
+def _fill_scout_openpos(is_open, asof, date):
+    """Populate the open-positions popup at the strip's current clock. Reconstructs held
+    state fresh on each open. FAST half — an alert-log replay, no engine scans."""
+    from dash.exceptions import PreventUpdate
+    if not is_open:                       # closing → leave the rendered body alone
+        raise PreventUpdate
+    day, as_of = _scout_popup_clock(asof, date)
+    return _scout_openpos_body(day, as_of)
+
+
+@app.callback(Output("scout-horizon-sim", "children"),
+              Input("scout-openpos-modal", "is_open"),
+              State("charts-asof", "value"), State("news-date", "data"),
+              State("charts-tf", "value"),
+              prevent_initial_call=True)
+def _fill_scout_horizon_sim(is_open, asof, date, ltf):
+    """SLOW half — the selected horizon's SIMULATED ledger (288 engine scans, cached).
+    Its own callback so the real ledger above never waits on it."""
+    from dash.exceptions import PreventUpdate
+    if not is_open:
+        raise PreventUpdate
+    day, as_of = _scout_popup_clock(asof, date)
+    return _horizon_ledger_block(day, as_of, ltf)
 
 
 def _btst_body():
@@ -5797,7 +5830,7 @@ def _horizon_ledger_block(day, as_of, ltf):
               "background": "#0d0a1a"})
 
 
-def _scout_openpos_body(today: str, as_of, ltf=None):
+def _scout_openpos_body(today: str, as_of):
     """Popup body: the day's scout ledger — OPEN positions (with a live cross-check +
     unrealized P&L) on top, then CLOSED episodes (outcome + realized P&L), newest-first.
     All reconstructed from the persisted alert log (tf = _ALERT_TF). BTST carries are
@@ -6245,9 +6278,10 @@ def _scout_openpos_body(today: str, as_of, ltf=None):
         dcc.Store(id="scout-open-store", data=open_records),
         dcc.Store(id="scout-closed-store", data=closed_records),
         summary,
-        # the SELECTED horizon's own ledger, simulated — the thing the dropdown implies
-        # exists and otherwise does not
-        _horizon_ledger_block(today, as_of, ltf),
+        # NOTE: the SELECTED horizon's simulated ledger used to be built here. It is now
+        # its own callback (_fill_scout_horizon_sim → #scout-horizon-sim, rendered under
+        # this block) because it costs tens of seconds and was holding the real legs
+        # hostage behind a spinner.
         html.Div(f"● OPEN  ·  actual poller legs ({_ALERT_TF}m)",
                  style={"color": "#34d399", "fontSize": "0.6rem",
                         "fontWeight": "700", "marginBottom": "3px"}),

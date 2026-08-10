@@ -83,9 +83,19 @@ def _grid(day: str, ltf: int, as_of: dt.datetime | None) -> list:
 
 
 def _key(as_of):
-    """Cache key for as_of — bucketed to the minute so a live board's per-second clock
-    does not blow the cache on every tick."""
-    return None if as_of is None else as_of.strftime("%Y-%m-%dT%H:%M")
+    """Cache key for as_of — FLOORED to the POLL_MIN grid, so a live board's clock does
+    not blow the cache on every tick.
+
+    Bucketing to the minute (the first cut) meant 60 distinct keys an hour for a walk
+    that only has 12 decision instants in that hour: 11:03 and 11:04 produce the exact
+    same grid, yet each paid the full rebuild. Flooring is also the conservative
+    direction — the key can only ever trail the real clock, never run ahead of it, so a
+    sealed practice/replay session still cannot be walked past its own cutoff."""
+    if as_of is None:
+        return None
+    floored = as_of.replace(minute=as_of.minute - (as_of.minute % POLL_MIN),
+                            second=0, microsecond=0)
+    return floored.strftime("%Y-%m-%dT%H:%M")
 
 
 @functools.lru_cache(maxsize=32)
