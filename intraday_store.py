@@ -51,7 +51,19 @@ _MAXLEN = {
     "60min": 8,
 }
 
-MAX_OI_SNAPSHOTS = 150   # 150 × 3 min = 7.5 hours — more than full session
+# ── OI snapshot cadence + retention (DERIVED, so they cannot drift apart) ────────
+# The old pair was MAX_OI_SNAPSHOTS = 150 with the comment "150 x 3 min = 7.5 hours —
+# more than full session", but the accept-throttle was 90s, not 180s. 150 x 90s = 3.75h
+# against a 6.25h session, so the in-memory series SILENTLY DROPPED the first ~2.5 hours
+# of every day — the morning, which carries the single largest OI moves (09:00-09:30 is
+# 16.4% of the session's total |dOI|, measured over 6 sessions). Two readers were seeing
+# a truncated day: the OI panel (dashboard) and intraday_shock.
+#
+# Fixed by deriving the bound from the interval instead of hard-coding a number that has
+# to be re-reasoned every time the cadence changes.
+OI_SNAPSHOT_SEC = 30     # accept one snapshot per index per this many seconds
+_SESSION_SEC = int(6.25 * 3600)                                   # 09:15 -> 15:30
+MAX_OI_SNAPSHOTS = _SESSION_SEC // OI_SNAPSHOT_SEC + 50           # + pre-open/margin
 
 
 # ── Candle Builder ────────────────────────────────────────────────────────────
@@ -298,11 +310,17 @@ class OITimeSeriesStore:
         self._s: dict[str, deque] = {
             sym: deque(maxlen=MAX_OI_SNAPSHOTS) for sym in symbols
         }
-        # throttle: don't accept two snapshots within 90 seconds of each other
+        # throttle: don't accept two snapshots within OI_SNAPSHOT_SEC of each other
         self._last_ts: dict[str, float] = {sym: 0.0 for sym in symbols}
 
-    def add(self, snap: OISnapshot, min_interval_sec: int = 90):
-        """Add snapshot. Silently drops if called too soon after last add."""
+    def add(self, snap: OISnapshot, min_interval_sec: int = OI_SNAPSHOT_SEC):
+        """Add snapshot. Silently drops if called too soon after last add.
+
+        This is a SECOND, independent rate limit on top of the poller's sleep, and the two
+        disagreed: the poller ran at 30s before 11:30, but this throttle was a flat 90s, so
+        oi_snapshots (PCR, OI walls, max pain, ATM IV) was 90-second data ALL DAY even in
+        the fast window. Chain legs went to the mirror 3x more often than the aggregate
+        computed from the very same fetch. Now both are OI_SNAPSHOT_SEC."""
         accepted = False
         with self._lock:
             now = _time.time()

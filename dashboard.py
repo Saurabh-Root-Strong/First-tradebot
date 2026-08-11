@@ -433,7 +433,9 @@ def _heartbeat_writer():
 
 def _oi_background_poller():
     """
-    Background thread: snapshot option chain for all 4 indices every 30 seconds.
+    Background thread: snapshot option chain for all 4 indices every 30 seconds,
+    for the WHOLE session (see the cadence note below — this used to drop to 90s
+    after 11:30 and no longer does).
 
     Runs independently of user interaction so OI history accumulates from 9:15
     whether or not the OC panel is open.  Uses the nearest expiry for each index.
@@ -443,18 +445,44 @@ def _oi_background_poller():
     these aren't duplicates. 30s ≈ 1/10 of the shortest (5-min) TF → ±10% anchor
     precision, matching the price side. NOT finer: <30s oversamples the 5-min frame
     (the noisiest, least-trusted signal) — the real footprint is the 15/60-min and
-    day-level OI builds, indifferent to sub-30s. Export is decoupled (10s flush),
-    API is trivial (8 calls/min). NSE futures OI stays 60s (publication-bound).
+    day-level OI builds, indifferent to sub-30s. Export is decoupled (10s flush).
+    NSE futures OI stays 60s (publication-bound).
+
+    NOTE the poller sleep is only HALF the rate limit: OIStore.add carries its own
+    accept-throttle (intraday_store.OI_SNAPSHOT_SEC) which gates oi_snapshots — PCR,
+    OI walls, max pain, ATM IV. It was a flat 90s while this ran at 30s, so those
+    aggregates were 90-second data even inside the fast window, computed from fetches
+    that had already happened. Both are 30s now; change them together.
     """
     OPEN  = datetime.time(9, 14)
     CLOSE = datetime.time(15, 31)
-    # Adaptive cadence: the Fyers option-chain REST endpoint has a daily call
-    # budget (empirically ~exhausted by ~11:05 at a flat 30s × 4 indices, after
-    # which capture silently died while WS ticks ran to close). The morning is
-    # where the gap/overnight-unwinding read lives, so keep it fast there and
-    # stretch the budget across the afternoon: 30s until 11:30, 90s after.
-    POLL_FAST, POLL_SLOW = 30, 90
-    SLOW_AFTER = datetime.time(11, 30)
+    # ── CADENCE: 30s all day, with a failure-driven backoff instead of a clock one ──
+    # This used to be 30s until 11:30 then 90s, to ration a supposed daily call budget
+    # "empirically ~exhausted by ~11:05 at a flat 30s × 4 indices". That diagnosis does
+    # not survive the data: the implied ceiling is ~888 calls/day, and the 30/90 schedule
+    # has been landing ~1,700 calls a day — 1.9x that — with zero fetch failures and a
+    # last snapshot at 15:26-15:29 on all six sessions of 2026-08-04..11. Whatever killed
+    # chain capture around 11am was not a call cap; the chain writer was silently dead on
+    # a 13-column-vs-12-value INSERT under `except: pass` (fixed separately, 73168f1).
+    #
+    # And the clock split was allocated backwards. |Δ total OI| by 30-min slot, NIFTY,
+    # mean of 6 sessions, is a U: 09:00 = 16.4% and 15:00 = 16.7% (the largest slot of the
+    # day), trough ~3.4% at 13:00. The 90s window covered 54% of the day's OI movement at
+    # a third of the resolution, including the close — which is where the one validated
+    # edge lives (BTST close-strength) and where expiry pinning happens (on expiry Tuesday
+    # the 15:00 slot is 1,149 lakh vs 381 non-expiry).
+    #
+    # 30s flat is 3,016 calls/day. Headroom is PROVEN to ~1,700, not to 3,016 — so the
+    # rationing is kept, but triggered by ACTUAL failure rather than a guess about a
+    # clock. If a whole cycle fails for every index, three times running, step the
+    # interval down a rung and say so. Ratchet is one-way per process: recovering to
+    # fast again would just re-burn whatever ran out and oscillate. Worst case this
+    # degrades to the old 90s (then 180s) having already banked the morning — strictly
+    # better than a silent death, which is what the clock split was really guarding.
+    POLL_LADDER = (30, 90, 180)
+    _poll_ix = 0
+    _fail_cycles = 0
+    FAIL_CYCLES_TO_BACKOFF = 3
     # Strikes: fetch/persist a WIDE band so last night's OI WALLS (often well OTM,
     # the put floor especially) are actually in the captured chain — at ±15 the
     # floor wall fell outside the map on ~90% of samples, blinding the continuity/
@@ -467,6 +495,7 @@ def _oi_background_poller():
     while True:
         try:
             now_t = datetime.datetime.now(tz=IST).time()
+            _tried = _ok_count = 0
             if OPEN <= now_t <= CLOSE:
                 with _lock:
                     spots = {s: (_latest.get(s) or {}).get("ltp", 0) for s in INDEX_SYMBOLS}
@@ -474,6 +503,7 @@ def _oi_background_poller():
                     spot = spots.get(sym, 0)
                     if not spot:
                         continue
+                    _tried += 1
                     try:
                         data = fetch_option_chain(sym, n_strikes=CHAIN_STRIKES)
                         ok = data.get("s") == "ok"
@@ -491,6 +521,7 @@ def _oi_background_poller():
                                       f"{datetime.datetime.now(tz=IST):%H:%M:%S}", flush=True)
                         if not ok:
                             continue
+                        _ok_count += 1
                         d   = data.get("data", {})
                         raw = d.get("optionsChain", [])
                         if not raw:
@@ -552,7 +583,19 @@ def _oi_background_poller():
         except Exception as exc:
             print(f"  [chain] poller cycle error: {type(exc).__name__}: {str(exc)[:120]}",
                   flush=True)
-        time.sleep(POLL_FAST if datetime.datetime.now(tz=IST).time() < SLOW_AFTER else POLL_SLOW)
+        # Backoff ladder — only a cycle that tried and got NOTHING counts as a failure, so
+        # one flaky index, or a pre-open cycle with no spot yet, cannot ration the day.
+        if _tried:
+            _fail_cycles = _fail_cycles + 1 if _ok_count == 0 else 0
+            if _fail_cycles >= FAIL_CYCLES_TO_BACKOFF and _poll_ix < len(POLL_LADDER) - 1:
+                _poll_ix += 1
+                _fail_cycles = 0
+                print(f"  [chain] {FAIL_CYCLES_TO_BACKOFF} consecutive dead cycles @ "
+                      f"{datetime.datetime.now(tz=IST):%H:%M:%S} — backing off to "
+                      f"{POLL_LADDER[_poll_ix]}s for the rest of this process. If this "
+                      f"fires daily, the call budget is real: re-ration the ladder rather "
+                      f"than raising it.", flush=True)
+        time.sleep(POLL_LADDER[_poll_ix])
 
 
 _fetch_quotes = _broker_rest.fetch_quotes   # /data/quotes lp map — broker adapter
