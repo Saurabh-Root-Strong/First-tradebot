@@ -9340,13 +9340,10 @@ def _resolve_role() -> str:
     (TRADEBOT_CAPTURE=1). Anything else, including a bare `python dashboard.py`, runs
     as a read-only VIEWER, so a laptop can NEVER accidentally clobber the VM's synced
     mirrors. DASH_VIEWER=1 always forces viewer. Returns 'viewer' | 'capturer'."""
-    import os
-    from core.constants import LIVE_DIR
-    if os.environ.get("DASH_VIEWER") == "1":
-        return "viewer"
-    forced = os.environ.get("TRADEBOT_CAPTURE") == "1"
-    marked = (LIVE_DIR.parent / ".capture_host").exists()
-    return "capturer" if (forced or marked) else "viewer"
+    # Rule lives in core.capture_role so this, intraday_db's write guard, and
+    # supervise.py's refusal are the SAME decision (see that module's header).
+    from core.capture_role import resolve_role
+    return resolve_role()
 
 
 def _acquire_capture_lock():

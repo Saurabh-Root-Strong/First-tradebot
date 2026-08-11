@@ -59,12 +59,12 @@ _PARQUET_TABLES = (
 # in via render paths (signals.py write_signal fired from a VIEWER callback on
 # 2026-07-09 → created a local today-DB → export wave CLOBBERED the VM-synced mirrors
 # with empty tables). A viewer process now cannot write no matter who calls write_*.
+# The rule now lives in core.capture_role — same marker path (_DB_DIR == LIVE_DIR.parent,
+# asserted in tests), same precedence — so this guard, dashboard's role, and supervise's
+# refusal cannot drift apart. They drifting apart IS the 2026-08-11 restart loop.
 def _is_capture_host() -> bool:
-    if os.environ.get("DASH_VIEWER") == "1":
-        return False
-    if os.environ.get("TRADEBOT_CAPTURE") == "1":
-        return True
-    return (_DB_DIR / ".capture_host").exists()
+    from core.capture_role import is_capture_host
+    return is_capture_host()
 
 
 _CAPTURE_HOST = _is_capture_host()

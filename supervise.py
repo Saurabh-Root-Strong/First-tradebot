@@ -26,6 +26,7 @@ from pathlib import Path
 
 from core.constants import IST   # single source of truth
 from core.market_calendar import is_trading_day   # NSE holidays + weekends
+from core.capture_role import is_capture_host, why as role_why   # capturer vs viewer
 HERE = Path(__file__).parent
 PY   = HERE / ".venv" / "Scripts" / "python.exe"
 PY   = PY if PY.exists() else Path(sys.executable)
@@ -142,7 +143,43 @@ def _other_supervisors() -> list[int]:
         return []
 
 
+EXIT_NOT_CAPTURE_HOST = 3
+
+
 def main() -> None:
+    # ROLE GATE — this supervisor is for a CAPTURER and nothing else.
+    #
+    # Everything below assumes the process it babysits holds the Fyers WebSocket: it
+    # demands a valid token, and it health-checks `ws_heartbeat.txt`, which ONLY the
+    # capturer branch of dashboard.py ever writes (`_heartbeat_writer` starts in the
+    # `else:` after `if VIEWER:`). Run it on a viewer box and every one of those checks
+    # is a category error. On 2026-08-11 that is exactly what happened: the laptop
+    # correctly resolved to viewer, so nothing wrote the heartbeat, so `heartbeat_age()`
+    # — whose `except: return 1e9` cannot tell "never written" from "very stale" — read
+    # ~3,025,000s (the file was 35 days old) and this loop killed and relaunched a
+    # perfectly healthy dashboard every ~2 minutes from the open, clearing port 8050 each
+    # time. Capture never suffered (the VM captures, sync_from_vm feeds the laptop); the
+    # UI died every two minutes. Per the standing topology decision a viewer box needs no
+    # supervisor at all, so refuse LOUDLY rather than supervise something that cannot
+    # satisfy the health check by construction.
+    #
+    # On the VM this is also the better failure mode for the documented deploy caveat: a
+    # rebuilt container whose bind-mounted `data/intraday/.capture_host` went missing used
+    # to fail safe to VIEWER and silently capture nothing. Now it exits with this message
+    # in `docker logs`, naming the exact marker to create.
+    if not is_capture_host():
+        # ASCII-ONLY below. This is the one message that has to survive a hostile console:
+        # a cp1252 Windows terminal renders an em-dash as "?", and on the VM it is read
+        # through `docker logs` after a failed redeploy. Same rule as token.describe().
+        log("REFUSING TO RUN - this box is a VIEWER, not the capture host.")
+        log(f"  role decided by: {role_why()}")
+        log("  A viewer has no WebSocket, so it never writes data/ws_heartbeat.txt, and "
+            "supervising it means restart-looping a healthy dashboard forever.")
+        log("  If this box IS meant to capture:  touch data/intraday/.capture_host  "
+            "(or set TRADEBOT_CAPTURE=1). Otherwise nothing to do - a viewer needs no "
+            "supervisor; run dashboard.py directly (dev.bat) and feed it sync_from_vm.py.")
+        sys.exit(EXIT_NOT_CAPTURE_HOST)
+
     # SINGLE INSTANCE — a second supervisor is a port war: its launch kills the
     # first one's dashboard (_free_port_8050), then BOTH restart loops fight over
     # 8050 forever. Required now that a scheduled task can auto-launch this script

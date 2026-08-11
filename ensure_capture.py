@@ -28,6 +28,7 @@ sys.path.insert(0, str(HERE))
 
 from core.constants import IST
 from core.market_calendar import is_trading_day
+from core.capture_role import is_capture_host
 
 PY = HERE / ".venv" / "Scripts" / "python.exe"
 LOG = HERE / "logs" / "ensure_capture.log"
@@ -59,6 +60,13 @@ def _supervisor_running() -> bool:
 
 
 def main() -> None:
+    # This watchdog exists to keep a CAPTURER alive. On a viewer box there is nothing to
+    # resurrect — and relaunching supervise.py there just churns a process every 5 minutes
+    # that now refuses and exits (EXIT_NOT_CAPTURE_HOST). Silent no-op, matching the rest
+    # of this script's behaviour outside its window; the loud explanation belongs to
+    # supervise.py, which the operator runs by hand when they mean it.
+    if not is_capture_host():
+        return
     now = datetime.datetime.now(tz=IST)
     if not is_trading_day(now.date()):
         return
