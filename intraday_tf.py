@@ -37,8 +37,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from core.constants import IST, LABELS, LABEL_TO_SYM, NSE_NAME as _NSE_UL   # noqa: E402
+from core.constants import (IST, LABELS, LABEL_TO_SYM,                     # noqa: E402
+                            NSE_NAME as _NSE_UL, today_iso as _today_iso)
 from core.mirror_io import read_mirror as _read                            # noqa: E402
+from core.session import session_only                                      # noqa: E402
 
 TFS = [5, 10, 15, 60]
 # A regime label is a DIRECTIONAL claim, so it must clear noise on BOTH axes:
@@ -111,11 +113,20 @@ def _regime(z_px: float, oi_frac: float, persist: bool
 
 
 def analyze(sym: str, date=None, as_of=None) -> dict:
-    ticks = _read("ticks", date, as_of)
-    oi = _read("oi_snapshots", date, as_of)
-    chain = _read("chain_snapshots", date, as_of)
-    fut = _read("futures_quotes", date, as_of)
-    if ticks is None or oi is None:
+    # SESSION CLAMP. Every cell here is "what happened in the last T minutes", measured
+    # as now vs the sample at/before now-T — so any row outside the session silently
+    # becomes the baseline of a window it does not belong to. The tick mirror carries
+    # BOTH ends plus, sometimes, a straggler from the previous evening: 2026-08-11's file
+    # opens with a 2026-08-10 17:56:31 row. At 09:28 that row was the only thing at or
+    # before the 60m anchor of 08:28, so the "60m" cell reported an OVERNIGHT return
+    # (-0.368%) as an hourly move, and the 15m anchor of 09:13 landed in the pre-open
+    # auction. Both printed on the live panel as independent timeframes.
+    _day = date or _today_iso()
+    ticks = session_only(_read("ticks", date, as_of), "ts", _day)
+    oi = session_only(_read("oi_snapshots", date, as_of), "ts", _day)
+    chain = session_only(_read("chain_snapshots", date, as_of), "ts", _day)
+    fut = session_only(_read("futures_quotes", date, as_of), "ts", _day)
+    if ticks is None or oi is None or not len(ticks) or not len(oi):
         return {"sym": sym, "has_data": False, "note": "warming up — need ticks + OI"}
     t = ticks[ticks["symbol"] == sym].sort_values("ts")
     o = oi[oi["symbol"] == sym].sort_values("ts")
@@ -142,7 +153,14 @@ def analyze(sym: str, date=None, as_of=None) -> dict:
         s = t[t["ts"] <= ts_]
         return float(s["ltp"].iloc[-1]) if len(s) else None
 
-    first_ts = t["ts"].iloc[0]
+    # A cell is only real once EVERY series it reads spans the window. Price already had
+    # an ETA guard; OI and futures did not — `_at_or_before` returning None fell back to
+    # `.iloc[0]`, i.e. "since capture start", so two different timeframes whose anchors
+    # both predated capture printed the IDENTICAL number and read as independent
+    # agreement. That is what the 2026-08-11 09:28 panel showed: 15m and 60m both
+    # "optOI +851L / futOI +13.8L", feeding a "1/1 TFs agree" stack line built from one
+    # measurement counted twice. Gate on the LATEST first-sample across the sources.
+    first_ts = max(t["ts"].iloc[0], o["ts"].iloc[0])
     sig1 = _sig1_pct(t)                                   # realised 1-min vol scale (%)
     _iv  = o.iloc[-1]["atm_iv"] if "atm_iv" in o.columns else 0
     atm_iv = float(_iv) if pd.notna(_iv) else 0.0         # IV-implied fallback scale
@@ -151,8 +169,8 @@ def analyze(sym: str, date=None, as_of=None) -> dict:
     for T in TFS:
         anchor = now_ts - pd.Timedelta(minutes=T)
         p0, p1 = price_at(anchor), float(t["ltp"].iloc[-1])
-        if p0 is None or p0 <= 0:
-            # cell unlocks once capture spans T minutes: first_tick + T
+        if p0 is None or p0 <= 0 or anchor < first_ts:
+            # cell unlocks once capture spans T minutes from the LATEST source start
             pending.append({"tf": T, "eta": (first_ts + pd.Timedelta(minutes=T)).strftime("%H:%M")})
             continue
         px = (p1 - p0) / p0 * 100
@@ -175,9 +193,10 @@ def analyze(sym: str, date=None, as_of=None) -> dict:
         if f is not None and len(f) >= 1:
             fn = f.iloc[-1]
             fp = _at_or_before(f, "symbol", sym, anchor)
-            if fp is None:
-                fp = f.iloc[0]
-            if float(fp["near_ltp"] or 0) > 0:
+            # No futures sample at/before the anchor = this window is NOT measurable on
+            # futures. Report unknown (None) instead of silently substituting the day's
+            # first quote, which quietly re-labels a since-open move as a T-minute one.
+            if fp is not None and float(fp["near_ltp"] or 0) > 0:
                 fpx = (float(fn["near_ltp"]) - float(fp["near_ltp"])) / float(fp["near_ltp"]) * 100
                 fvol = (float(fn["near_vol"] or 0) - float(fp["near_vol"] or 0)) / 1e5
                 fbasis = float(fn["near_basis"] or 0) - float(fp["near_basis"] or 0)
@@ -185,9 +204,11 @@ def analyze(sym: str, date=None, as_of=None) -> dict:
         foi_d = None; foi_build = 0
         if fo is not None:
             fo_prev = fo[fo["ts"] <= anchor]
-            base_oi = float(fo_prev.iloc[-1]["oi"]) if len(fo_prev) else float(fo.iloc[0]["oi"])
-            foi_d = (float(fo.iloc[-1]["oi"]) - base_oi) / 1e5
-            foi_build = int((foi_d > _OI_DB) - (foi_d < -_OI_DB))
+            # Same rule as futures price above: no sample at/before the anchor means the
+            # window is unmeasurable, not "use the day's first OI print".
+            if len(fo_prev):
+                foi_d = (float(fo.iloc[-1]["oi"]) - float(fo_prev.iloc[-1]["oi"])) / 1e5
+                foi_build = int((foi_d > _OI_DB) - (foi_d < -_OI_DB))
         # ── significance-gated regime ──────────────────────────────────────────
         # price: z-score vs the window's expected 1-sigma move (not a fixed %).
         sigT = _exp_move_pct(T, sig1, atm_iv)

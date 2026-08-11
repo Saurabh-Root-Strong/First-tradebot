@@ -87,12 +87,14 @@ def _filter_expiry(c, kind: str):
     return sub, len(sub) > 0
 
 
-SESSION_OPEN = pd.Timestamp("09:15").time()
-SESSION_CLOSE = pd.Timestamp("15:30").time()
+from core.session import CLOSE as SESSION_CLOSE, OPEN as SESSION_OPEN, session_only
 
 
-def _session_only(df):
-    """Drop anything outside 09:15–15:30 IST.
+def _session_only(df, day=None):
+    """Drop anything outside 09:15–15:30 IST (and off-day rows when `day` is given).
+
+    Thin wrapper over core.session.session_only — the window lives there because
+    intraday_tf needs the identical clamp and a second copy is how these drift.
 
     The tick capture runs wider than the session on BOTH ends and both ends poison a bar:
 
@@ -108,10 +110,7 @@ def _session_only(df):
         real last half-hour with half an hour of post-close prints.
 
     `atm_strikes` already clamped this way; the bar builders did not."""
-    if df is None or not len(df) or "ts" not in df.columns:
-        return df
-    t = df["ts"].dt.time
-    return df[(t >= SESSION_OPEN) & (t <= SESSION_CLOSE)]
+    return session_only(df, "ts", day)
 
 
 def _gaps_after(index, tf_min: int) -> list:
@@ -229,7 +228,8 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
                 "note": f"{expiry} expiry not captured yet"}
     oi = _read("oi_snapshots", date, as_of, sym)
 
-    ticks = _session_only(ticks)                  # no pre-open auction, no post-close tape
+    # no pre-open auction, no post-close tape, no straggler row from the day BEFORE
+    ticks = _session_only(ticks, date or today_iso())
     if ticks is None or not len(ticks):
         return {"has_data": False, "sym": sym, "tf": tf_min,
                 "note": "warming up — no in-session ticks yet"}
@@ -548,7 +548,7 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
     if f is None or "near_ltp" not in f.columns:
         return {"has_data": False, "sym": sym, "tf": tf_min,
                 "note": "warming up — need futures capture"}
-    f = _session_only(f)                          # same clamp as the option bars
+    f = _session_only(f, date or today_iso())     # same clamp as the option bars
     if f is None or not len(f):
         return {"has_data": False, "sym": sym, "tf": tf_min,
                 "note": "warming up — no in-session futures quotes yet"}
