@@ -111,6 +111,44 @@ def test_no_two_cells_share_a_measurement(synthetic):
     assert len(tots) == len(set(tots)), f"duplicate windows collapsed onto one number: {tots}"
 
 
+def test_clamp_is_load_bearing_when_capture_itself_starts_pre_open(monkeypatch):
+    """ISOLATES THE CLAMP from the pending guard.
+
+    Mutation-testing the first cut showed both nets stayed green with the clamp removed:
+    in those fixtures the `anchor < first_ts` guard caught everything, because ticks
+    opened with a previous-evening row and OI opened at 09:15, so `max(first_tick,
+    first_oi)` was already 09:15. The guard only promises "the window fits inside
+    CAPTURE" — it takes the clamp to make capture mean SESSION.
+
+    So: start BOTH series pre-open at 09:00 (oi_snapshots really did begin at 09:14 on
+    2026-08-10, one minute before the bell). Unclamped, first_ts is 09:00, a 09:05 anchor
+    passes the guard, and the cell is priced off the call auction. Clamped, first_ts is
+    09:15 and the cell stands down."""
+    import intraday_tf as itf
+    sym = "NSE:NIFTY50-INDEX"
+    mins = pd.date_range(_ts(9, 0), _ts(9, 20), freq="1min")     # spans the open
+    auction = 24800.0                                            # never traded
+    ticks = pd.DataFrame({
+        "ts": mins, "symbol": sym,
+        "ltp": [auction if m.time() < dt.time(9, 15) else 24500.0 for m in mins],
+    })
+    oi = pd.DataFrame({
+        "ts": mins, "symbol": sym,
+        "total_call_oi": [1_000_000] * len(mins), "total_put_oi": [900_000] * len(mins),
+        "atm_iv": 12.0,
+    })
+    monkeypatch.setattr(itf, "_read",
+                        lambda tbl, date=None, as_of=None, symbol=None:
+                        {"ticks": ticks, "oi_snapshots": oi}.get(tbl))
+    r = itf.analyze(sym, DAY, dt.datetime(2026, 8, 11, 9, 20,
+                                          tzinfo=dt.timezone(dt.timedelta(hours=5, minutes=30))))
+    for c in r["cells"]:
+        p0 = 24500.0 / (1 + c["px"] / 100.0)
+        assert abs(p0 - auction) > 1.0, (
+            f"tf={c['tf']} is priced off the {auction} pre-open auction — the session "
+            "clamp is not being applied")
+
+
 def test_overnight_row_never_becomes_a_baseline(synthetic):
     """The 24700 row is stamped the previous evening and the 24650 row is the pre-open
     auction. No surviving cell may be measured against either."""
