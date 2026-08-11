@@ -7962,6 +7962,30 @@ def _crosshair(fig: "go.Figure") -> "go.Figure":
     return fig
 
 
+def _mark_capture_gaps(fig, d, tf_min: int, rows) -> None:
+    """Hatch every stretch where capture stopped, on every panel of `fig`.
+
+    Without this a hole is INVISIBLE. plotly is handed a list of bar timestamps, not a
+    continuous time grid, so a bar that never existed is not a break in the line — it is
+    a straight segment between its neighbours. A 6-minute stall and a 4-hour outage both
+    render as clean data, which is how the old "chain capture dies at 11am" failure used
+    to draw a calm flat afternoon. The bar immediately AFTER the hole is also wrong: it
+    absorbs the whole backlog of volume increments (measured 2026-08-10, the 348s gap at
+    14:24 made the next bar print 2.1x the day's median volume, which looks like a burst
+    of activity and is really the recorder coming back). Grey it, don't smooth it."""
+    gaps = d.get("gap_after") or []
+    ts = d.get("ts") or []
+    for i, flagged in enumerate(gaps):
+        if not flagged or i + 1 >= len(ts):
+            continue
+        for rr in rows:
+            fig.add_vrect(x0=ts[i], x1=ts[i + 1], fillcolor="#94a3b8", opacity=0.16,
+                          line_width=0, layer="below", row=rr, col=1)
+        fig.add_annotation(x=ts[i + 1], y=1, yref="y domain", row=1, col=1,
+                           text="no capture", showarrow=False, xanchor="right",
+                           font=dict(size=8, color="#94a3b8"))
+
+
 def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly") -> "go.Figure":
     """4-panel popup chart for one index/timeframe — full session, tf-minute bars:
       1. Price  — candlestick + close line, with volume merged at the base.
@@ -7987,7 +8011,18 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly"
         row_heights=[0.34, 0.22, 0.20, 0.24],
         specs=[[{"secondary_y": True}], [{}], [{"secondary_y": True}], [{}]],
         subplot_titles=(
-            f"{label} price — {tf_min}m candles + volume", "Option OI — CE vs PE (lakh)",
+            f"{label} price — {tf_min}m candles + volume",
+            # oi_degraded = oi_snapshots was missing and the OI totals fell back to summing
+            # the chain over whatever strikes were captured that snapshot. Capture width
+            # churns 31↔51 strikes on 33.7% of snapshots, and each width change adds or
+            # drops ~20 strikes of standing OI at once, so the bar-to-bar DIFF is dominated
+            # by the strike set rather than by trading (|Δ| on width-change snapshots runs
+            # 65-476x the width-stable median). That makes this panel AND the ΔOI panel
+            # below unreliable in magnitude and SIGN. The flag has been computed since the
+            # fallback was written and read by nothing — it only logged. Say it on screen.
+            ("⚠ Option OI — DEGRADED: oi_snapshots missing, totals summed over a churning "
+             "strike set — ΔOI sign unreliable" if d.get("oi_degraded")
+             else "Option OI — CE vs PE (lakh)"),
             "ATM straddle premium (₹) + ATM IV (%)",
             "Positioning flow — ΔOI/bar · calls↑ puts↓ · red=call-write amber=call-buy "
             "green=put-write lime=put-buy · hatched grey=closing"))
@@ -8071,6 +8106,7 @@ def _footprint_fig(sym, tf_min: int, asof_value=None, date=None, expiry="weekly"
                                      fgcolor="#0a0f1a")),
                          hovertext=pe_t, hoverinfo="x+text"), row=4, col=1)
     fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=4, col=1)
+    _mark_capture_gaps(fig, d, tf_min, rows=(1, 2, 3, 4))
     # Shade the clicked lookback window across every panel.
     if d.get("last_ts"):
         x0 = d["last_ts"] - datetime.timedelta(minutes=int(tf_min))
@@ -8247,6 +8283,7 @@ def _futures_fig(sym, tf_min: int, asof_value=None, date=None, leg="near") -> "g
     fig.add_trace(go.Bar(x=ts, y=fy, marker_color=fc_clr, name="ΔOI", showlegend=False,
                          hovertext=ft, hoverinfo="x+text"), row=3, col=1)
     fig.add_hline(y=0, line_width=0.8, line_color="#475569", row=3, col=1)
+    _mark_capture_gaps(fig, d, tf_min, rows=(1, 2, 3, 4, 5))
     # 4 — basis.
     b_clr = ["#22c55e" if (v is not None and v >= 0) else "#ef4444" for v in d["basis"]]
     fig.add_trace(go.Bar(x=ts, y=d["basis"], name="basis", marker_color=b_clr,

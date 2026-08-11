@@ -87,6 +87,52 @@ def _filter_expiry(c, kind: str):
     return sub, len(sub) > 0
 
 
+SESSION_OPEN = pd.Timestamp("09:15").time()
+SESSION_CLOSE = pd.Timestamp("15:30").time()
+
+
+def _session_only(df):
+    """Drop anything outside 09:15–15:30 IST.
+
+    The tick capture runs wider than the session on BOTH ends and both ends poison a bar:
+
+      • PRE-OPEN. The 09:00–09:15 call auction publishes indicative prices that never
+        traded. Measured 2026-08-10 NIFTY: 504 pre-open ticks reaching 24722.5 against a
+        true session high of 24618.9. At tf=5 the damage hides, because the bar index is
+        gated by chain capture (first snapshot 09:14) so the pre-open buckets get dropped
+        anyway. At tf=60 the (09:00,10:00] bucket contains that 09:14 snapshot, SURVIVES,
+        and drags every auction tick in with it — the first candle printed a high 103
+        points above anything that ever traded.
+      • POST-CLOSE. Ticks kept arriving until 17:56. With label/closed="right" that makes
+        a 15:35 bar at tf=5 and a 16:00 bar at tf=60 whose (15:00,16:00] window blends the
+        real last half-hour with half an hour of post-close prints.
+
+    `atm_strikes` already clamped this way; the bar builders did not."""
+    if df is None or not len(df) or "ts" not in df.columns:
+        return df
+    t = df["ts"].dt.time
+    return df[(t >= SESSION_OPEN) & (t <= SESSION_CLOSE)]
+
+
+def _gaps_after(index, tf_min: int) -> list:
+    """Per-bar flag: True where the NEXT bar is further away than one bar-width, i.e.
+    capture stopped and the chart is about to draw straight through the hole.
+
+    A bar with no snapshot in it does not exist in `index` at all — plotly is handed a
+    LIST of timestamps, not a continuous grid, so a missing bar is not a visible break,
+    it is a straight line between its neighbours. A 6-minute hole and a 4-hour outage
+    both render as clean data. Worse, the bar AFTER the hole absorbs the whole backlog
+    of volume increments: measured 2026-08-10, the 348s gap at 14:24 made the 14:35 bar
+    print 2.1x the day's median volume, which reads as a burst of activity and is really
+    the recorder restarting. Flag it so the render can mark it rather than pretend."""
+    step = pd.Timedelta(minutes=tf_min)
+    out = [False] * len(index)
+    for i in range(len(index) - 1):
+        if index[i + 1] - index[i] > step:
+            out[i] = True
+    return out
+
+
 def _wallclock(idx):
     """Drop tz so plotly plots naive IST wall-clock. Mirror timestamps are tz-aware
     (UTC+05:30); plotly serializes the offset and the cursor spike re-applies it,
@@ -183,6 +229,10 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
                 "note": f"{expiry} expiry not captured yet"}
     oi = _read("oi_snapshots", date, as_of, sym)
 
+    ticks = _session_only(ticks)                  # no pre-open auction, no post-close tape
+    if ticks is None or not len(ticks):
+        return {"has_data": False, "sym": sym, "tf": tf_min,
+                "note": "warming up — no in-session ticks yet"}
     spot_at = ticks.set_index("ts")["ltp"].sort_index()
 
     # Per-snapshot ATM straddle: nearest-to-spot strike present on BOTH legs.
@@ -423,18 +473,36 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
     # HONEST COST: half of all bars now read "flat" instead of a direction. That is the
     # point — they were never distinguishable from noise.
     _OI_EPS_MULT = 1.0
-    eps_ce = max(1.0, _OI_EPS_MULT * float(d_oi_ce.abs().median() or 0))
-    eps_pe = max(1.0, _OI_EPS_MULT * float(d_oi_pe.abs().median() or 0))
+    # EXPANDING, not whole-view. The threshold used to be one number — the median over
+    # every bar CURRENTLY IN VIEW — which quietly made a closed bar's label depend on how
+    # much of the day had elapsed. Measured 2026-08-10 NIFTY: eps_ce ran 32.7M at 10:00
+    # down to 3.2M at 15:30 (10x), and bar #3 — closed before 10:00 — read "flat" at 10:00
+    # and "buy" from 11:30 on. At tf=60 the median is taken over 3-7 diffs, so eps_pe even
+    # moved NON-monotonically (32.4M → 9.4M → 24.2M) and bar #3 went write → flat.
+    #
+    # Not a lookahead (at cutoff T the median only ever saw bars <= T) but a bar you read
+    # at 11:00 was not the bar you got back at 15:30, and intraday_scout feeds these labels
+    # into the flow leg at weight 0.40. An EXPANDING median depends only on bars <= i, so
+    # bar i's label is FINAL the moment it closes — the series is now prefix-invariant like
+    # every numeric column beside it. Warmup (< _OI_EPS_MIN_N observed diffs) reads "flat",
+    # the same fail-safe direction the mood classifier uses before ER is warm.
+    _OI_EPS_MIN_N = 3
+
+    def _eps(d):
+        return (d.abs().expanding(min_periods=_OI_EPS_MIN_N).median()
+                * _OI_EPS_MULT).clip(lower=1.0)
+
+    eps_ce, eps_pe = _eps(d_oi_ce), _eps(d_oi_pe)
 
     def _act(d_oi, resid, eps):
-        if pd.isna(d_oi) or abs(d_oi) < eps:
+        if pd.isna(d_oi) or pd.isna(eps) or abs(d_oi) < eps:
             return "flat"
         if d_oi > 0:                                              # OI building
             return "buy" if (pd.notna(resid) and resid > 0) else "write"
         return "cover" if (pd.notna(resid) and resid > 0) else "unwind"   # OI falling
 
-    ce_act = [_act(o, r, eps_ce) for o, r in zip(d_oi_ce, res_ce)]
-    pe_act = [_act(o, r, eps_pe) for o, r in zip(d_oi_pe, res_pe)]
+    ce_act = [_act(o, r, e) for o, r, e in zip(d_oi_ce, res_ce, eps_ce)]
+    pe_act = [_act(o, r, e) for o, r, e in zip(d_oi_pe, res_pe, eps_pe)]
 
     _wc = _wallclock(bar.index)
     return {
@@ -455,6 +523,9 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
         "d_oi_ce": [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in d_oi_ce],
         "d_oi_pe": [None if pd.isna(v) else round(float(v) / 1e5, 2) for v in d_oi_pe],
         "ce_act":  ce_act, "pe_act": pe_act,
+        # True on a bar whose successor is more than one bar-width away — capture stopped
+        # here, the next bar's volume absorbed the backlog. Render marks it.
+        "gap_after": _gaps_after(bar.index, tf_min),
         "last_ts": _wc[-1].to_pydatetime(),
     }
 
@@ -477,6 +548,10 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
     if f is None or "near_ltp" not in f.columns:
         return {"has_data": False, "sym": sym, "tf": tf_min,
                 "note": "warming up — need futures capture"}
+    f = _session_only(f)                          # same clamp as the option bars
+    if f is None or not len(f):
+        return {"has_data": False, "sym": sym, "tf": tf_min,
+                "note": "warming up — no in-session futures quotes yet"}
     f = f.set_index("ts").sort_index()
     leg = leg if leg in ("near", "next", "far") else "near"
     _ltp = {"near": "near_ltp", "next": "next_ltp", "far": "far_ltp"}[leg]
@@ -559,6 +634,7 @@ def build_futures_series(sym: str, tf_min: int, date=None, as_of=None, leg="near
         "term":   [None if (term is None or pd.isna(v)) else str(v) for v in (term if term is not None else [None] * len(bar))],
         "oi":     _c(oi_lakh), "d_oi": _c(d_oi), "fut_act": fut_act,
         "has_oi": oi_lakh is not None,
+        "gap_after": _gaps_after(bar.index, tf_min),
         "last_ts": _wc[-1].to_pydatetime(),
     }
 
