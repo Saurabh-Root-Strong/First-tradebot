@@ -168,6 +168,43 @@ def _covered_until(day, sym):
         return None
 
 
+_PRIOR_DOI_CACHE: dict = {}
+
+
+def _prior_session_doi(sym: str, tf_min: int, day: str, expiry: str):
+    """(|dOI_ce|, |dOI_pe|) from the previous TRADING session, for seeding the deadband.
+
+    Entirely in the past, so it cannot leak: the newest bar it can see closed before this
+    session opened. Built with _seed=False so the prior day does not recursively seed off
+    the day before it. Returns (None, None) when there is no usable prior mirror — first
+    run, a holiday gap, or a box that only just started syncing — and the caller falls
+    back to a warmup-free expanding median."""
+    key = (sym, tf_min, day, expiry)
+    if key in _PRIOR_DOI_CACHE:
+        return _PRIOR_DOI_CACHE[key]
+    out = (None, None)
+    try:
+        from core.market_calendar import is_trading_day
+        d = pd.Timestamp(day).date() - pd.Timedelta(days=1)
+        for _ in range(7):                     # walk back over weekends / holidays
+            if is_trading_day(d):
+                break
+            d = d - pd.Timedelta(days=1)
+        prev = d.isoformat()
+        if (LIVE_DIR / f"{prev}_chain_snapshots.parquet").exists():
+            p = _build_series_impl(sym, tf_min, prev, None, expiry, _seed=False)
+            if p.get("has_data"):
+                ce = [abs(v) * 1e5 for v in p["d_oi_ce"] if v is not None]
+                pe = [abs(v) * 1e5 for v in p["d_oi_pe"] if v is not None]
+                out = (ce or None, pe or None)
+    except Exception:                          # a seed is an optimisation, never a hard dep
+        out = (None, None)
+    if len(_PRIOR_DOI_CACHE) > 200:
+        _PRIOR_DOI_CACHE.clear()
+    _PRIOR_DOI_CACHE[key] = out
+    return out
+
+
 def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") -> dict:
     """Memoised wrapper: the scout lifecycle walk-back asks for the SAME (sym,tf,date,
     as_of) series repeatedly (every 30s tick re-walks the same minutes; post-close the
@@ -212,11 +249,15 @@ def build_series(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") 
     return res
 
 
-def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly") -> dict:
+def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="weekly",
+                       _seed: bool = True) -> dict:
     """Return the bar series for `sym` at `tf_min` minutes. {'has_data': False, ...}
     until enough is captured. tf_min is the bar size AND the highlighted window.
     `expiry` in {weekly, monthly} picks the option expiry (weekly until capture is
-    extended to tag/store the monthly chain)."""
+    extended to tag/store the monthly chain).
+
+    `_seed` is internal: False when this call IS the prior-session lookup for the OI
+    deadband, so the seed does not recurse a day at a time down the calendar."""
     ticks = _read("ticks", date, as_of, sym)
     chain = _read("chain_snapshots", date, as_of, sym)
     if ticks is None or chain is None or "ltp" not in chain.columns:
@@ -486,13 +527,44 @@ def _build_series_impl(sym: str, tf_min: int, date=None, as_of=None, expiry="wee
     # bar i's label is FINAL the moment it closes — the series is now prefix-invariant like
     # every numeric column beside it. Warmup (< _OI_EPS_MIN_N observed diffs) reads "flat",
     # the same fail-safe direction the mood classifier uses before ER is warm.
-    _OI_EPS_MIN_N = 3
+    # PRIOR-SESSION SEED — because "expanding" alone starved the alert timeframe.
+    #
+    # The first cut needed 3 observed diffs before it would emit any label. At tf=5 that
+    # is warm by ~10:15, which looked fine. At tf=60 there are only SEVEN bars in a whole
+    # session, so the first label appeared at 15:00 and five of seven bars read "flat" —
+    # and _ALERT_TF is 60, so the headless poller's flow leg (weight 0.40) ran blind for
+    # six and a quarter hours. Live alerts fell 22 -> 4 the session after that shipped,
+    # while a same-code control produced 10 simulated trades on BOTH days: the drop was
+    # the warmup, not the market. Stability had been fixed by destroying availability.
+    #
+    # The deadband is meant to be "|dOI| big enough that its sign means something" — a
+    # whole-session median (see the calibration above). The prior SESSION's diffs are the
+    # same quantity measured on data that is entirely in the past, so seeding with them
+    # keeps the calibration, stays causal, and gives a usable threshold from bar one.
+    # Today's own diffs still enter the median as they close, so the estimate converges to
+    # the live session. Prefix-invariance is preserved: bar i sees only the prior day plus
+    # bars <= i, never anything after it.
+    _seed_ce, _seed_pe = (_prior_session_doi(sym, tf_min, date or today_iso(), expiry)
+                          if _seed else (None, None))
 
-    def _eps(d):
-        return (d.abs().expanding(min_periods=_OI_EPS_MIN_N).median()
-                * _OI_EPS_MULT).clip(lower=1.0)
+    def _eps(d, seed):
+        a = d.abs()
+        if seed is not None and len(seed):
+            # median over (fixed prior-session diffs + today's diffs so far)
+            base = np.asarray(seed, dtype=float)
+            out, run = [], []
+            for v in a:
+                if v == v:
+                    run.append(float(v))
+                out.append(np.median(np.concatenate([base, run])) if run else np.median(base))
+            e = pd.Series(out, index=d.index)
+        else:
+            # no usable prior session (first run, holiday, missing mirror) — fall back to
+            # an expanding median with NO warmup gate. Noisy early beats silent all day.
+            e = a.expanding(min_periods=1).median()
+        return (e * _OI_EPS_MULT).clip(lower=1.0)
 
-    eps_ce, eps_pe = _eps(d_oi_ce), _eps(d_oi_pe)
+    eps_ce, eps_pe = _eps(d_oi_ce, _seed_ce), _eps(d_oi_pe, _seed_pe)
 
     def _act(d_oi, resid, eps):
         if pd.isna(d_oi) or pd.isna(eps) or abs(d_oi) < eps:

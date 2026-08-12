@@ -124,6 +124,32 @@ def test_closed_bar_labels_and_values_are_final(series):
         assert part[k][:n] == full[k][:n], f"{k} is not final on closed bars"
 
 
+@pytest.mark.parametrize("tf", TFS)
+def test_positioning_labels_are_AVAILABLE_not_just_stable(tf):
+    """The other half of the contract, and the half that got shipped broken.
+
+    Making closed-bar labels final was done with an expanding median gated on 3 observed
+    diffs. At tf=5 that warms by ~10:15 and looked fine; at tf=60 a whole session is
+    SEVEN bars, so the first label landed at 15:00 and five of seven read "flat" — and
+    _ALERT_TF is 60, so the live poller's flow leg (weight 0.40) ran blind all day. Live
+    alerts fell 22 -> 4 the next session while a same-code control produced 10 simulated
+    trades on both days. Every existing test passed, because they all asserted labels do
+    not CHANGE and none asserted labels EXIST.
+
+    Bar 0 can never be labelled (its dOI is NaN), so the earliest possible label is bar 1.
+    """
+    import footprint_chart as fc
+    d = fc.build_series(SYM, tf, DAY, None)
+    acts = [a for a in d["ce_act"]] + [a for a in d["pe_act"]]
+    assert any(a != "flat" for a in acts), (
+        f"tf={tf}: every bar on a full session reads 'flat' — the deadband is starving "
+        f"the flow leg, not filtering it")
+    first = next(i for i, a in enumerate(d["ce_act"] + ["x"]) if a != "flat")
+    assert first <= 2, (
+        f"tf={tf}: first non-flat label is bar {first}; bar 1 is the first bar that CAN "
+        f"carry one, so anything beyond bar 2 means a warmup gate is eating the session")
+
+
 def test_gap_flags_match_actual_bar_spacing(series):
     for tf, d in series.items():
         ts = [pd.Timestamp(x) for x in d["ts"]]
