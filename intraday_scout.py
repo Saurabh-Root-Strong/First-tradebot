@@ -838,27 +838,31 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     if in_open and verdict.startswith("TRADE"):
         verdict, direction = "NO-TRADE", ""
 
-    # Fast path for lifecycle probing — skip the expensive forecast/verify/forward.
-    if verdict_only:
-        return {"sym": sym, "has_data": True, "verdict": verdict,
-                "direction": direction, "strength": round(strength, 3), "spot": spot}
-
-    conf = int(round(min(abs(strength) / 0.6, 1.0) * 100))
-    try:
-        fcst = hf.forecast(sym, as_of=as_of, date=date)         # honest range band
-    except Exception:
-        fcst = {}
-
-    # ── price-structure (S/R, coil, breakout) — the orthogonal VETO family ───────
-    # The OI arrow has no sense of WHERE price sits; this reads it off the same bars.
-    # Computed + displayed + harvested ALWAYS; only ACTS on the verdict when _STRUCT_VETO
-    # is on (default off — backtest_scout must first show the veto cuts the bleed OOS).
-    struct = ps.analyze(ser)
+    # ── the three orthogonal VETO families — ABOVE the fast-path return ──────────
+    # They used to sit below it. That silently split the engine in two: `scan()` (the live
+    # alert path) and backtest_scout take the FULL path and could be vetoed, while the
+    # verdict_only callers — audit_day, backtest_4day_trades, horizon_ledger, the dashboard
+    # replay, and this module's own _lifecycle walk-back — returned above the veto block and
+    # so measured the UNVETOED engine no matter how the flags were set. Worst of that list
+    # is _lifecycle: it probes from inside a full scan, so an enabled veto would have made
+    # the walk-back disagree with the very verdict it was walking back from.
+    #
+    # COST. The fast path exists because it is ~16ms vs ~440ms, which is what makes a full
+    # 5m day grid (288 scans) run in seconds. So each family is computed only when it is
+    # DISPLAYED (the full path, which shows and harvests all three regardless of
+    # enforcement) or ENFORCED (its flag on). With all three flags off — today's default —
+    # the fast path computes nothing new and this is a pure no-op.
+    #
+    # The families stay SEQUENTIAL and order-dependent, exactly as before: an enforced veto
+    # clears `direction`, so a later family sees "" and reports no veto of its own.
+    _show = not verdict_only
+    # price-structure (S/R, coil, breakout): the OI arrow has no sense of WHERE price sits.
+    struct = ps.analyze(ser) if (_show or _STRUCT_VETO) else None
     struct_veto, struct_veto_reason = ps.veto(struct, direction)
     if _STRUCT_VETO and struct_veto and verdict.startswith("TRADE"):
         verdict, direction = "NO-TRADE", ""
     # day-trend regime — the orthogonal "don't fight the trend" family (SL audit fix)
-    regime = ps.regime(ser)
+    regime = ps.regime(ser) if (_show or _TREND_VETO) else None
     trend_veto, trend_veto_reason = ps.trend_veto(regime, direction)
     if _TREND_VETO and trend_veto and verdict.startswith("TRADE"):
         verdict, direction = "NO-TRADE", ""
@@ -867,14 +871,29 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
     # must not depend on the chart timeframe, its band-width factor + veto were CALIBRATED on
     # 5-min ER10 (backtest_band_regime / backtest_regime), and on coarse bars (tf=60) ER10
     # would need 10 hours and never warm intraday. Matches the cockpit (intraday_read uses 5m).
-    try:
-        _mood_ser = ser if tf_min == 5 else fc.build_series(sym, 5, date, as_of)
-        mood = rc.classify_from_bars(_mood_ser, n=_MOOD_WIN)
-    except Exception:
-        mood = rc.classify_from_bars(ser, n=_MOOD_WIN)
+    mood = None
+    if _show or _MOOD_VETO:
+        try:
+            _mood_ser = ser if tf_min == 5 else fc.build_series(sym, 5, date, as_of)
+            mood = rc.classify_from_bars(_mood_ser, n=_MOOD_WIN)
+        except Exception:
+            mood = rc.classify_from_bars(ser, n=_MOOD_WIN)
     mood_veto, mood_veto_reason = rc.veto(mood, direction)
     if _MOOD_VETO and mood_veto and verdict.startswith("TRADE"):
         verdict, direction = "NO-TRADE", ""
+
+    # Fast path for lifecycle probing — skip the expensive forecast/verify/forward.
+    if verdict_only:
+        return {"sym": sym, "has_data": True, "verdict": verdict,
+                "direction": direction, "strength": round(strength, 3), "spot": spot,
+                "struct_veto": bool(struct_veto), "trend_veto": bool(trend_veto),
+                "mood_veto": bool(mood_veto)}
+
+    conf = int(round(min(abs(strength) / 0.6, 1.0) * 100))
+    try:
+        fcst = hf.forecast(sym, as_of=as_of, date=date)         # honest range band
+    except Exception:
+        fcst = {}
 
     reasons = []
     for k in ("flow", "div", "cross", "fut"):
