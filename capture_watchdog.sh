@@ -31,6 +31,10 @@ LOG=/home/ubuntu/tradebot/logs/capture_watchdog.log
 STATE=/home/ubuntu/tradebot/logs/.watchdog_last_restart
 HEALTH=/home/ubuntu/tradebot/logs/capture_health.txt
 NTFY_TOPIC="${NTFY_TOPIC:-tradebot-capture-6e5d23ee60cc}"
+# Overridable ONLY so the alert branch can be exercised against a fake token without
+# touching the live one mid-session. The alert path is the whole point of this script;
+# shipping it untested is how the 2026-08-20 futile-restart logic survived so long.
+TOKEN_FILE="${TOKEN_FILE:-/home/ubuntu/tradebot/access_token.txt}"
 
 # The box runs UTC; cron's CRON_TZ controls only WHEN we fire. Stamp IST explicitly —
 # the old script printed the literal string "UTC" next to an IST clock.
@@ -58,10 +62,10 @@ PY
 # ── 1. TOKEN, on the host — the check that must come first ──────────────────────────
 # Decodes the JWT `exp` straight out of access_token.txt. Stdlib only, no container, no
 # broker call. Prints "<state> <minutes_left>".
-TOK=$(python3 - <<'PY'
-import base64, json, datetime as dt
+TOK=$(TOKEN_FILE="$TOKEN_FILE" python3 - <<'PY'
+import base64, json, datetime as dt, os
 try:
-    raw = open("/home/ubuntu/tradebot/access_token.txt").read().strip()
+    raw = open(os.environ["TOKEN_FILE"]).read().strip()
 except Exception:
     print("MISSING 0"); raise SystemExit
 tok = raw.split(":")[-1] if ":" in raw.split(".")[0] else raw
