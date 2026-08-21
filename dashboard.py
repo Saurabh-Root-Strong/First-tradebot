@@ -1581,11 +1581,26 @@ app.layout = dbc.Container([
                                  # the SAME 1h band as "15m → 1h" (identical calibration cell,
                                  # identical coverage); only the observation rate differs.
                                  {"label": "1h · single frame", "value": 60}],
-                        # Default = 15 → 1h: the 1h band is the validated product, and the
-                        # 15m trigger gives 4 looks per horizon instead of 1, so an entry
-                        # is not held hostage to one hourly print. Same calibration cell as
-                        # "1h · single frame" — only the observation rate differs.
-                        value=15, style={"fontSize": "0.72rem"}), md=2),
+                        # Default = "1h · single frame", and it MUST match _ALERT_TF.
+                        # The poller writes every alert at 60m; this panel scans whatever
+                        # the dropdown says. At 15m the two came apart in the way that
+                        # matters: on 2026-08-18 at 09:57 the 15m frame read TRADE PE on
+                        # three indices and rendered full tickets (entry / SL / target /
+                        # HOLD) while the 60m frame had one bar and strength +0.000 on all
+                        # four — and the first alert of that day did not land until 10:0x.
+                        # For ~45min every morning the board was issuing trade tickets that
+                        # the alert log never recorded and no ledger could ever grade.
+                        # It also simply LOSES more. Same 9 sessions, horizon pinned at 60m
+                        # so only the structure re-read rate varies (horizon_ledger holds
+                        # the poll cadence at POLL_MIN regardless of ltf):
+                        #     15m trigger  n=117  win 38.5%  net/trade −₹218  t=−1.58
+                        #     60m trigger  n= 67  win 49.3%  net/trade −₹127  t=−0.62
+                        # 75% more legs, 11pp worse win rate, ~3× the loss. The "4 looks
+                        # per horizon beat 1" argument that set this to 15 (6ea889d) was
+                        # reasoning, not measurement; this is the measurement. It also
+                        # matches the churn result that fixed the mirror-image bug in
+                        # ad34f89 (15m→60m cut a day from 18 NEW/14 FLIP/12 BAND to 4/0/1).
+                        value=60, style={"fontSize": "0.72rem"}), md=2),
                     # Replay: pick ANY cutoff minute (truncate every chart at that
                     # time to study what the market did next). Cleared = full/live
                     # session — the as_of cutoff is leakage-safe (enforced at the
@@ -5501,6 +5516,13 @@ def _horizon_for(tf) -> int:
 # Ledger-only (no poller change).
 _SCOUT_MAX_HOLD_MIN = 90
 
+# Minimum closed legs before the SIMULATED ledger is allowed to print a PERCENTAGE.
+# Not a statistical threshold — a display honesty one. A single morning routinely closes
+# 1-3 simulated legs, and "2W/0L = 100.0%" next to a ₹ figure reads as a track record for
+# whatever horizon the dropdown happens to be on. Counts and rupees are facts at any n;
+# a rate is not. 5 is the smallest n where the printed percentage is not a coin.
+_MIN_N_PCT = 5
+
 # ── THE BELL ───────────────────────────────────────────────────────────────────────────
 # The arrow is an INTRADAY product. It is flat overnight, always — a long option held over
 # the night bleeds theta (which is the whole reason the BTST edge buys FUTURES instead).
@@ -5794,6 +5816,10 @@ def _horizon_ledger_block(day, as_of, ltf):
              "held": (e["open_ts"].strftime("%H:%M") + "→" +
                       (e["close_ts"].strftime("%H:%M") if e.get("close_ts") else "—")),
              "entry": e.get("entry"), "exit": e.get("exit"),
+             # SIGNED BY THE LEG, not the tape (horizon_ledger sets -mv for a PE):
+             # +ve = the index moved the leg's WAY. Labelling this "Index move" read as
+             # the raw index change and inverted every PE row on the eye — 2026-08-18
+             # MIDCAP PE showed "+0.18%" on an hour the index fell 14888.10 → 14859.25.
              "idx": (e["idx_pct"] / 100.0) if e.get("idx_pct") is not None else None,
              "gross": e.get("gross"), "cost": e.get("cost"), "net": e.get("net"),
              "outcome": e.get("outcome")} for e in cl]
@@ -5810,7 +5836,8 @@ def _horizon_ledger_block(day, as_of, ltf):
                  {"name": "Held", "id": "held"},
                  {"name": "Entry", "id": "entry", "type": "numeric", "format": _r2},
                  {"name": "Exit", "id": "exit", "type": "numeric", "format": _r2},
-                 {"name": "Index move", "id": "idx", "type": "numeric", "format": _pc},
+                 {"name": "Move in favour", "id": "idx", "type": "numeric",
+                  "format": _pc},
                  {"name": "₹ gross", "id": "gross", "type": "numeric", "format": _r0},
                  {"name": "− costs", "id": "cost", "type": "numeric", "format": _r0},
                  {"name": "₹ NET", "id": "net", "type": "numeric", "format": _r0},
@@ -5839,12 +5866,20 @@ def _horizon_ledger_block(day, as_of, ltf):
                 "color": "#a78bfa", "fontWeight": "800", "fontSize": "0.68rem"}),
             html.Span(f"   {s['n_closed']} trades", style={"color": "#e2e8f0",
                                                            "fontWeight": "700"}),
+            # A PERCENTAGE NEEDS A SAMPLE. On 2026-08-18 this header read
+            # "2 trades · 2W/0L = 100.0% net-of-cost · +₹787 NET" off TWO legs, one of
+            # which was directionally wrong — a scoreboard-shaped number for a setting
+            # measured at −₹218/trade over 9 sessions. Below _MIN_N_PCT show the raw
+            # W/L count only; the ₹ figures stay (they are the actual simulated sum,
+            # not an inferred rate).
             html.Span(f" · {s['wins']}W/{s['losses']}L"
-                      + (f" = {s['win_pct']}% net-of-cost" if s.get("win_pct")
-                         is not None else ""),
+                      + (f" = {s['win_pct']}% net-of-cost"
+                         if (s.get("win_pct") is not None
+                             and (s.get("n_closed") or 0) >= _MIN_N_PCT) else ""),
                       style={"color": "#94a3b8"}),
             html.Span((f"  ·  direction right {s['idx_win_pct']}%"
-                       if s.get("idx_win_pct") is not None else ""),
+                       if (s.get("idx_win_pct") is not None
+                           and (s.get("n_closed") or 0) >= _MIN_N_PCT) else ""),
                       title="How often the INDEX moved the way the arrow said — before "
                             "theta and spread. The gap between this and the net-of-cost "
                             "win rate IS the cost floor.",
@@ -5856,6 +5891,9 @@ def _horizon_ledger_block(day, as_of, ltf):
                                                           "fontWeight": "800"}),
             html.Span(f"  ·  avg hold {s.get('avg_hold') or '—'}m",
                       style={"color": "#64748b"}),
+            html.Span((f"  ·  n={s.get('n_closed')} — too few to quote a rate"
+                       if (s.get("n_closed") or 0) < _MIN_N_PCT else ""),
+                      style={"color": "#fbbf24"}),
         ], style={"fontSize": "0.66rem", "marginBottom": "4px"}),
         html.Div(
             "SIMULATED, not traded — no alert was written and no order placed. Rebuilt "
