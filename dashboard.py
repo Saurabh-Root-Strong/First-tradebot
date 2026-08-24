@@ -6806,16 +6806,51 @@ def _scout_detect(state, now, persist):
         #    shut until the gate resets, instead of re-entering on the very next tick) ──
         if (v.startswith("TRADE") and r.get("direction") != lock
                 and now.time() < _SCOUT_NO_NEW_AFTER):
-            pos = {"day": today, "dir": r.get("direction"),
-                   "strike": lc.get("entry_strike") or r.get("atm"),
-                   "entry": lc.get("entry_prem"), "sl": lc.get("sl"), "tgt": lc.get("target"),
-                   "bl": r.get("pred_lo"), "bh": r.get("pred_hi"), "bb": False,
-                   "trig": now.strftime("%H:%M"), "expiry": r.get("expiry"),
-                   "expiry_date": r.get("expiry_date"),
-                   "label": r["label"], "thin": bool(r.get("thin")), "spot": spot}
-            _emit(sym, _scout_alert_rec(now, pos, "NEW"))
-            st["open"] = pos
-            lock = None                                  # a fresh leg is armed by definition
+            # ── PRICE THE FILL AT `now`, NEVER AT THE LIFECYCLE TRIGGER ──────────
+            # lc["entry_prem"]/["entry_strike"] answer a COUNTERFACTUAL: "what you WOULD
+            # have paid had you entered when this signal run began". _lifecycle anchors
+            # them to trig_t = the start of the contiguous TRADE run, and on the 60m alert
+            # frame the walk-back budget is max(_TRIG_MAX_MIN, 6*tf) = 360 min — the whole
+            # session. A NEW event asks a different question: "a position is opening NOW."
+            # Feeding one answer to the other question printed money.
+            #
+            # 2026-08-24 FIN NIFTY: the PE run traced back to the 10:15 grid instant, so
+            # every re-open replayed strike 26300 @ Rs80.90 (the 10:14:45 print) while the
+            # live premium was Rs174-181. tgt = 1.65 x 80.90 = 133.49 was therefore ALREADY
+            # BREACHED at the instant of entry, so the very next poll booked "TARGET" 33s
+            # later at +117%. Three times (11:38, 11:41, 13:02) = Rs16,857 of fabricated
+            # profit, and it would have repeated until the bell. The strike was stale too:
+            # _atm was 26300 at 10:15 but 26150 at 11:38, so the "ATM" leg was really 160
+            # points ITM carrying an ATM premium from 84 minutes earlier — an entry BELOW
+            # the option's own intrinsic value, which is not a quote that can exist.
+            _dir = r.get("direction")
+            _strike = (scout._atm(spot, sym) if spot else None) or lc.get("entry_strike")
+            _entry = scout._opt_premium(sym, today, now, _strike, _dir) if _strike else None
+            # An ATM leg can never trade below intrinsic. If it reads that way the quote is
+            # stale or torn, and a position opened on it is ungradeable — refuse it rather
+            # than book a trade whose P&L is fiction.
+            _intr = None
+            if spot and _strike:
+                _intr = max(0.0, _strike - spot) if _dir == "PE" else max(0.0, spot - _strike)
+            _priceable = (_entry is not None and _entry > 0
+                          and (_intr is None or _entry >= _intr * 0.98))
+            # Keep whatever bracket the lifecycle is configured for, as RATIOS, so this
+            # stays in lockstep with _slt_for instead of hardcoding 0.65/1.65 twice.
+            _lp = lc.get("entry_prem")
+            _sl_r = (lc["sl"] / _lp) if (_lp and lc.get("sl")) else 0.65
+            _tg_r = (lc["target"] / _lp) if (_lp and lc.get("target")) else 1.65
+            if _priceable:
+                pos = {"day": today, "dir": _dir,
+                       "strike": _strike,
+                       "entry": round(_entry, 2),
+                       "sl": round(_entry * _sl_r, 2), "tgt": round(_entry * _tg_r, 2),
+                       "bl": r.get("pred_lo"), "bh": r.get("pred_hi"), "bb": False,
+                       "trig": now.strftime("%H:%M"), "expiry": r.get("expiry"),
+                       "expiry_date": r.get("expiry_date"),
+                       "label": r["label"], "thin": bool(r.get("thin")), "spot": spot}
+                _emit(sym, _scout_alert_rec(now, pos, "NEW"))
+                st["open"] = pos
+                lock = None                              # a fresh leg is armed by definition
         st["lock"], st["lock_day"] = lock, today
         state[sym] = st
     return events
