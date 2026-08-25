@@ -1,0 +1,23 @@
+# ── SCHEDULES ARE UTC ────────────────────────────────────────────────────────────────
+# This box runs UTC and Debian's cron (3.0pl1) has NO CRON_TZ support — `man 5 crontab`
+# mentions it zero times. The old `CRON_TZ=Asia/Kolkata` line was therefore inert: it was
+# exported to each job as a plain env var while every schedule still fired on UTC, so the
+# whole file ran 5h30 late. capture_watchdog was nominally 09:20/09:45 IST but actually
+# ran 14:50/15:15 IST — near the CLOSE — which is why it could never save a morning and
+# why 2026-08-20 was a post-mortem, not a rescue.
+# IST = UTC+5:30 and India observes no DST, so this mapping is permanent.
+# DO NOT re-add CRON_TZ: if cron is ever replaced by cronie it WOULD be honoured and
+# every job would silently shift +5:30 again.
+30 3 * * 1-5 bash /home/ubuntu/tradebot/capture_watchdog.sh preopen
+50 3 * * 1-5 bash /home/ubuntu/tradebot/capture_watchdog.sh
+15 4 * * 1-5 bash /home/ubuntu/tradebot/capture_watchdog.sh
+5 4 * * 1-5 bash /home/ubuntu/tradebot/btst_vm_cron.sh morning
+58 9 * * 1-5 bash /home/ubuntu/tradebot/btst_vm_cron.sh eod
+15 10 * * 1-5 cd /home/ubuntu/tradebot && /usr/bin/docker compose exec -T tradebot python update_historical_daily.py >> /home/ubuntu/tradebot/hist_topup.log 2>&1
+
+# ── INSTALL ──────────────────────────────────────────────────────────────────────────
+#   scp vm_crontab.txt ubuntu@13.233.88.148:/tmp/ && ssh ubuntu@... 'crontab /tmp/vm_crontab.txt'
+#   Verify with:  crontab -l   and, after the next fire, logs/capture_watchdog.log
+# This file is the CANONICAL schedule. The VM's crontab is not otherwise version
+# controlled, so a rebuilt box silently loses it -- and the most likely reconstruction
+# is the CRON_TZ form that was broken for months. Keep them in sync.
