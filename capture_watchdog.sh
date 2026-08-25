@@ -27,6 +27,12 @@
 set -uo pipefail
 cd /home/ubuntu/tradebot || exit 1
 
+# MODE: "session" (default) = full check during 09:15-15:30. "preopen" = TOKEN ONLY,
+# 08:30-09:15. The pre-open run is the one that actually saves a day: a token that died
+# at its overnight cutoff is caught BEFORE the bell, while there is still time to run
+# morning_token.bat, instead of after the first minutes are already lost.
+MODE="${1:-session}"
+
 LOG=/home/ubuntu/tradebot/logs/capture_watchdog.log
 STATE=/home/ubuntu/tradebot/logs/.watchdog_last_restart
 HEALTH=/home/ubuntu/tradebot/logs/capture_health.txt
@@ -50,12 +56,17 @@ notify() {  # notify <priority> <tags> <title> <body>
 }
 
 # ── guards: trading day + session window, host-side so a dead container can't skew it ──
-python3 - <<'PY' || exit 0
-import datetime as dt, sys
+MODE="$MODE" python3 - <<'PY' || exit 0
+import datetime as dt, os, sys
 sys.path.insert(0, "/home/ubuntu/tradebot")
 from core.market_calendar import is_trading_day
 now = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
-ok = is_trading_day(now.date()) and dt.time(9, 15) <= now.time() <= dt.time(15, 30)
+if not is_trading_day(now.date()):
+    sys.exit(1)
+if os.environ.get("MODE") == "preopen":
+    ok = dt.time(8, 30) <= now.time() < dt.time(9, 15)
+else:
+    ok = dt.time(9, 15) <= now.time() <= dt.time(15, 30)
 sys.exit(0 if ok else 1)
 PY
 
@@ -84,8 +95,13 @@ MINS=$(echo "$TOK" | awk '{print $2}')
 if [ "$STATE_TOK" != "VALID" ]; then
   log "TOKEN $STATE_TOK — a restart cannot fix this. NOT restarting."
   echo "UNHEALTHY token=$STATE_TOK at $(ts)" > "$HEALTH"
+  if [ "$MODE" = "preopen" ]; then
+    notify urgent "rotating_light" "Tradebot token DEAD — fix BEFORE the open" \
+      "The VM token is $STATE_TOK and the market has not opened yet. Run morning_token.bat on the laptop NOW — ALL 5 STEPS. The browser login alone is not enough; step 2 is the scp to the VM, and a partial run leaves no trace it stopped early (that is what lost 2026-08-20 entirely)."
+  else
   notify urgent "rotating_light" "Tradebot capture DOWN — token $STATE_TOK" \
-    "The VM has no usable Fyers token, so it is capturing NOTHING today. A container restart will not help. On the laptop: run morning_token.bat (all 5 steps — the login alone is not enough, step 2 scp's it to the VM)."
+  "The VM has no usable Fyers token, so it is capturing NOTHING today. A container restart will not help. On the laptop: run morning_token.bat (all 5 steps — the login alone is not enough, step 2 scp's it to the VM)."
+  fi
   exit 2
 fi
 
@@ -94,6 +110,13 @@ if [ "$MINS" -lt 360 ]; then
   log "token VALID but only ${MINS}m left — expires before the session ends"
   notify high "hourglass" "Tradebot token expires mid-session" \
     "Only ${MINS} minutes of token left. Refresh it before it lapses or capture stops mid-day."
+fi
+
+# Pre-open runs stop here: the token is good and there are no ticks yet to judge.
+if [ "$MODE" = "preopen" ]; then
+  log "pre-open: token OK (${MINS}m left) — market not open yet, skipping tick probe"
+  echo "PREOPEN_OK token=${MINS}m at $(ts)" > "$HEALTH"
+  exit 0
 fi
 
 # ── 2. tick freshness ───────────────────────────────────────────────────────────────
