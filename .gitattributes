@@ -3,3 +3,4 @@
 Dockerfile text eol=lf
 Caddyfile text eol=lf
 docker-compose.yml text eol=lf
+vm_crontab.txt text eol=lf
