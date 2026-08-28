@@ -23,7 +23,7 @@ REM --- make sure Windows ssh accepts the key (perms must be private) ----------
 icacls "%PEM%" /inheritance:r /grant:r "%USERNAME%:R" >nul 2>&1
 
 echo.
-echo [1/4] Opening Fyers login in your browser -- log in (FY_ID, PIN, TOTP)...
+echo [1/5] Opening Fyers login in your browser -- log in (FY_ID, PIN, TOTP)...
 ".venv\Scripts\python.exe" fyers_auth.py
 if errorlevel 1 (
   echo.
@@ -32,9 +32,12 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/4] Uploading token to the VM...
-scp -i "%PEM%" -o StrictHostKeyChecking=accept-new access_token.txt %VM%:/home/ubuntu/tradebot/access_token.txt
-if errorlevel 1 ( echo  UPLOAD FAILED & pause & exit /b 1 )
+echo [2/5] Verifying the token reached the VM...
+REM fyers_auth.py ALREADY pushes on success (push_token.py). This is the retry: it
+REM re-uploads + verifies the digest, and is a no-op cost if the first push worked.
+REM Host/key/remote path live in push_token.py alone -- two copies is how they drift.
+".venv\Scripts\python.exe" push_token.py
+if errorlevel 1 ( echo  UPLOAD FAILED -- the VM does NOT have today's token & pause & exit /b 1 )
 
 echo.
 echo [3/5] Restarting capture on the VM...

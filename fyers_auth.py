@@ -210,6 +210,20 @@ def main() -> None:
     print(f"  Saved to    : {TOKEN_FILE.resolve()}")
     print(f"  Token prefix: {access_token[:50]}...")
     print()
+
+    # Ship it to the VM in the SAME action that minted it. The VM cannot mint its own
+    # (headless TOTP is 404-blocked by Fyers), so the upload is the only path — and as
+    # a separate manual step it was skipped on 2026-08-28, costing the VM every tick
+    # from 09:15 to 09:46. Best-effort: the token is already on disk, so a failed or
+    # skipped push (no SSH key, laptop offline, local-only dev) must never look like a
+    # failed login. push_token.py prints exactly what it did and how to retry.
+    try:
+        from push_token import push
+        push()
+    except Exception as exc:                       # import/OS error — never fatal here
+        print(f"  VM push skipped ({type(exc).__name__}: {exc}) — "
+              f"run push_token.py manually if the VM needs this token.")
+    print()
     print("  TradeBot.py will auto-read access_token.txt on startup.")
     print()
     print("  Now run:  .venv\\Scripts\\python.exe TradeBot.py")
