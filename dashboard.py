@@ -682,6 +682,7 @@ def _auto_signal_poller():
     """Drive engine.eval_and_open across all 4 indices every 60s during market hours
     (track-record coverage for the whole book, not just the viewed panel). Logic in
     engine.py; this loop is just the live clock + gate."""
+    from core.session import DERIV_CLOSE as _DERIV_CLOSE
     led  = intraday_trades.get_ledger()
     feed = LiveFeed()
     while True:
@@ -689,6 +690,19 @@ def _auto_signal_poller():
             now = datetime.datetime.now(tz=IST)
             if datetime.time(9, 16) <= now.time() <= datetime.time(15, 25):
                 engine.eval_and_open(feed, led, INDEX_SYMBOLS, tf_key="15min")
+            # CAS TAIL — capture only, NO signal eval. Index derivatives trade until
+            # 15:40 while the cash index is frozen in the auction, so 15:25-15:40 is
+            # the only record of what futures did while the CAS price was forming —
+            # the one window that can ever answer whether that +12.8bps close jump is
+            # anticipated (and the only place a REAL btst futures fill price lives).
+            # eval_and_open stays capped at 15:25 on purpose: opening a fresh 15min
+            # directional trade at 15:35 has no session left to work with.
+            elif datetime.time(15, 25) < now.time() <= _DERIV_CLOSE:
+                for _s in INDEX_SYMBOLS:
+                    try:
+                        fetch_futures(_s)
+                    except Exception:
+                        pass
         except Exception:
             pass
         time.sleep(60)

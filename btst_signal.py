@@ -34,6 +34,10 @@ import numpy as np
 import pandas as pd
 
 CLR_TH = 0.66
+# First NSE session under the Closing Auction Session (SEBI circular 2026-01-16). From
+# this date the exchange close for F&O-eligible names is an auction print, not the last
+# traded price — see _bar_from_mirror and core.session.CONTINUOUS_CLOSE.
+CAS_START = dt.date(2026, 8, 3)
 EXIT_T = dt.time(9, 30)
 COST_BPS = 3.0
 SYMS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
@@ -61,6 +65,7 @@ def _bar_from_mirror(sym, date):
     try:
         import datetime as _dt
         from core.mirror_io import read_mirror
+        from core.session import CONTINUOUS_CLOSE
         tk = read_mirror("ticks", date.isoformat(), None, f"NSE:{FY[sym]}-INDEX")
         if tk is None or len(tk) < 30:
             return None
@@ -78,6 +83,24 @@ def _bar_from_mirror(sym, date):
         last = m.iloc[-1]["ts"].time()
         if last < _dt.time(15, 10):        # start of the validated 15:10-15:30 entry window
             return None
+        # ── CLOSING AUCTION SESSION (CAS), live 2026-08-03 ───────────────────────────
+        # Continuous cash trading now ENDS at 15:15; 15:15-15:30 is an auction whose
+        # single equilibrium print lands ~15:28. Taking that print as `close` broke this
+        # signal in two ways, measured over the first 18 post-CAS sessions (n=36 index-days):
+        #   1. clr hit EXACTLY 1.000 on 5 of them — zero times in 68 pre-CAS observations.
+        #      An auction print above the day's continuous high forces clr to 1.0 by
+        #      arithmetic. That is not a strong close, and 12/36 (33%) of post-CAS signals
+        #      FLIPPED versus the continuous tape (pre-CAS: 8/68 = 12%).
+        #   2. `close` doubles as entry_px, and the print jumped +12.8bps on average away
+        #      from the last traded price — an entry you cannot fill, worth 10-25% of the
+        #      whole overnight edge.
+        # The rule was validated on 2yr of pre-CAS data where 15:10-15:30 was continuously
+        # tradeable. Clamping to CONTINUOUS_CLOSE keeps it measuring the thing it was
+        # validated on. The CAS print remains the official close — it is simply not a
+        # close-STRENGTH input, and not a price this signal can transact at.
+        m = m[m["ts"].dt.time <= CONTINUOUS_CLOSE]
+        if len(m) < 30:
+            return None
         ltp = m["ltp"].to_numpy(float)
         hi, lo, close = float(ltp.max()), float(ltp.min()), float(m.iloc[-1]["ltp"])
         return {"clr": (close - lo) / (hi - lo) if hi > lo else 0.5, "close": close}
@@ -90,18 +113,32 @@ def candidates(date):
     archive; falls back to the tick mirror for a not-yet-archived day (e.g. today, offline)."""
     out = []
     for s in SYMS:
-        try:
-            d = _daily(s)
-            r = d[d["date"] == date]
-        except Exception:
-            r = None
-        if r is not None and not r.empty:
-            clr, close = _clr(r.iloc[0]), float(r.iloc[0]["close"])
-        else:
-            bar = _bar_from_mirror(s, date)
-            if not bar:
-                continue
+        # SOURCE ORDER FLIPS AT CAS. The archived daily bar's `close` is the EXCHANGE
+        # close, which from 2026-08-03 IS the auction print — so on a post-CAS date the
+        # archive carries exactly the contamination _bar_from_mirror now clamps away, and
+        # preferring it would silently re-introduce the 33% signal flips for every date
+        # that has since been archived (i.e. every backtest and every panel replay).
+        # Post-CAS: intraday mirror first, archive only as a last resort.
+        bar = _bar_from_mirror(s, date) if date >= CAS_START else None
+        if bar:
             clr, close = bar["clr"], bar["close"]
+        else:
+            try:
+                d = _daily(s)
+                r = d[d["date"] == date]
+            except Exception:
+                r = None
+            if r is not None and not r.empty:
+                clr, close = _clr(r.iloc[0]), float(r.iloc[0]["close"])
+                if date >= CAS_START:
+                    print(f"    ⚠ {s} {date}: no tick mirror — clr/entry come from the "
+                          f"ARCHIVED close, which post-CAS is the auction print (signal "
+                          f"may be an artifact, entry may be unfillable).", file=sys.stderr)
+            else:
+                bar = _bar_from_mirror(s, date)
+                if not bar:
+                    continue
+                clr, close = bar["clr"], bar["close"]
         if clr >= CLR_TH:
             out.append({"date": date, "sym": s, "clr": round(clr, 3),
                         "entry_px": round(close, 2)})

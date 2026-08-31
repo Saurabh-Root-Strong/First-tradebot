@@ -23,9 +23,49 @@ import datetime as dt
 OPEN = dt.time(9, 15)
 CLOSE = dt.time(15, 30)
 
+# ── THE CLOSING AUCTION SESSION (CAS) SPLIT THE END OF THE DAY IN TWO ────────────
+# SEBI circular 2026-01-16, live on NSE from 2026-08-03. For F&O-eligible stocks —
+# i.e. every heavyweight index constituent — CONTINUOUS trading now ends at 15:15.
+# 15:15-15:30 is an auction (order entry only, no matching, window shuts at a RANDOM
+# moment between 15:28 and 15:30), and the closing price is the single equilibrium
+# price matched at ~15:28-15:35. The old rule (close = VWAP of the last 30 minutes)
+# is gone.
+#
+# MEASURED IN OUR OWN MIRRORS: from 2026-08-03 the NIFTY tape carries exactly TWO
+# distinct LTPs between 15:15 and 15:30 on EVERY session (225-480 before it) — a flat
+# line from 15:15:00, then one step to the CAS print at ~15:28-15:29. That step
+# averaged +12.8bps over the first 18 sessions and reached +197 points on day one.
+#
+# So 15:30 is still the SESSION boundary and the CAS print is the OFFICIAL close —
+# CLOSE stays 15:30 and settlement still uses it. But the last continuously TRADED
+# price is at CONTINUOUS_CLOSE, and any statistic that assumes prices were being
+# discovered by trading (close-strength, range, sigma, bar builders, band width) owes
+# itself that boundary instead: over 15:15-15:30 sigma collapses to ~0 and is then
+# handed a gap, which is not volatility, it is a scheduled auction.
+CONTINUOUS_CLOSE = dt.time(15, 15)
+
+# Index derivatives keep trading through the auction and close at 15:40 — they are NOT
+# auctioned. This is why the cash index and its futures diverge for the last 25 minutes
+# of the day, and why a futures fill can never be assumed at the cash CAS print.
+DERIV_CLOSE = dt.time(15, 40)
+
 
 def in_session(t: dt.time) -> bool:
     return OPEN <= t <= CLOSE
+
+
+def in_continuous(t: dt.time) -> bool:
+    """Inside the CONTINUOUSLY-TRADED cash session (09:15-15:15 since CAS). Use this,
+    not in_session, wherever a price is only meaningful if trading produced it."""
+    return OPEN <= t <= CONTINUOUS_CLOSE
+
+
+def continuous_only(df, col: str = "ts", day=None):
+    """session_only(), but clamped at CONTINUOUS_CLOSE — drops the CAS auction window."""
+    out = session_only(df, col=col, day=day)
+    if out is None or not len(out) or col not in out.columns:
+        return out
+    return out[out[col].dt.time <= CONTINUOUS_CLOSE]
 
 
 def session_only(df, col: str = "ts", day=None):
