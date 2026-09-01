@@ -101,10 +101,27 @@ def _expiry_date(sym: str) -> Optional[str]:
     return out
 
 
-# Premium SL / first-target as % of entry, by timeframe (from trade_setup.TF_PROFILES).
-# Wider stop + further target the longer the hold.
-_SLT = {5: (0.30, 0.50), 15: (0.32, 0.55), 30: (0.33, 0.60), 60: (0.35, 0.65),
-        120: (0.38, 0.72)}
+# Premium SL / first-target as % of entry, by timeframe.
+#
+# SET BY THE DESK to a FLAT 20% stop / 35% target at every horizon (was a
+# horizon-scaled 30-38% stop / 50-72% target lifted from trade_setup.TF_PROFILES).
+#
+# MEASURED FIRST, on the 302 sim entries with real premium paths walked at 5-min steps:
+#   TP35/SL20  mean -2.22%   win 29.8%   PF 0.72
+#   TP65/SL35  mean -2.42%   win 29.8%   PF 0.72   (what this replaces)
+#   paired difference +0.20pp, day-block CI [-1.27, +1.64] — indistinguishable from zero,
+#   and only 52 of 302 trades exit differently under the two rules at all.
+# The whole TP/SL grid tested (TP30-80 x SL15-40) spans just -1.83% to -2.48%: the exit
+# rule is NOT what is losing the money. A tighter target does raise the odds of touching
+# it, but cost is charged on both sides, so TP35/SL20 needs a 41.8% win rate to break even
+# and the entries deliver 29.8%. Two honest caveats: the walk samples every 5 min, so it
+# UNDERSTATES stop hits (an intrabar spike through -20% that recovers is not seen), and a
+# tighter stop suffers more from that bias than a wide one; and a 20% stop on a 0-DTE
+# premium is inside one bar's noise on expiry day.
+# Keep this flat unless the desk re-scales it deliberately — the horizon scaling it
+# replaced encoded "wider stop for a longer hold", which no longer applies.
+_SLT = {5: (0.20, 0.35), 15: (0.20, 0.35), 30: (0.20, 0.35), 60: (0.20, 0.35),
+        120: (0.20, 0.35)}
 
 
 def _slt_for(horizon_min) -> tuple:
