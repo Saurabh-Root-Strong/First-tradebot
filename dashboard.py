@@ -9198,12 +9198,24 @@ def _render_cockpit(date, asof_str=""):
                   "under-covers there (measured on 2yr history, robust). Base width otherwise.")
         # measured 60m coverage tag: how often price actually lands in THIS index's band
         cov, cconf = r.get("band_cover"), r.get("band_conf", "none")
+        stay = r.get("band_stay")
         _cc = {"ok": "#22c55e", "soft": "#eab308", "low": "#ef4444", "thin": "#64748b"}
+        # TWO numbers, because they answer different questions and only the first was
+        # ever shown: cov = price FINISHES inside at t+H; stay = price NEVER LEFT during
+        # the horizon. At 60m these are 76% and 67% — the band is breached intra-hour
+        # about a third of the time. Showing only 76% next to a band that just broke is
+        # what makes the board read as inaccurate when it is behaving as measured.
+        _stay_txt = f"/{stay*100:.0f}" if stay is not None else ""
         cov_span = (html.Span(
-            f" {cov*100:.0f}% {'✓' if cconf=='ok' else '~' if cconf=='soft' else '⚠' if cconf=='low' else '·'}",
+            f" {cov*100:.0f}{_stay_txt}% "
+            f"{'✓' if cconf=='ok' else '~' if cconf=='soft' else '⚠' if cconf=='low' else '·'}",
             style={"color": _cc.get(cconf, "#64748b"), "fontSize": "0.55rem"},
-            title=f"measured: price lands in this 60m band {cov*100:.0f}% of the time "
-                  f"(n={r.get('band_n', 0)}). Trust the band where this is high.")
+            title=(f"measured, n={r.get('band_n', 0)}: price FINISHES inside this 60m band "
+                   f"{cov*100:.0f}% of the time"
+                   + (f", and NEVER LEAVES it {stay*100:.0f}% of the time (all-index). "
+                      f"So it is breached intra-hour ~{100-stay*100:.0f}% of the time even "
+                      f"though it usually closes back inside — do not read a touch as the "
+                      f"band failing." if stay is not None else ".")))
             if cov is not None else html.Span(""))
         rows.append(html.Div([
             html.Span(f"{r['label']:11}", style={"color": "#e2e8f0", "fontWeight": "700"}),
@@ -9251,11 +9263,15 @@ def _render_cockpit(date, asof_str=""):
                 "to trade. It NEVER says buy or sell a direction (that loses money). It "
                 "gives you a range and one order per index. Two lines each:", "#cbd5e1"),
             _hh("LINE 1 — the state (where price is + the range)"),
-            _hm("NIFTY 50  23987  NORMAL 62%  60m band 23982–24030  74% ✓"),
+            _hm("NIFTY 50  23987  NORMAL 62%  60m band 23982–24030  74/67% ✓"),
             _hl("• 23987 = price now    • NORMAL = calm mood (62% sure)"),
             _hl("• 23982–24030 = where it likely sits in 1 hour (your range)"),
-            _hl("• 74% ✓ = that band was right 74% of the time. GREEN ✓ = trust it. "
-                "RED ⚠ (~50%) = shaky, rough guide only. · = too few days."),
+            _hl("• 74/67% = FIRST number: price ends up inside the band after the hour, "
+                "74% of the time. SECOND number: price never left it at all, 67%."),
+            _hl("• so the band gets POKED THROUGH about 1 hour in 3 and still closes back "
+                "inside — a touch is NOT the band being wrong. Size for that.",),
+            _hl("• GREEN ✓ = trust it. RED ⚠ (~50%) = shaky, rough guide only. "
+                "· = too few days."),
             _hh("LINE 2 — your order (the → line; this is the boss)"),
             _hm("→ STAND-ASIDE  size 0.0x · choppy · option-buy: NO"),
             _hl("• the WORD = your order    • size = how big (1.0x full, 0.5x half, 0.0x none)"),

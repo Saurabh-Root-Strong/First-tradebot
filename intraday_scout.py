@@ -1011,6 +1011,10 @@ def scan_index(sym: str, tf_min: int, date=None, as_of=None,
         "pred_lo": fwd["pred_lo"], "pred_hi": fwd["pred_hi"],
         "pred_move_pct": fwd["move_pct"], "verify": verify,
         "band_cover": bcov["cover"], "band_n": bcov["n"], "band_conf": bcov["conf"],
+        # "finishes inside at t+H" (band_cover) vs "never left during the horizon"
+        # (band_stay). The second is the one a watcher actually experiences — see
+        # hour_forecast.band_coverage.
+        "band_stay": bcov.get("stay"),
         # non-None => this coverage was measured at a DIFFERENT horizon and borrowed
         # (the ledger only carries the horizons eod_sync sweeps). The UI must not call
         # a borrowed cell "measured at this horizon".

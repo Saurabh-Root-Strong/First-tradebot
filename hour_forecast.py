@@ -220,6 +220,18 @@ def band_coverage(sym: str, horizon_min: int) -> dict:
     # calibration_engine corrects against. Prefer deployed; fall back for old ledgers.
     cover = c.get("deployed") if c.get("deployed") is not None else c.get("endpoint")
     n = int(c.get("n", 0))
+    # ── FINISHES-INSIDE is not STAYS-INSIDE, and the board was only ever showing the
+    # first one. `deployed`/`endpoint` ask "was price inside the band AT t+H" — an
+    # ENDPOINT test. A trader watching the band experiences the ENVELOPE: did price
+    # leave the band at any point during the hour. Measured over the same ledger, 60m:
+    # endpoint 83.2% / deployed 76.0% / envelope 66.9%. So the band is breached
+    # intra-hour about a THIRD of the time while still closing inside three quarters of
+    # the time, and a badge reading "76%" next to a band that just broke is what makes
+    # the board look wrong when it is not. Surface both.
+    # The envelope column is only logged at the ALL-INDEX level (by_index carries just
+    # endpoint/deployed), so `stay` is flagged as all-index rather than silently passed
+    # off as this index's own number.
+    stay = ((led.get("overall", {}) or {}).get(key, {}) or {}).get("envelope")
     if cover is None or n < 20:
         conf = "thin"
     elif cover >= 0.66:
@@ -234,7 +246,8 @@ def band_coverage(sym: str, horizon_min: int) -> dict:
         ratio = max(horizon_min, borrowed) / max(1, min(horizon_min, borrowed))
         if ratio > _COV_H_TOL and conf == "ok":
             conf = "soft"          # number is plausible, the EVIDENCE is not at this H
-    return {"cover": cover, "n": n, "conf": conf, "borrowed": borrowed}
+    return {"cover": cover, "n": n, "conf": conf, "borrowed": borrowed,
+            "stay": stay, "stay_scope": "all-index"}
 
 
 # ── TIME-OF-DAY band width — the intraday-vol U-shape correction ──────────────────
