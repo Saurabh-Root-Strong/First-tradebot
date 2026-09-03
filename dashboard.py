@@ -8747,6 +8747,40 @@ def _moneyness_panel(sym: str):
             hovermode="x unified")
         return f
 
+    def _mini(bucket: str):
+        """One small window: CE vs PE OI for a single bucket (or the basket TOTAL).
+
+        Independent y-axes on purpose — ATM can be 350L while ITM is 45L, and a shared
+        axis would flatten ITM/OTM into the floor. The cost is that HEIGHT IS NOT
+        COMPARABLE ACROSS THE FOUR WINDOWS, so each header prints its own last values:
+        read the shape here, read the level off the header.
+        """
+        if bucket == "TOTAL":
+            s = (live.groupby(["ts", "side"], observed=True)["oi"].sum()
+                 .reset_index())
+        else:
+            s = live[live.bucket == bucket]
+        f = go.Figure()
+        vals = {}
+        for side, colr in (("CE", "#ef4444"), ("PE", "#22c55e")):
+            d_ = s[s.side == side].sort_values("ts")
+            if not len(d_) or float(d_["oi"].max() or 0) == 0:
+                continue
+            vals[side] = float(d_["oi"].iloc[-1]) / 1e5
+            f.add_trace(go.Scatter(x=d_.ts, y=d_["oi"] / 1e5, name=side, showlegend=False,
+                                   line=dict(color=colr, width=1.3)))
+        head = (f"{bucket}   CE {vals.get('CE', 0):.0f}L · PE {vals.get('PE', 0):.0f}L"
+                if vals else f"{bucket}   — no OI")
+        f.update_layout(
+            title=dict(text=head, font=dict(size=10, color="#94a3b8"), x=0.02),
+            height=165, margin=dict(l=4, r=6, t=28, b=20),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(gridcolor="#0f1a2a", tickfont=dict(color="#475569", size=8),
+                       tickformat="%H:%M", nticks=4),
+            yaxis=dict(gridcolor="#0f1a2a", tickfont=dict(color="#64748b", size=8)),
+            hovermode="x unified")
+        return f
+
     last = live[live.ts == live.ts.max()]
     n_by = {(r.side, r.bucket): r.n_strikes for r in last.itertuples()}
     esc = not (min(basket["window"]) <= float(spot_by_ts.iloc[-1]) <= max(basket["window"]))
@@ -8760,9 +8794,24 @@ def _moneyness_panel(sym: str):
                   "levels use live delta labels · flow uses labels frozen at the open",
                   style={"color": "#f59e0b" if esc else "#334155"}),
     ], style={"fontSize": "0.55rem", "marginBottom": "4px", **MONO})
-    return [_fig(live, "oi", "OI by moneyness — live labels (where OI sits)", 250),
-            _fig(pin, "oi_chg",
-                 "ΔOI since open — pinned basket (what positioning actually did)", 230)], cap
+    mini_row = dbc.Row(
+        [dbc.Col(dcc.Graph(figure=_mini(b), config={"displayModeBar": False}),
+                 md=3, xs=6, style={"padding": "0 3px"})
+         for b in ("TOTAL", "ITM", "ATM", "OTM")],
+        className="g-0", style={"marginBottom": "2px"})
+    mini_note = html.Div(
+        "── OI by moneyness · 23-strike basket · CE red / PE green · each window has "
+        "its OWN y-scale (ATM dwarfs ITM), so compare SHAPE here and read LEVEL off "
+        "each header. TOTAL = the basket, NOT the whole-chain CALL OI / PUT OI in the "
+        "strip above (that is every expiry).",
+        style={"color": "#334155", "fontSize": "0.53rem", "margin": "6px 0 2px", **MONO})
+    # READY-TO-RENDER components (not raw figures) — the row is a dbc.Row, not a Graph,
+    # so the caller must not blanket-wrap these in dcc.Graph.
+    return [mini_note, mini_row,
+            dcc.Graph(figure=_fig(pin, "oi_chg",
+                                  "ΔOI since open — pinned basket (what positioning "
+                                  "actually did)", 230),
+                      config={"displayModeBar": False})], cap
 
 
 def _render_liveoi(sym: str) -> "html.Div":
@@ -8861,14 +8910,16 @@ def _render_liveoi(sym: str) -> "html.Div":
                if eod_bits else html.Div())
 
     g = lambda fig: dcc.Graph(figure=fig, config={"displayModeBar": False})
-    mfigs, mcap = _moneyness_panel(sym)
+    # already-built components (mini row + flow graph), NOT figures — do not wrap.
+    mparts, mcap = _moneyness_panel(sym)
     return html.Div([
         strip,
         eod_cap,
         html.Div(f"{len(series)} snapshots · {ts[0]:%H:%M}–{ts[-1]:%H:%M} IST · {src_note}",
                  style={"color": "#334155", "fontSize": "0.55rem", "marginBottom": "4px", **MONO}),
-        g(f1), g(f2), g(f3),
-        *([mcap] + [g(f) for f in mfigs] if mfigs else []),
+        g(f1),
+        *([mcap] + mparts if mparts else []),
+        g(f2), g(f3),
     ], style={"background": BG_CARD, "border": "1px solid #111d2e",
               "borderRadius": "10px", "padding": "14px 16px"})
 
