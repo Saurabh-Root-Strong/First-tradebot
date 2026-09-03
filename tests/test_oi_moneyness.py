@@ -113,3 +113,50 @@ def test_escaped_detects_spot_leaving_the_window():
     s = om.bucket_snapshot(_rows(), 23873, step=50, use_delta=False)
     assert om.escaped(s, 23873) is False
     assert om.escaped(s, 30000) is True
+
+
+# ── vectorised path must agree with the row-wise one ─────────────────────────────
+def test_bucket_series_matches_bucket_snapshot_on_one_timestamp():
+    """Two implementations of the same rule is how they drift. Pin them together."""
+    pd = pytest.importorskip("pandas")
+    rows = _rows()
+    for i, r in enumerate(rows):                      # spread deltas across the window
+        r["delta"] = 0.9 if i < 10 else (0.5 if i < 24 else 0.1)
+        r["ts"] = pd.Timestamp("2026-09-03 10:00")
+    df = pd.DataFrame(rows)
+    spot = pd.Series({pd.Timestamp("2026-09-03 10:00"): 23873.0})
+    ser = om.bucket_series(df, spot, step=50)
+    snap = om.bucket_snapshot(rows, 23873.0, step=50)
+    checked = 0
+    for side in ("CE", "PE"):
+        for b in om.BUCKETS:
+            got = ser[(ser.side == side) & (ser.bucket == b)]["oi"]
+            vec = float(got.iloc[0]) if len(got) else 0.0
+            assert vec == pytest.approx(snap[side][b]["oi"]), (
+                f"{side}/{b}: vectorised {vec} != row-wise {snap[side][b]['oi']}")
+            checked += 1
+    assert checked == 6                    # guard: the loop actually compared something
+
+
+def test_bucket_series_pinned_labels_never_move():
+    pd = pytest.importorskip("pandas")
+    rows = _rows()
+    basket = om.pin_basket(rows, 23873, step=50, use_delta=False)
+    frames = []
+    for j, ts in enumerate(("10:00", "14:00")):
+        for r in rows:
+            frames.append(dict(r, ts=pd.Timestamp(f"2026-09-03 {ts}"), delta=None,
+                               oi=1000 + 100 * j))
+    df = pd.DataFrame(frames)
+    spot = pd.Series({pd.Timestamp("2026-09-03 10:00"): 23873.0,
+                      pd.Timestamp("2026-09-03 14:00"): 24600.0})   # spot RUNS AWAY
+    ser = om.bucket_series(df, spot, step=50, labels="pinned", basket=basket)
+    early = ser[ser.ts == pd.Timestamp("2026-09-03 10:00")].set_index(["side", "bucket"]).n_strikes
+    late = ser[ser.ts == pd.Timestamp("2026-09-03 14:00")].set_index(["side", "bucket"]).n_strikes
+    assert early.to_dict() == late.to_dict(), "pinned buckets changed size when spot moved"
+
+
+def test_bucket_series_empty_input_returns_empty_frame():
+    pd = pytest.importorskip("pandas")
+    out = om.bucket_series(pd.DataFrame(), pd.Series(dtype=float), step=50)
+    assert len(out) == 0 and "bucket" in out.columns

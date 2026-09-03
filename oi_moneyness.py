@@ -225,6 +225,90 @@ def basket_delta(rows: Iterable[dict], basket: dict) -> dict:
     return out
 
 
+def bucket_series(df, spot_by_ts, step: float = 0.0, n: int = WINDOW_STRIKES,
+                  labels: str = "live", basket: Optional[dict] = None):
+    """Vectorised session time-series of bucket aggregates. pandas in, pandas out.
+
+    A per-snapshot Python loop is not viable here — a session is ~675 snapshots x ~102
+    legs per index — so this classifies the whole frame at once.
+
+    df: chain rows for ONE index with columns ts, strike, side, oi, oich, volume, delta.
+    spot_by_ts: Series indexed by ts (the live spot at each snapshot).
+    labels:
+      "live"   — moneyness recomputed at every snapshot from that leg's CURRENT delta.
+                 Levels view: where OI sits now.
+      "pinned" — moneyness frozen from `basket` (built at the open). Flow view: the
+                 number means "OI change in what was ITM/ATM/OTM AT THE OPEN".
+
+    THE BASKET IS FIXED FOR THE WHOLE SESSION either way — one 23-strike set chosen at
+    the open, never re-selected. That is what removes the composition artifact: with a
+    per-snapshot window, strikes entering and leaving as spot drifts would show up as
+    OI appearing and vanishing, and PCR would move with no trade behind it. Fixing the
+    constituents means every change in these series happened at a strike that was in
+    the basket the whole time.
+
+    Returns a long frame: ts, side, bucket, oi, oi_chg, volume, n_strikes.
+    """
+    import pandas as pd
+
+    if df is None or not len(df):
+        return pd.DataFrame(columns=["ts", "side", "bucket", "oi", "oi_chg",
+                                     "volume", "n_strikes"])
+    d = df.copy()
+    d = d[d["side"].isin(("CE", "PE"))]
+    keep = set(basket["window"]) if basket else set(
+        window_strikes(d["strike"], float(spot_by_ts.iloc[0]), n))
+    d = d[d["strike"].isin(keep)]
+    if not len(d):
+        return pd.DataFrame(columns=["ts", "side", "bucket", "oi", "oi_chg",
+                                     "volume", "n_strikes"])
+    d["spot"] = d["ts"].map(spot_by_ts)
+    d["spot"] = d["spot"].ffill().bfill()
+
+    if labels == "pinned":
+        if not basket:
+            raise ValueError("labels='pinned' needs a basket from pin_basket()")
+        lab = pd.Series(list(zip(d["strike"].astype(float), d["side"])), index=d.index)
+        d["bucket"] = lab.map(basket["labels"])
+        d = d[d["bucket"].notna()]
+    else:
+        ad = d["delta"].abs()
+        usable = ad.notna() & (ad > 0.0)
+        # delta path
+        b = pd.Series(index=d.index, dtype=object)
+        b[usable & (ad >= ITM_DELTA)] = "ITM"
+        b[usable & (ad < ITM_DELTA) & (ad >= ATM_DELTA)] = "ATM"
+        b[usable & (ad < ATM_DELTA)] = "OTM"
+        # strike fallback for legs with no usable delta — SAME per-leg mirror as
+        # moneyness(): a put above spot is ITM, a call above spot is OTM.
+        if (~usable).any() and step:
+            f = d[~usable]
+            dist = (f["strike"] - f["spot"]) / step
+            above = dist > 0
+            near = dist.abs() <= ATM_STRIKES
+            fb = pd.Series("ATM", index=f.index)
+            call = f["side"].eq("CE")
+            fb[~near & above & call] = "OTM"
+            fb[~near & ~above & call] = "ITM"
+            fb[~near & above & ~call] = "ITM"
+            fb[~near & ~above & ~call] = "OTM"
+            b[~usable] = fb
+        d["bucket"] = b.fillna("ATM")
+
+    g = d.groupby(["ts", "side", "bucket"], observed=True)
+    out = g.agg(oi=("oi", "sum"), volume=("volume", "sum"),
+                n_strikes=("strike", "nunique")).reset_index()
+    # oi_chg = change against THIS basket's own first snapshot, not the broker's `oich`
+    # (which is a day-change against the previous CLOSE and so mixes overnight with
+    # intraday). Session-cumulative and anchored at the open, like every other series
+    # on the board.
+    first = (out.sort_values("ts").groupby(["side", "bucket"], observed=True)["oi"]
+             .first().rename("oi0"))
+    out = out.merge(first, on=["side", "bucket"], how="left")
+    out["oi_chg"] = out["oi"] - out["oi0"]
+    return out.drop(columns=["oi0"]).sort_values(["ts", "side", "bucket"])
+
+
 def bucket_pcr(snap: dict, bucket: str = "ATM") -> Optional[float]:
     """PUT/CALL OI ratio WITHIN one moneyness bucket.
 
