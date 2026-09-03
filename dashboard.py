@@ -8678,6 +8678,93 @@ def _liveoi_db_fallback(sym: str):
     return [], None
 
 
+def _moneyness_panel(sym: str):
+    """(figures, caption) — ITM/ATM/OTM buckets over the 23-strike window.
+
+    TWO charts on purpose, because they answer different questions and the difference
+    is not cosmetic (see oi_moneyness):
+      LEVELS  — labels recomputed each snapshot from that leg's live delta. Where OI is.
+      FLOW    — labels FROZEN at the open over a fixed basket. What positioning did.
+    Measured 2026-09-03 NIFTY: the live view showed ATM puts -9.9L / OTM +130.7L while
+    the pinned view showed +64.6L / +56.3L. Nothing unwound — strikes were relabelled
+    as spot fell. Showing only the live series invents an ATM unwind on any trending day.
+    """
+    import oi_moneyness as om
+    from core.mirror_io import read_mirror
+    from core.constants import STRIKE_STEP, today_iso
+    try:
+        day = today_iso()
+        ch = read_mirror("chain_snapshots", day, None, sym)
+        tk = read_mirror("ticks", day, None, sym)
+        if ch is None or not len(ch) or tk is None or not len(tk):
+            return [], None
+        ch = ch.copy(); ch["ts"] = pd.to_datetime(ch["ts"])
+        tk = tk.copy(); tk["ts"] = pd.to_datetime(tk["ts"])
+        tk = tk.sort_values("ts")
+        snap_ts = pd.DataFrame({"ts": sorted(ch["ts"].unique())})
+        sp = pd.merge_asof(snap_ts, tk[["ts", "ltp"]], on="ts")
+        spot_by_ts = pd.Series(sp["ltp"].values, index=sp["ts"].values)
+        if not len(spot_by_ts) or not pd.notna(spot_by_ts.iloc[0]):
+            return [], None
+        step = STRIKE_STEP.get(sym, 0)
+        first = ch[ch["ts"] == ch["ts"].min()].to_dict("records")
+        basket = om.pin_basket(first, float(spot_by_ts.iloc[0]), step=step)
+        live = om.bucket_series(ch, spot_by_ts, step, basket=basket)
+        pin = om.bucket_series(ch, spot_by_ts, step, labels="pinned", basket=basket)
+        if not len(live):
+            return [], None
+    except Exception as exc:
+        # LOG, never swallow. A bare `return [], None` here turned a NameError into a
+        # silently blank panel during development, which is exactly how chain capture
+        # once died unnoticed behind an `except: pass`. A broken panel must say so.
+        print(f"  [moneyness] {sym} panel failed: {type(exc).__name__}: {exc}", flush=True)
+        return [], None
+
+    # CE warm / PE cool, shade by moneyness so six traces stay readable.
+    CLR = {("CE", "ITM"): "#7f1d1d", ("CE", "ATM"): "#ef4444", ("CE", "OTM"): "#fca5a5",
+           ("PE", "ITM"): "#14532d", ("PE", "ATM"): "#22c55e", ("PE", "OTM"): "#86efac"}
+
+    def _fig(df, col, title, height):
+        f = go.Figure()
+        for side in ("CE", "PE"):
+            for b in om.BUCKETS:
+                s = df[(df.side == side) & (df.bucket == b)]
+                if not len(s) or float(s[col].abs().max() or 0) == 0:
+                    continue          # skip structurally empty buckets (MIDCAP ITM etc)
+                f.add_trace(go.Scatter(
+                    x=s.ts, y=s[col] / 1e5, name=f"{side} {b}",
+                    line=dict(color=CLR[(side, b)], width=1.4,
+                              dash="solid" if side == "CE" else "dot")))
+        f.update_layout(
+            title=dict(text=title, font=dict(size=11, color="#94a3b8"), x=0.01),
+            height=height, margin=dict(l=8, r=8, t=34, b=24),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(gridcolor="#0f1a2a", tickfont=dict(color="#475569", size=9),
+                       tickformat="%H:%M"),
+            yaxis=dict(gridcolor="#0f1a2a", tickfont=dict(color="#64748b", size=9),
+                       title=dict(text="lakh", font=dict(size=8, color="#334155"))),
+            legend=dict(orientation="h", y=1.16, x=0, font=dict(size=8, color="#94a3b8")),
+            hovermode="x unified")
+        return f
+
+    last = live[live.ts == live.ts.max()]
+    n_by = {(r.side, r.bucket): r.n_strikes for r in last.itertuples()}
+    esc = not (min(basket["window"]) <= float(spot_by_ts.iloc[-1]) <= max(basket["window"]))
+    cap = html.Div([
+        html.Span(f"23-strike basket pinned at the open  {min(basket['window']):,.0f}–"
+                  f"{max(basket['window']):,.0f}  ·  ATM zone now "
+                  f"{n_by.get(('CE','ATM'), 0)} strikes (delta 0.35–0.65)  ·  ",
+                  style={"color": "#52708f"}),
+        html.Span("⚠ SPOT LEFT THE BASKET — buckets are one-sided, walls inside it "
+                  "no longer mean anything" if esc else
+                  "levels use live delta labels · flow uses labels frozen at the open",
+                  style={"color": "#f59e0b" if esc else "#334155"}),
+    ], style={"fontSize": "0.55rem", "marginBottom": "4px", **MONO})
+    return [_fig(live, "oi", "OI by moneyness — live labels (where OI sits)", 250),
+            _fig(pin, "oi_chg",
+                 "ΔOI since open — pinned basket (what positioning actually did)", 230)], cap
+
+
 def _render_liveoi(sym: str) -> "html.Div":
     """Live OI session time-series: total OI buildup, PCR, walls/max-pain — all vs spot."""
     series = oi_store.series(sym)
@@ -8774,12 +8861,14 @@ def _render_liveoi(sym: str) -> "html.Div":
                if eod_bits else html.Div())
 
     g = lambda fig: dcc.Graph(figure=fig, config={"displayModeBar": False})
+    mfigs, mcap = _moneyness_panel(sym)
     return html.Div([
         strip,
         eod_cap,
         html.Div(f"{len(series)} snapshots · {ts[0]:%H:%M}–{ts[-1]:%H:%M} IST · {src_note}",
                  style={"color": "#334155", "fontSize": "0.55rem", "marginBottom": "4px", **MONO}),
         g(f1), g(f2), g(f3),
+        *([mcap] + [g(f) for f in mfigs] if mfigs else []),
     ], style={"background": BG_CARD, "border": "1px solid #111d2e",
               "borderRadius": "10px", "padding": "14px 16px"})
 
