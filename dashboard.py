@@ -8678,7 +8678,7 @@ def _liveoi_db_fallback(sym: str):
     return [], None
 
 
-def _moneyness_panel(sym: str):
+def _moneyness_panel(sym: str, day: str = None):
     """(figures, caption) — ITM/ATM/OTM buckets over the 23-strike window.
 
     TWO charts on purpose, because they answer different questions and the difference
@@ -8691,11 +8691,27 @@ def _moneyness_panel(sym: str):
     """
     import oi_moneyness as om
     from core.mirror_io import read_mirror
-    from core.constants import STRIKE_STEP, today_iso
+    from core.constants import STRIKE_STEP, today_iso, LIVE_DIR
     try:
-        day = today_iso()
+        # FOLLOW THE PAGE'S SESSION. The rest of /live-oi falls back to the last
+        # captured session before the open (the strip reads "last session 2026-09-03"),
+        # and a panel pinned to today_iso() went blank beside it every pre-open morning
+        # — which reads as "the feature is broken", not "the market has not opened".
+        # `day` is what the caller resolved; only fall back when it is not given.
+        day = day or today_iso()
         ch = read_mirror("chain_snapshots", day, None, sym)
         tk = read_mirror("ticks", day, None, sym)
+        if ch is None or not len(ch) or tk is None or not len(tk):
+            # newest session that actually has BOTH mirrors, so the panel never
+            # disagrees with the chart above it about which day is on screen
+            cands = sorted(p.name.split("_")[0] for p in LIVE_DIR.glob("*_chain_snapshots.parquet")
+                           if p.name[0].isdigit() and p.stat().st_size > 500_000)
+            for cand in reversed(cands[-10:]):
+                ch = read_mirror("chain_snapshots", cand, None, sym)
+                tk = read_mirror("ticks", cand, None, sym)
+                if ch is not None and len(ch) and tk is not None and len(tk):
+                    day = cand
+                    break
         if ch is None or not len(ch) or tk is None or not len(tk):
             return [], None
         ch = ch.copy(); ch["ts"] = pd.to_datetime(ch["ts"])
@@ -8799,11 +8815,13 @@ def _moneyness_panel(sym: str):
                  md=3, xs=6, style={"padding": "0 3px"})
          for b in ("TOTAL", "ITM", "ATM", "OTM")],
         className="g-0", style={"marginBottom": "2px"})
+    from core.constants import today_iso as _today
+    _daytag = "" if day == _today() else f"  ·  showing {day}"
     mini_note = html.Div(
-        "── OI by moneyness · 23-strike basket · CE red / PE green · each window has "
-        "its OWN y-scale (ATM dwarfs ITM), so compare SHAPE here and read LEVEL off "
-        "each header. TOTAL = the basket, NOT the whole-chain CALL OI / PUT OI in the "
-        "strip above (that is every expiry).",
+        f"── OI by moneyness · 23-strike basket{_daytag} · CE red / PE green · each "
+        "window has its OWN y-scale (ATM dwarfs ITM), so compare SHAPE here and read "
+        "LEVEL off each header. TOTAL = the basket, NOT the whole-chain CALL OI / PUT "
+        "OI in the strip above (that is every expiry).",
         style={"color": "#334155", "fontSize": "0.53rem", "margin": "6px 0 2px", **MONO})
     # READY-TO-RENDER components (not raw figures) — the row is a dbc.Row, not a Graph,
     # so the caller must not blanket-wrap these in dcc.Graph.
@@ -8818,6 +8836,7 @@ def _render_liveoi(sym: str) -> "html.Div":
     """Live OI session time-series: total OI buildup, PCR, walls/max-pain — all vs spot."""
     series = oi_store.series(sym)
     src_note = "live"
+    _sd = None
     if not series:
         series, _sd = _liveoi_db_fallback(sym)
         src_note = f"last session {_sd}" if series else "live"
@@ -8911,7 +8930,9 @@ def _render_liveoi(sym: str) -> "html.Div":
 
     g = lambda fig: dcc.Graph(figure=fig, config={"displayModeBar": False})
     # already-built components (mini row + flow graph), NOT figures — do not wrap.
-    mparts, mcap = _moneyness_panel(sym)
+    # Pass the session the page settled on, so the moneyness windows never show a
+    # different day from the chart directly above them.
+    mparts, mcap = _moneyness_panel(sym, day=_sd)
     return html.Div([
         strip,
         eod_cap,
