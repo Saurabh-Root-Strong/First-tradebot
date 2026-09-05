@@ -4435,6 +4435,29 @@ def _fill_scout(sel, combo, vdate, _tick, gp_val):
                 _lsr.append(html.Span(f"◈ confluence @{', '.join(str(x) for x in lv['confluence'])}",
                             style={"color": "#22d3ee", "fontSize": "0.6rem", "fontWeight": "700",
                                    "marginRight": "10px"}))
+            # ── ARMED MTF-CONFLUENCE SETUP ──────────────────────────────────────────
+            # Fires only when price is actually AT a level both frames agree on. The
+            # measured grade for THIS tf pair is printed on the same line, deliberately:
+            # the rule backtests NEGATIVE (see tradeboard.CONF_GRADE / the module note),
+            # so the suggestion and the evidence against it must never be separated.
+            _cs = lv.get("conf_setup") or {}
+            if _cs:
+                _g = tb.CONF_GRADE.get(f"{ltf_tf}m>{htf_tf}m") or {}
+                _gtxt = (f"  ·  backtested {_g['n']} trades: win {_g['win']:.0f}% "
+                         f"mean {_g['bps']:+.1f}bps {_g['verdict']}" if _g else
+                         "  ·  ungraded on this pair")
+                _dir_clr = "#4ade80" if _cs["side"] == "LONG" else "#f87171"
+                _lsr.append(html.Div([
+                    html.Span(f"⚑ MTF SETUP  {_cs['side']} @ {_cs['kind']} ",
+                              style={"color": _dir_clr, "fontWeight": "700"}),
+                    html.Span(f"{_cs['ltf_level']} (LTF) ≈ {_cs['htf_level']} (HTF), "
+                              f"gap {_cs['gap']} · ×{_cs['touches']} touches  ",
+                              style={"color": "#a78bfa"}),
+                    html.Span(f"entry {_cs['entry']} · SL {_cs['sl']} · "
+                              f"target {_cs['target']} · R:R {_cs['rr']}",
+                              style={"color": "#e2e8f0"}),
+                    html.Span(_gtxt, style={"color": "#f59e0b", "fontWeight": "700"}),
+                ], style={"fontSize": "0.6rem", "marginTop": "2px"}))
             body.append(html.Tr([html.Td([
                 _kv("band", f"[{lv.get('band_lo')}, {lv.get('band_hi')}]", "#40c4ff"),
                 _kv("60m S/R", f"{_sup_txt} / {_res_txt}", "#4ade80"),

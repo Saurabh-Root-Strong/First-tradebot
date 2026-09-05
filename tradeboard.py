@@ -998,6 +998,87 @@ def _struct_min(h, l, c, i, lb=_STRUCT_LB):
     return "RANGE"
 
 
+# ── MTF CONFLUENCE SETUP ─────────────────────────────────────────────────────────
+# Defaults are the BACKTESTED ones. Changing any of them invalidates the grade shown
+# beside the setup, because that grade was measured at exactly these values.
+CONF_TOL_ATR = 0.25      # HTF level counts as "same level" within this × HTF-ATR
+CONF_NEAR_ATR = 0.15     # price must be this close to the level to arm the setup
+CONF_SL_ATR = 0.50       # stop sits this far BEYOND the level
+CONF_RR = 1.5            # target = this × risk
+
+# MEASURED GRADE PER TF PAIR. 4,028 trades over 57 sessions of live tick data, the exact
+# rule above, 3bps futures round trip, flat 15:15, stop assumed first when one 5m bar
+# holds both stop and target. Day-block bootstrap CI.
+#
+#   pair       confluent                              control (single-TF)
+#   5m>15m     n=1568 win 37.4% -3.17bps [-3.64,-2.72]  n=521 -3.03bps [-3.91,-2.18]
+#   10m>30m    n= 921 win 34.5% -4.75bps [-5.58,-3.92]  n=256 -2.45bps [-4.30,-0.40]
+#   15m>60m    n= 582 win 38.3% -3.67bps [-5.18,-2.05]  n=180 -3.94bps [-7.18,-0.63]
+#
+# ALL THREE PAIRS LOSE, and every CI excludes zero — this is not "no edge", it is a
+# measured negative one. Confluence also fails to beat its own control on 2 of 3 pairs.
+# At R:R 1.5 break-even needs 40% wins; the best pair delivers 38.3%.
+# The grade is displayed NEXT TO the suggestion on purpose: the setup is a charting
+# convenience for a human who wants to see where both frames agree, not a system call,
+# and the evidence against it must not be separable from it.
+CONF_GRADE: dict = {
+    "5m>15m":  {"n": 1568, "win": 37.4, "bps": -3.17, "lo": -3.64, "hi": -2.72,
+                "pf": 0.56, "rupee": -827_537, "verdict": "NEGATIVE"},
+    "10m>30m": {"n": 921,  "win": 34.5, "bps": -4.75, "lo": -5.58, "hi": -3.92,
+                "pf": 0.52, "rupee": -726_446, "verdict": "NEGATIVE"},
+    "15m>60m": {"n": 582,  "win": 38.3, "bps": -3.67, "lo": -5.18, "hi": -2.05,
+                "pf": 0.69, "rupee": -357_087, "verdict": "NEGATIVE"},
+}
+
+
+def confluence_setup(lv_l, lv_h, spot: float, atr: float, tol_pts: float = None) -> dict:
+    """A trade suggestion when an LTF level sits ON an HTF level and price is AT it.
+
+    Returns {} unless EXACTLY ONE side qualifies. Being squeezed between a confluent
+    support and a confluent resistance is not a setup, it is a coin flip inside a box —
+    the backtest skipped those and so does this, or the displayed grade would not apply.
+
+    tol_pts: fixed point tolerance (e.g. 20). Default None = 0.25 × ATR, which is what
+    was measured. A FIXED point band is not comparable across indices — 20 points is
+    0.03% of BANK NIFTY and 0.14% of MIDCAP, so the same number is a 4x looser filter on
+    one board than the other; ATR scaling is why the default is what it is.
+    """
+    if not lv_l or not lv_h or not spot or not atr or atr <= 0:
+        return {}
+    tol = float(tol_pts) if tol_pts else CONF_TOL_ATR * atr
+    near = CONF_NEAR_ATR * atr
+    cands = []
+    below = [(x, t) for x, t in lv_l if x < spot]
+    above = [(x, t) for x, t in lv_l if x > spot]
+    if below:
+        lvl, tch = max(below, key=lambda c: c[0])
+        if abs(spot - lvl) <= near:
+            cands.append(("LONG", lvl, tch))
+    if above:
+        lvl, tch = min(above, key=lambda c: c[0])
+        if abs(spot - lvl) <= near:
+            cands.append(("SHORT", lvl, tch))
+    if len(cands) != 1:
+        return {}
+    side, lvl, tch = cands[0]
+    mates = [xh for xh, _ in lv_h if abs(lvl - xh) <= tol]
+    if not mates:
+        return {}
+    htf_lvl = min(mates, key=lambda x: abs(x - lvl))
+    sl = lvl - CONF_SL_ATR * atr if side == "LONG" else lvl + CONF_SL_ATR * atr
+    risk = abs(spot - sl)
+    if risk <= 0:
+        return {}
+    target = spot + CONF_RR * risk if side == "LONG" else spot - CONF_RR * risk
+    return {"side": side, "kind": "support" if side == "LONG" else "resistance",
+            "ltf_level": round(lvl, 1), "htf_level": round(htf_lvl, 1),
+            "gap": round(abs(lvl - htf_lvl), 1), "touches": tch,
+            "entry": round(spot, 1), "sl": round(sl, 1), "target": round(target, 1),
+            "rr": CONF_RR, "risk_pts": round(risk, 1),
+            "dist_atr": round(abs(spot - lvl) / atr, 2),
+            "tol_used": round(tol, 1)}
+
+
 def _walls(h, l, tol: float):
     """TOUCH-COUNTED S/R: cluster swing pivots within `tol` price units → [(level, touches)].
     A 3-touch cluster = a wall the market rejected three times; 1-touch = a mere pivot. The
@@ -1147,6 +1228,8 @@ def _scout_levels(sym, ltf_tf, htf_tf, tag, htf, ltf, spot, date, as_of) -> dict
         "sup_touches": sup_t, "res_touches": res_t,
         "sup_l": sup_l, "sup_l_t": sup_l_t, "res_l": res_l, "res_l_t": res_l_t,
         "confluence": confluence[:3],
+        # the armed TRADE when price is actually AT a both-frames level (may be {})
+        "conf_setup": confluence_setup(lv_l, lv, spot, atr),
         "headroom_atr": head, "wall_warn": wall_warn,
         "warn_level": warn_level, "warn_touches": warn_touches, "warn_tf": warn_tf,
         "atm": atm, "side": side, "lean": lean,
