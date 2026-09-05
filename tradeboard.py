@@ -1115,8 +1115,25 @@ def _scout_levels(sym, ltf_tf, htf_tf, tag, htf, ltf, spot, date, as_of) -> dict
             head = round(abs(wx - spot) / atr, 2)
             warn_level, warn_touches, warn_tf = wx, wt, wtf
     wall_warn = bool(head is not None and head < 0.5)
-    # LTF nearest S/R (display) + ◈ CONFLUENCE flag (15m wall sitting ON a 60m wall = the
-    # strongest level — the system's one validated level-finding: confluence works).
+    # LTF nearest S/R (display) + ◈ CONFLUENCE flag: a 15m wall sitting ON a 60m wall.
+    #
+    # DISPLAY ONLY — "confluence works" was asserted here, never measured. Measured
+    # 2026-09-04 over 11,443 level-touch events / 58 sessions / 4 indices, forward 60m,
+    # confluent vs single-TF, day-block CI (price within 0.15 ATR of the level):
+    #     support  confluent +1.51bps [-5.20,+7.96] up 51.2%
+    #     support  single-TF +1.04bps [-1.99,+3.80] up 53.5%   -> confluence +0.47bps
+    #     resist   confluent +1.01bps  up 49.3%
+    #     resist   single-TF +3.10bps  up 53.0%                -> confluence -2.08bps
+    # The support gap shrinks to +0.34 at 0.30 ATR and -0.06 at 0.50 ATR (it decays as n
+    # grows, which is the shape of noise), the resistance side is NEGATIVE at every width,
+    # and confluent touches have a LOWER up-rate than single-TF ones. Every CI spans zero.
+    # Even the best cell is +1.5bps against a ~3bps futures floor, so it is untradeable
+    # even if real. 46.8% of all level touches qualify as confluent at 0.25 ATR — a filter
+    # that fires on half the sample is not selecting anything.
+    # Matches the eqbtst study of the same rule (aligned levels, tolerance sweep): sign
+    # backwards at every width, negative 8 of 8 years.
+    # Keep drawing it — a chartist reading two frames agreeing is legitimate context —
+    # but do NOT build an entry, a size, or a verdict on it without a fresh measurement.
     l_above = [(x, t) for x, t in lv_l if x > spot]
     l_below = [(x, t) for x, t in lv_l if x < spot]
     res_l, res_l_t = min(l_above, key=lambda c: c[0]) if l_above else (None, 0)
