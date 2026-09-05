@@ -1006,28 +1006,36 @@ CONF_NEAR_ATR = 0.15     # price must be this close to the level to arm the setu
 CONF_SL_ATR = 0.50       # stop sits this far BEYOND the level
 CONF_RR = 1.5            # target = this × risk
 
-# MEASURED GRADE PER TF PAIR. 4,028 trades over 57 sessions of live tick data, the exact
-# rule above, 3bps futures round trip, flat 15:15, stop assumed first when one 5m bar
-# holds both stop and target. Day-block bootstrap CI.
+# MEASURED GRADE PER TF PAIR, on 57 sessions of live tick data, the exact rule above,
+# 3bps futures round trip, flat 15:15, day-block bootstrap CI.
 #
-#   pair       confluent                              control (single-TF)
-#   5m>15m     n=1568 win 37.4% -3.17bps [-3.64,-2.72]  n=521 -3.03bps [-3.91,-2.18]
-#   10m>30m    n= 921 win 34.5% -4.75bps [-5.58,-3.92]  n=256 -2.45bps [-4.30,-0.40]
-#   15m>60m    n= 582 win 38.3% -3.67bps [-5.18,-2.05]  n=180 -3.94bps [-7.18,-0.63]
+# THESE ARE THE lb=31 NUMBERS — the lookback the live path actually uses (_walls is fed
+# h[-31:]). An earlier grade here was measured with the FULL available level history and
+# was therefore describing a code path that does not ship; corrected 2026-09-05.
 #
-# ALL THREE PAIRS LOSE, and every CI excludes zero — this is not "no edge", it is a
-# measured negative one. Confluence also fails to beat its own control on 2 of 3 pairs.
-# At R:R 1.5 break-even needs 40% wins; the best pair delivers 38.3%.
+#   pair       n    win    mean bps   day-block CI
+#   5m>15m    692  35.7%   -3.40      [-4.31, -2.38]   significantly negative
+#   10m>30m   366  39.9%   -3.32      [-5.75, -1.39]   significantly negative
+#   15m>60m   231  40.7%   -2.90      [-5.74, +0.26]   negative, CI touches zero
+#
+# LOOKBACK ROBUSTNESS (8,496 trades, 3 pairs x lookback 20/31/50 — run as a sign-stability
+# check, NOT to pick a winner): 7 of 9 cells significantly negative, 2 inconclusive, 0
+# positive. Spread across all nine cells is 1.00bps and every one is on the same side of
+# zero, so the verdict does not depend on the 31 (which was itself never measured — it
+# arrived as a round "~30" in the original scout commit).
+#
+# At R:R 1.5 break-even needs 40% wins. Two pairs sit below it; 15m>60m reaches 40.7% and
+# still loses, because the winners do not cover the cost.
 # The grade is displayed NEXT TO the suggestion on purpose: the setup is a charting
 # convenience for a human who wants to see where both frames agree, not a system call,
 # and the evidence against it must not be separable from it.
 CONF_GRADE: dict = {
-    "5m>15m":  {"n": 1568, "win": 37.4, "bps": -3.17, "lo": -3.64, "hi": -2.72,
-                "pf": 0.56, "rupee": -827_537, "verdict": "NEGATIVE"},
-    "10m>30m": {"n": 921,  "win": 34.5, "bps": -4.75, "lo": -5.58, "hi": -3.92,
-                "pf": 0.52, "rupee": -726_446, "verdict": "NEGATIVE"},
-    "15m>60m": {"n": 582,  "win": 38.3, "bps": -3.67, "lo": -5.18, "hi": -2.05,
-                "pf": 0.69, "rupee": -357_087, "verdict": "NEGATIVE"},
+    "5m>15m":  {"n": 692, "win": 35.7, "bps": -3.40, "lo": -4.31, "hi": -2.38,
+                "verdict": "NEGATIVE"},
+    "10m>30m": {"n": 366, "win": 39.9, "bps": -3.32, "lo": -5.75, "hi": -1.39,
+                "verdict": "NEGATIVE"},
+    "15m>60m": {"n": 231, "win": 40.7, "bps": -2.90, "lo": -5.74, "hi": +0.26,
+                "verdict": "no edge"},
 }
 
 

@@ -61,4 +61,9 @@ def test_every_shipped_tf_pair_has_a_measured_grade():
     for pair in ("5m>15m", "10m>30m", "15m>60m"):
         g = tb.CONF_GRADE[pair]
         assert g["n"] > 100 and "verdict" in g
-        assert g["hi"] < 0, f"{pair} CI upper bound must reflect the measured negative"
+        # NOT asserting hi < 0 — 15m>60m measured [-5.74, +0.26], which touches zero, and
+        # a test that demanded a negative upper bound would be forcing the data to agree
+        # with the conclusion. What must hold is that NO pair is significantly POSITIVE:
+        # nothing here may be presented as a winning setup.
+        assert g["lo"] < 0, f"{pair} would be a positive edge — re-verify before shipping"
+        assert g["bps"] < 0, f"{pair} mean must match the measured negative"
