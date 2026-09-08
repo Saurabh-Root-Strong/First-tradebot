@@ -5061,7 +5061,7 @@ def _scout_playbook(r):
             f"adverse index move ≈ this premium stop, so the two usually fire together."))
     else:
         body.append(line(
-            "2) PREMIUM stop = ~30-35% of the option premium you paid (the engine sets "
+            "2) PREMIUM stop = ~20% of the option premium you paid (the engine sets "
             "this on the ATM once you're in a live trade)."))
 
     # ── 3. target ────────────────────────────────────────────────────────────────
@@ -5954,6 +5954,10 @@ def _scout_openpos_body(today: str, as_of):
     All reconstructed from the persisted alert log (tf = _ALERT_TF). BTST carries are
     appended in their OWN section — never merged into the scout stats (see _btst_section)."""
     import intraday_scout as scout
+    # Tooltip copy is generated from the SAME bracket the engine trades (_slt_for), so a
+    # desk re-scale never leaves the popup quoting a stop/target that no longer exists.
+    _sl_p, _tg_p = scout._slt_for(_ALERT_TF)
+    _SL_TXT, _TG_TXT = f"-{_sl_p:.0%}", f"+{_tg_p:.0%}"
     opens, closed = _scout_episodes(today, as_of=as_of)
 
     # ── the log must not be allowed to LOOK healthy when it is not ────────────────
@@ -6172,11 +6176,11 @@ def _scout_openpos_body(today: str, as_of):
         _tip("band", "upper", "Index cleared the UPPER σ-range band (broke above)."),
         _tip("band", "lower", "Index broke the LOWER σ-range band (broke below)."),
         _tip("band", "broke", "Moved past the σ-range band since entry."),
-        _tip("status", "target", "Premium reached the +65% target — close pending on the next poll."),
-        _tip("status", "SL", "Premium hit the −35% stop — close pending on the next poll."),
+        _tip("status", "target", f"Premium reached the {_TG_TXT} target — close pending on the next poll."),
+        _tip("status", "SL", f"Premium hit the {_SL_TXT} stop — close pending on the next poll."),
         _tip("status", "pullback", "Ran up ≥20% then gave back ≥15pts of that gain (peak → now)."),
-        _tip("status", "▲", "In profit, running toward the +65% target."),
-        _tip("status", "▼", "Underwater, drawing toward the −35% stop."),
+        _tip("status", "▲", f"In profit, running toward the {_TG_TXT} target."),
+        _tip("status", "▼", f"Underwater, drawing toward the {_SL_TXT} stop."),
     ]
     open_header_tips = {
         "side": "CE = call (bullish lean) · PE = put (bearish lean)",
@@ -6190,7 +6194,7 @@ def _scout_openpos_body(today: str, as_of):
                  "account — MIDCAP's 120-lot doubles NIFTY's rupee swing for the same %.",
         "band": "'—' = still inside the σ-range band. A break (↑ upper / ↓ lower) closes "
                 "the episode → it moves to the CLOSED table below.",
-        "status": "Live trajectory on the option premium vs SL (−35%) / target (+65%): "
+        "status": f"Live trajectory on the option premium vs SL ({_SL_TXT}) / target ({_TG_TXT}): "
                   "running ▲ / drawdown ▼ / pullback / hit. Poller closes on SL/target/flip.",
         "check": "Live board vs your held side — is the arrow still with you?",
     }
@@ -6259,10 +6263,10 @@ def _scout_openpos_body(today: str, as_of):
          "color": "#64748b", "fontWeight": "600"},
     ]
     closed_tips = [
-        _tip("outcome", "target", "Premium hit the +65% target."),
+        _tip("outcome", "target", f"Premium hit the {_TG_TXT} target."),
         _tip("outcome", "flipped", "Arrow reversed to the other side → position exited "
              "(the dominant exit at 60m — SL / target rarely bind)."),
-        _tip("outcome", "SL", "Premium hit the −35% stop."),
+        _tip("outcome", "SL", f"Premium hit the {_SL_TXT} stop."),
         _tip("outcome", "band", "Spot broke the σ-range band (↑ upper / ↓ lower) — range "
              "exceeded, episode closed at the arrow's premium then."),
         _tip("outcome", "timed out", f"Held {_SCOUT_MAX_HOLD_MIN}m without hitting SL / target "
@@ -6872,10 +6876,10 @@ def _scout_detect(state, now, persist):
             _priceable = (_entry is not None and _entry > 0
                           and (_intr is None or _entry >= _intr * 0.98))
             # Keep whatever bracket the lifecycle is configured for, as RATIOS, so this
-            # stays in lockstep with _slt_for instead of hardcoding 0.65/1.65 twice.
+            # stays in lockstep with _slt_for instead of hardcoding the bracket twice.
             _lp = lc.get("entry_prem")
-            _sl_r = (lc["sl"] / _lp) if (_lp and lc.get("sl")) else 0.65
-            _tg_r = (lc["target"] / _lp) if (_lp and lc.get("target")) else 1.65
+            _sl_r = (lc["sl"] / _lp) if (_lp and lc.get("sl")) else (1 - scout._slt_for(_ALERT_TF)[0])
+            _tg_r = (lc["target"] / _lp) if (_lp and lc.get("target")) else (1 + scout._slt_for(_ALERT_TF)[1])
             if _priceable:
                 pos = {"day": today, "dir": _dir,
                        "strike": _strike,

@@ -57,7 +57,9 @@ def _scout_trade_status(entry, now, sl, tgt, peak) -> str:
       🎯/🛑  = already past target/SL (close pending on the next poll)
       ↩ pullback = ran up >=20% then gave back >=15pts of that gain
       ▲ / ▼  = running toward target / drawing toward SL, with the current premium move
-    entry/sl/tgt are the alert-logged premium levels (SL −35%, target +65% of entry)."""
+    entry/sl/tgt are the alert-logged premium levels; the running ▲/▼ line quotes the
+    bracket back from THOSE levels (never a hardcoded pair) so it cannot drift from the
+    bracket the engine actually traded."""
     if not entry or now is None:
         return "· no data"
     g = now / entry - 1.0                                  # current premium move
@@ -69,5 +71,7 @@ def _scout_trade_status(entry, now, sl, tgt, peak) -> str:
     if gp >= 0.20 and (gp - g) >= 0.15:
         return f"↩ pullback {g:+.0%} (pk {gp:+.0%})"
     if g >= 0:
-        return f"▲ {g:+.0%} → tgt +65%"
-    return f"▼ {g:+.0%} → SL −35%"
+        t = f" → tgt {tgt / entry - 1.0:+.0%}" if tgt else ""
+        return f"▲ {g:+.0%}{t}"
+    d = f" → SL {sl / entry - 1.0:+.0%}" if sl else ""
+    return f"▼ {g:+.0%}{d}"
