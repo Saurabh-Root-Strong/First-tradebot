@@ -89,8 +89,17 @@ class TradeLedger:
         _DB.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.execute(_DDL)
+            # sl_initial: the stop AS IT STOOD AT ENTRY. `sl` is a live, trailing field —
+            # the T1 breakeven lift and flag_regime_shift both overwrite it — so on a closed
+            # row `sl` is the FINAL stop and the entry stop is gone. `risk` still carries its
+            # magnitude (risk = entry - sl_initial, set once at open and never mutated, which
+            # is what keeps R comparable across trades), but without the level you cannot audit
+            # the bracket a trade was armed with, and `risk != entry - sl` looks like corruption
+            # when it is just the trail doing its job. Recorded explicitly so the invariant is
+            # visible in the row instead of having to be re-derived.
             for _col, _type in (("reason", "TEXT"), ("regime_flag", "TEXT"),
-                                ("t1_booked", "INTEGER DEFAULT 0")):
+                                ("t1_booked", "INTEGER DEFAULT 0"),
+                                ("sl_initial", "REAL")):
                 try:
                     con.execute(f"ALTER TABLE paper_trades ADD COLUMN {_col} {_type}")
                 except Exception:
@@ -214,14 +223,14 @@ class TradeLedger:
                 con.execute(
                     "INSERT INTO paper_trades (trade_id, opened_ts, date, index_sym, "
                     "option_sym, direction, strike, expiry, tf, conviction, confidence, "
-                    "composite, spot_entry, entry_ltp, sl, t1, t2, risk, mfe, mae, last_ltp, "
-                    "updated_ts, status, outcome, reason) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "composite, spot_entry, entry_ltp, sl, sl_initial, t1, t2, risk, mfe, mae, "
+                    "last_ltp, updated_ts, status, outcome, reason) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     [tid, ts.isoformat(), day, index_sym,
                      rec.get("option_sym"), direction, rec.get("strike"), str(rec.get("exp_date") or ""),
                      rec.get("tf_label"), rec.get("conviction"), int(rec.get("confidence") or 0),
                      float(rec.get("score") or 0), rec.get("spot"),
-                     entry, sl, float(rec.get("t1") or 0), float(rec.get("t2") or 0), risk,
+                     entry, sl, sl, float(rec.get("t1") or 0), float(rec.get("t2") or 0), risk,
                      entry, entry, entry, ts.isoformat(), "OPEN", "OPEN", reason],
                 )
                 con.commit()
@@ -276,7 +285,15 @@ class TradeLedger:
                 outcome = "WIN" if r > 0 else "SCRATCH" if r == 0 else "LOSS"
             else:
                 r = round((fill - entry) / risk, 2)        # honest: may be worse than -1R
-                status, exit_ltp, outcome, exit_ts = "SL", fill, "LOSS", ts.isoformat()
+                # A stop-out is not automatically a loss. `sl` is TRAILED — flag_regime_shift
+                # raises it toward the last price, and it may end ABOVE entry — so hitting it
+                # can bank a profit (measured: 15 of 250 rows, r +0.01 to +0.72, every one
+                # carrying a regime-shift flag). Hardcoding LOSS here mislabelled all of them
+                # and made the outcome column disagree with the r_multiple beside it. Derive
+                # the verdict from the realised R, exactly as the T1 / FLIP / EOD paths do.
+                # `status` stays SL because that is the MECHANISM that closed the trade.
+                outcome = "WIN" if r > 0 else "SCRATCH" if r == 0 else "LOSS"
+                status, exit_ltp, exit_ts = "SL", fill, ts.isoformat()
         elif t2 and ltp >= t2:
             # Final target. Blend the booked half with the runner half if T1 booked.
             r = (round(0.5 * r_t1 + 0.5 * ((t2 - entry) / risk), 2) if booked
