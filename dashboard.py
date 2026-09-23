@@ -6866,7 +6866,13 @@ def _scout_detect(state, now, persist):
             # the option's own intrinsic value, which is not a quote that can exist.
             _dir = r.get("direction")
             _strike = (scout._atm(spot, sym) if spot else None) or lc.get("entry_strike")
-            _entry = scout._opt_premium(sym, today, now, _strike, _dir) if _strike else None
+            # require_traded: a NEVER-TRADED strike still carries an `ltp`, and it is
+            # synthetic and frozen. Arming on one invents the whole trade (2026-08-27/28
+            # FIN NIFTY: Rs45,324 of fabricated loss on two strikes with volume=0, oi=0
+            # and IV ~2x their neighbours). A price only becomes a position here, so this
+            # is the site that must refuse it.
+            _entry = (scout._opt_premium(sym, today, now, _strike, _dir, require_traded=True)
+                      if _strike else None)
             # An ATM leg can never trade below intrinsic. If it reads that way the quote is
             # stale or torn, and a position opened on it is ungradeable — refuse it rather
             # than book a trade whose P&L is fiction.

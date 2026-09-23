@@ -514,10 +514,67 @@ def _spot_at(sym: str, date, t) -> Optional[float]:
 _OPT_RT_COST = 3.0
 
 
-def _opt_premium(sym: str, date, t, strike, side: str, expiry="weekly") -> Optional[float]:
-    """ATM option LTP for (strike, side) at or before t from the chain mirror.
-    Same expiry filter build_series uses, so entry/exit are the same instrument."""
+def _strike_traded(sym: str, date, t, strike, side: str, expiry="weekly") -> Optional[bool]:
+    """Has (strike, side) ACTUALLY TRADED today as of t? None when it cannot be told.
+
+    WHY. `ltp` is a LAST TRADED price, not a quote. On a strike that has never traded the
+    feed still carries a number, and that number is synthetic and frozen — the SAME value
+    reappears across sessions. On the thin FIN NIFTY ladder those dead strikes sit
+    interleaved with live ones and break put/call monotonicity outright:
+
+        2026-08-28 12:13 FIN PE   26100 = 254.20  vol 323,760  oi 50,340  iv 12.4   <- real
+                                  26150 = 545.85  vol       0  oi      0  iv 21.3   <- dead
+                                  26200 = 786.75  vol       0  oi      0  iv 28.4   <- dead
+                                  26300 = 325.80  vol  14,880  oi  1,620  iv 12.0   <- real
+
+    A put ladder must RISE with strike; the real strikes do, the dead ones sawtooth. The
+    scout armed 26200 @ Rs786.75 — a price no one ever paid, ~2.8x the true ~Rs283 — and
+    booked the "loss" when the next poll found a real print. Same story on 2026-08-27 at
+    26350 @ Rs640.60. Between them: Rs45,324 of fabricated loss, 56% of a 30-day drawdown.
+
+    volume/oi are the honest test (a traded strike has both); IV is the corroborating tell
+    (dead strikes price ~2x their neighbours' vol). Returns None when the columns are
+    absent, so an older mirror degrades to the previous behaviour rather than blocking
+    every leg.
+    """
     if not strike:
+        return None
+    try:
+        ch = _read_mirror("chain_snapshots", date, t, sym)
+    except Exception:
+        return None
+    if ch is None or not len(ch):
+        return None
+    if "volume" not in ch.columns and "oi" not in ch.columns:
+        return None                                   # cannot tell — do not block
+    ch, ok = fc._filter_expiry(ch, expiry)
+    if not ok or ch is None or not len(ch):
+        return None
+    sub = ch[(ch["side"] == side) & (ch["strike"] == strike)
+             & (ch["ts"] <= pd.Timestamp(t))]
+    if not len(sub):
+        return None
+    row = sub.sort_values("ts").iloc[-1]
+    vol = row.get("volume") if "volume" in sub.columns else None
+    oi = row.get("oi") if "oi" in sub.columns else None
+    vol = float(vol) if pd.notna(vol) else 0.0
+    oi = float(oi) if pd.notna(oi) else 0.0
+    return bool(vol > 0 or oi > 0)
+
+
+def _opt_premium(sym: str, date, t, strike, side: str, expiry="weekly",
+                 require_traded: bool = False) -> Optional[float]:
+    """ATM option LTP for (strike, side) at or before t from the chain mirror.
+    Same expiry filter build_series uses, so entry/exit are the same instrument.
+
+    require_traded=True additionally refuses a strike that has never traded (see
+    _strike_traded) — use it wherever a PRICE BECOMES A POSITION, because a synthetic
+    LTP there manufactures P&L. It is off by default so read-only/display callers and
+    historical replays keep their existing behaviour.
+    """
+    if not strike:
+        return None
+    if require_traded and _strike_traded(sym, date, t, strike, side, expiry) is False:
         return None
     try:
         ch = _read_mirror("chain_snapshots", date, t, sym)
