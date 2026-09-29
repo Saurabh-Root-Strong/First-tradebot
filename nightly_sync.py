@@ -319,7 +319,7 @@ def _fetch_delivery_quality(duck) -> dict:
         df = duck.execute("""
             SELECT dd.symbol, dd.deliv_per
             FROM daily_data dd
-            JOIN sector_master sm ON dd.symbol = sm.symbol
+            JOIN v_sector_master sm ON dd.symbol = sm.symbol
             WHERE dd.trade_date         = (SELECT MAX(trade_date) FROM daily_data)
               AND dd.series             = 'EQ'
               AND dd.deliv_per          IS NOT NULL
@@ -421,10 +421,11 @@ def run_sync(force: bool = False) -> bool:
                        SUM(CASE WHEN dd.close_price > dd.prev_close THEN 1 ELSE 0 END) AS adv,
                        COUNT(*) AS total
                 FROM daily_data dd
-                JOIN sector_master sm ON dd.symbol = sm.symbol
+                JOIN v_sector_master sm ON dd.symbol = sm.symbol
                 WHERE dd.trade_date = (SELECT MAX(trade_date) FROM daily_data)
                   AND dd.series = 'EQ'
                   AND dd.turnover_lacs >= 5
+                  AND sm.sector <> 'ETF'
                 GROUP BY sm.sector
             """).df()
             if not df.empty:
