@@ -16,7 +16,8 @@ from dash import dcc, html, Input, Output, State, no_update, ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dashboard_ui import _fmt_contracts, _fmt_cr, _scout_trade_status, _slug  # pure UI leaf helpers
+from dashboard_ui import (_apply_trade_cap, _cap_muted, _fmt_contracts,  # pure UI leaf helpers
+                          _fmt_cr, _scout_trade_status, _slug)
 from dashboard_theme import (BG, BG_CARD, BG_SIDE, COLORS, FILLS, MONO, _CSS,  # theme + CSS + tooltips
                              _TIP_AGREE, _TIP_BAND, _TIP_RANGE, _TIP_STR, _TIP_TRIG, _TIP_VERDICT)
 import footprint_chart   # full-session OI/Volume/ATM-premium series for the popup chart
@@ -1232,6 +1233,13 @@ def _captured_days() -> list:
 
 _DEFAULT_DAY = _captured_days()[0]
 
+# The charts-page "N trades / index / day" switch (see _apply_trade_cap). 2 is measured, not
+# chosen: by trade number of the day the 1st and 2nd scout legs roughly break even while
+# the 3rd onward is where the book bleeds (30 sessions to 2026-09-29, both the replay and
+# the recorded live ledger). Display/discipline only — the poller still logs every leg.
+# Defined HERE, above app.layout, because the layout (built at import) labels the switch.
+_TRADE_CAP_N = 2
+
 
 app.layout = dbc.Container([
     # ── Header (brand + status, then a horizontal index/nav strip) ──────────────
@@ -1661,6 +1669,30 @@ app.layout = dbc.Container([
                 # spinner flashed over the panel every cycle (and the lifecycle walk-back makes
                 # the callback slow), blanking what you're reading and breaking focus. Keep the
                 # OLD content visible and only show the spinner if a load genuinely hangs (>8s).
+                # 2-TRADE CAP switch — lives in the STATIC layout (not inside charts-scout,
+                # which re-renders every 30s and would reset it) and persists per browser.
+                # A DISCIPLINE FILTER, not a poller setting: the headless poller cannot see a
+                # browser control, and it must keep logging every leg so the uncapped book
+                # stays gradeable. When on, the board + ledger count only the first
+                # _TRADE_CAP_N trades per index per day and mark later signals as skipped.
+                html.Div([
+                    dbc.Checklist(id="scout-cap2", value=[], switch=True,
+                                  persistence=True, persistence_type="local",
+                                  options=[{"label": f"🔒 {_TRADE_CAP_N} trades / index / day",
+                                            "value": "on"}],
+                                  style={"fontSize": "0.64rem", "color": "#e2e8f0"}),
+                    html.Span(
+                        "first 2 signals per index count; later ones are shown as SKIPPED "
+                        "(measured: 3rd+ trades lost ₹67k live over 30 sessions, 30% win)",
+                        title="Last 30 sessions (2026-08-14..09-29). Recorded live ledger: all "
+                              "trades −₹71,190; first 2 per index −₹3,922; the 136 skipped "
+                              "3rd+ trades −₹67,268 at 30% win. Replay of the current code: "
+                              "all −₹12,185 → first 2 +₹40,083 (beats 99.6% of random 2-trade "
+                              "picks). It CUTS losses; it does not prove the first two are "
+                              "profitable — the 30-day confidence interval still spans zero.",
+                        style={"color": "#64748b", "fontSize": "0.56rem", "marginLeft": "10px",
+                               "cursor": "help"}),
+                ], style={"display": "flex", "alignItems": "center", "marginBottom": "4px"}),
                 dcc.Loading(html.Div(id="charts-scout", style={"marginBottom": "10px"}),
                             type="circle", color="#34d399", delay_show=12000),
                 # Mode-aware help in a POPUP — opens over the chart, closes via the X /
@@ -3442,15 +3474,16 @@ def _scout_popup_clock(asof, date):
 @app.callback(Output("scout-openpos-body", "children"),
               Input("scout-openpos-modal", "is_open"),
               State("charts-asof", "value"), State("news-date", "data"),
+              State("scout-cap2", "value"),
               prevent_initial_call=True)
-def _fill_scout_openpos(is_open, asof, date):
+def _fill_scout_openpos(is_open, asof, date, cap_on):
     """Populate the open-positions popup at the strip's current clock. Reconstructs held
     state fresh on each open. FAST half — an alert-log replay, no engine scans."""
     from dash.exceptions import PreventUpdate
     if not is_open:                       # closing → leave the rendered body alone
         raise PreventUpdate
     day, as_of = _scout_popup_clock(asof, date)
-    return _scout_openpos_body(day, as_of)
+    return _scout_openpos_body(day, as_of, cap=_TRADE_CAP_N if cap_on else None)
 
 
 @app.callback(Output("scout-horizon-sim", "children"),
@@ -5948,17 +5981,22 @@ def _horizon_ledger_block(day, as_of, ltf):
               "background": "#0d0a1a"})
 
 
-def _scout_openpos_body(today: str, as_of):
+def _scout_openpos_body(today: str, as_of, cap=None):
     """Popup body: the day's scout ledger — OPEN positions (with a live cross-check +
     unrealized P&L) on top, then CLOSED episodes (outcome + realized P&L), newest-first.
     All reconstructed from the persisted alert log (tf = _ALERT_TF). BTST carries are
-    appended in their OWN section — never merged into the scout stats (see _btst_section)."""
+    appended in their OWN section — never merged into the scout stats (see _btst_section).
+
+    cap (the charts-page switch): count only the first `cap` episodes per index per day;
+    the rest are listed apart as SKIPPED, with what they would have made, so the rule is
+    graded every day instead of silently hiding the trades it removed."""
     import intraday_scout as scout
     # Tooltip copy is generated from the SAME bracket the engine trades (_slt_for), so a
     # desk re-scale never leaves the popup quoting a stop/target that no longer exists.
     _sl_p, _tg_p = scout._slt_for(_ALERT_TF)
     _SL_TXT, _TG_TXT = f"-{_sl_p:.0%}", f"+{_tg_p:.0%}"
     opens, closed = _scout_episodes(today, as_of=as_of)
+    opens, closed, skipped = _apply_trade_cap(opens, closed, cap)
 
     # ── the log must not be allowed to LOOK healthy when it is not ────────────────
     _sick = _scout_log_health(today) if as_of is None else None
@@ -6382,6 +6420,50 @@ def _scout_openpos_body(today: str, as_of):
         ], style={"fontSize": "0.62rem", "marginTop": "3px"}) if rs_by_idx else html.Span(""),
     ], style={"fontSize": "0.68rem", "marginBottom": "8px"})
 
+    # ── 2-TRADE CAP — what the switch removed, graded, so the rule audits itself ─────
+    cap_block = []
+    if cap:
+        sk_closed = [e for e in skipped if e.get("cap_state") == "closed"]
+        sk_open = [e for e in skipped if e.get("cap_state") == "open"]
+        sk_net = [_net_rs(e["sym"], e.get("entry"), e.get("exit")) for e in sk_closed]
+        sk_net = [x for x in sk_net if x is not None]
+        sk_sum = sum(sk_net)
+        sk_w = sum(1 for x in sk_net if x > 0)
+        verdict = ("the cap SAVED you" if sk_sum < 0 else
+                   "the cap COST you" if sk_sum > 0 else "no effect")
+        rows_sk = [html.Tr([
+            html.Td(e["label"], style={"padding": "2px 8px", "fontWeight": "700"}),
+            html.Td(f"#{e.get('trade_no')}", style={"padding": "2px 8px", "color": "#94a3b8"}),
+            html.Td(e.get("dir"), style={"padding": "2px 8px",
+                                         "color": "#34d399" if e.get("dir") == "CE" else "#f87171"}),
+            html.Td(e.get("strike"), style={"padding": "2px 8px"}),
+            html.Td(f"{e.get('open_t')}→{e.get('close_t') or 'open'}",
+                    style={"padding": "2px 8px", "color": "#94a3b8"}),
+            html.Td((lambda n: f"₹{n:+,}" if n is not None else "running")(
+                _net_rs(e["sym"], e.get("entry"), e.get("exit")) if e.get("cap_state") == "closed" else None),
+                style={"padding": "2px 8px", "fontWeight": "700"}),
+            html.Td(e.get("outcome") or "—", style={"padding": "2px 8px", "color": "#94a3b8"}),
+        ]) for e in sorted(skipped, key=lambda x: (x.get("open_t") or ""))]
+        cap_block = [html.Div([
+            html.Div([
+                html.Span(f"🔒 {cap}-TRADE CAP ON", style={"color": "#fbbf24", "fontWeight": "800"}),
+                html.Span(f"  ·  totals above count only the first {cap} trades per index",
+                          style={"color": "#94a3b8"}),
+            ]),
+            html.Div(
+                (f"{len(skipped)} later signal{'s' if len(skipped) != 1 else ''} SKIPPED"
+                 + (f" · the {len(sk_net)} closed ones would have made ₹{sk_sum:+,} NET "
+                    f"({sk_w}W/{len(sk_net) - sk_w}L) → {verdict}" if sk_net else "")
+                 + (f" · {len(sk_open)} still running (not taken)" if sk_open else ""))
+                if skipped else "no signal beyond the cap today",
+                style={"color": ("#22c55e" if sk_sum < 0 else "#f87171" if sk_sum > 0 else "#94a3b8"),
+                       "fontWeight": "700", "marginTop": "2px"}),
+            html.Table([html.Tbody(rows_sk)], style={"fontSize": "0.62rem", "marginTop": "4px",
+                                                     "borderCollapse": "collapse"})
+            if rows_sk else html.Span(""),
+        ], style={"fontSize": "0.64rem", "margin": "0 0 8px", "padding": "6px 10px",
+                  "background": "#1a1405", "border": "1px solid #854d0e", "borderRadius": "6px"})]
+
     note = html.Div(
         "Hover any cell or header for what it means. Click a header to sort ⇕; use the "
         "search box (top-right) to filter both tables across all columns (e.g. NIFTY, PE, "
@@ -6400,6 +6482,7 @@ def _scout_openpos_body(today: str, as_of):
         dcc.Store(id="scout-open-store", data=open_records),
         dcc.Store(id="scout-closed-store", data=closed_records),
         summary,
+        *cap_block,
         # NOTE: the SELECTED horizon's simulated ledger used to be built here. It is now
         # its own callback (_fill_scout_horizon_sim → #scout-horizon-sim, rendered under
         # this block) because it costs tens of seconds and was holding the real legs
@@ -6413,7 +6496,8 @@ def _scout_openpos_body(today: str, as_of):
         closed_tbl, note] + _btst)
 
 
-def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=False):
+def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=False,
+                        cap=None):
     import intraday_scout as scout
     today = datetime.datetime.now(IST).date().isoformat()
     # Freeze each OPEN position's lifecycle at the poller's true first-fire minute (the
@@ -6502,16 +6586,23 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
                 datetime.date.fromisoformat(date), datetime.time(15, 30), tzinfo=IST)
         except Exception:
             _led_asof = None
-    n_open = n_closed = 0
+    n_open = n_closed = n_skip = 0
     _op = _cl = []
+    _cap_taken: dict = {}                 # sym -> open times of the trades the cap KEPT
+    _cap_holding: set = set()             # syms whose kept trade is still open
     if date and _led_asof is not None:
         try:
             _op, _cl = _scout_episodes(date, as_of=_led_asof)
-            n_open, n_closed = len(_op), len(_cl)
+            _op, _cl, _sk = _apply_trade_cap(_op, _cl, cap)
+            n_open, n_closed, n_skip = len(_op), len(_cl), len(_sk)
+            for e in sorted(_op + _cl, key=lambda x: x.get("open_t") or ""):
+                _cap_taken.setdefault(e.get("sym"), []).append(e.get("open_t"))
+            _cap_holding = {e.get("sym") for e in _op}
         except Exception:
-            n_open = n_closed = 0
+            n_open = n_closed = n_skip = 0
     openbtn = (html.Button(
-        f"📋 {n_open} open · {n_closed} closed",
+        f"📋 {n_open} open · {n_closed} closed"
+        + (f" · 🔒 {n_skip} skipped" if cap else ""),
         id="scout-openpos-btn", n_clicks=0, title="the day's scout ledger — open positions "
         "(with a live cross-check) + closed episodes (SL / target / flipped) with realized P&L",
         style={"marginLeft": "10px", "fontSize": "0.58rem", "color": "#67e8f9",
@@ -6596,13 +6687,32 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
     ], style={"fontSize": "0.54rem", "marginTop": "5px", "lineHeight": "1.35",
               "background": "#1a0c0c", "border": "1px solid #7f1d1d",
               "borderRadius": "4px", "padding": "5px 8px"})
+    def _capped(r, row):
+        """Cap switch: once an index has used its N trades today and is not holding one of
+        them, its card says so and the ticket underneath dims — it is still shown (the read
+        and the band stay useful context), it is just not a trade for you today."""
+        sym = r.get("sym")
+        taken = _cap_taken.get(sym, [])
+        if not cap or len(taken) < cap or sym in _cap_holding:
+            return row
+        return html.Div([
+            html.Div(f"🔒 CAP {cap}/{cap} — {r.get('label', sym)} already took {cap} trades "
+                     f"today ({', '.join(t for t in taken if t)}). No new trade on this index "
+                     f"until tomorrow; the read below is context only.",
+                     style={"color": "#fbbf24", "fontSize": "0.6rem", "fontWeight": "700",
+                            "background": "#1a1405", "border": "1px solid #854d0e",
+                            "borderRadius": "4px", "padding": "3px 8px", "margin": "4px 0 2px"}),
+            html.Div(row, style={"opacity": 0.45}),
+        ])
+
     return html.Div(
         # LIVE rows take their trade memory from the POLLER LOG (one source of truth with the
         # badge + ledger popup), not from the browser's private detector copy, which drifts by
         # minutes and was driving the 90m cap countdown off the wrong clock. Replay/ghost have
         # no poller log for their day, so they keep the per-bar engine's own memory.
-        [title] + [_scout_row(r, mem=(_lmem if live else (seen or {})).get(r.get("sym")),
-                              today=today, live=live, practice=practice, session_over=_over)
+        [title] + [_capped(r, _scout_row(r, mem=(_lmem if live else (seen or {})).get(r.get("sym")),
+                                         today=today, live=live, practice=practice,
+                                         session_over=_over))
                    for r in rows] + [note]
         + ([_ghost_help()] if practice else []),
         style={"background": "#070d18", "border": "1px solid #1e293b",
@@ -6616,9 +6726,10 @@ def _charts_scout_panel(tf_min, date, as_of_dt, live=False, seen=None, practice=
     Input("news-date",   "data"),
     Input("sel-sym",     "data"),
     Input("setup-tick",  "n_intervals"),
+    Input("scout-cap2",  "value"),
     State("scout-seen",  "data"),
 )
-def _update_charts_scout(tf, asof, date, sel, _tick, seen):
+def _update_charts_scout(tf, asof, date, sel, _tick, cap_on, seen):
     """Multi-index TRADE/NO-TRADE scan. LIVE (no Replay time, today): as_of=now so the
     trade lifecycle (trigger/entry/SL/target/manage/P&L) renders, and the 30s tick
     refreshes the board so a NEW trigger appears on its own. An explicit Replay time
@@ -6644,7 +6755,8 @@ def _update_charts_scout(tf, asof, date, sel, _tick, seen):
         day, as_of_dt, live = today, datetime.datetime.now(IST), True
     try:
         return _charts_scout_panel(tf, day, as_of_dt, live=live, seen=seen,
-                                   practice=practice)
+                                   practice=practice,
+                                   cap=_TRADE_CAP_N if cap_on else None)
     except Exception as exc:
         return _recon_note(f"Scout unavailable ({type(exc).__name__}: {exc}).")
 
@@ -7103,8 +7215,9 @@ _VIEWER_ALERT_SEED = {"day": None, "n": 0}
     State("scout-seen",       "data"),
     State("scout-alerts",     "data"),
     State("scout-alert-fire", "data"),
+    State("scout-cap2",       "value"),
 )
-def _detect_scout_alerts(_tick, seen, alerts, fire):
+def _detect_scout_alerts(_tick, seen, alerts, fire, cap_on):
     """Browser-side mirror of the scout-alert detector — UI ONLY (never writes; the
     server-side _scout_alert_poller is the sole authoritative writer). Maintains the
     browser's scout-seen so the CHARTS board overlay shows HOLDING / last-trade, and
@@ -7136,7 +7249,12 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
             s["n"] = len(recs)                     # silently (no notification burst on load)
             return seen, recs[:50], no_update
         if len(recs) > prev_n:                      # a genuinely new authoritative alert
+            new = recs[:len(recs) - prev_n]         # recs is newest-first
             s["n"] = len(recs)
+            # cap switch: the list still updates (the log is the record), but a trade the
+            # cap skips does not beep — a notification is an instruction to act
+            if _cap_muted(new, recs, _TRADE_CAP_N if cap_on else None):
+                return seen, recs[:50], no_update
             return seen, recs[:50], int(fire or 0) + 1
         if len(recs) != prev_n or recs[:50] != log:  # shrank/deduped → resync list, no fire
             s["n"] = len(recs)
@@ -7146,6 +7264,8 @@ def _detect_scout_alerts(_tick, seen, alerts, fire):
     # CAPTURER (incl. anyone viewing the VM URL): the browser detector runs on the same
     # host's FRESH data + mirrors the poller, so its local events are authoritative here.
     if events:
+        if _cap_muted(events, events + log, _TRADE_CAP_N if cap_on else None):
+            return seen, (events + log)[:50], no_update
         return seen, (events + log)[:50], int(fire or 0) + 1
     if log != list(alerts or []):                # purged stale rows → write back
         return seen, log, no_update
@@ -7235,6 +7355,10 @@ def _alerts_from_mirror(date):
         last[base] = ts
         out.append({
             "t": ts.strftime("%H:%M"), "d": date, "kind": kind,
+            # the index, in the SAME form the live detector's recs carry — the cap switch
+            # counts NEWs per index off this list (_cap_muted); without it every synced
+            # alert would pool under one blank index on a viewer
+            "label": r.get("label") or LABELS.get(sym, sym),
             "head": r.get("head") or "", "body": r.get("body") or "",
             "color": _ALERT_KIND_COLOR.get(kind, "#e2e8f0"),
             "thin": bool(r.get("thin")),

@@ -51,6 +51,62 @@ def _fmt_contracts(v) -> str:
     return f"{v:+,d}"
 
 
+def _apply_trade_cap(opens: list, closed: list, cap) -> tuple:
+    """The charts-page "N trades / index / day" discipline switch, as a pure filter over the
+    day's scout episodes. Returns (opens_kept, closed_kept, skipped).
+
+    Keeps the FIRST `cap` episodes per index by open time — the only CAUSAL way to pick:
+    at the moment a trade opens you know how many you have already taken today, not which
+    of the day's trades will turn out best. Measured over the last 30 sessions (2026-09-29):
+    trades 3+ per index lost Rs67k live at a 30% win rate while the first two roughly broke
+    even; capping at 2 beat 99.6% of random 2-trade picks. The poller still LOGS every
+    episode — this filters what the board/ledger count, so the uncapped book stays gradeable.
+
+    `cap` falsy -> no filter. Input lists keep their order; skipped rows are copies tagged
+    with cap_state ("open"/"closed") and trade_no (1-based order of the day for that index).
+    """
+    if not cap:
+        return list(opens), list(closed), []
+    tagged = [(e, "open") for e in opens] + [(e, "closed") for e in closed]
+
+    def _key(item):
+        e = item[0]
+        ts = e.get("open_ts")
+        # open_ts carries seconds (a FLIP close + the next NEW can share a minute); open_t
+        # is the HH:MM fallback for rows built without it.
+        return (str(e.get("sym") or ""), str(ts) if ts is not None else "",
+                str(e.get("open_t") or ""))
+
+    kept, rank, skipped = set(), {}, []
+    for e, state in sorted(tagged, key=_key):
+        s = e.get("sym")
+        k = rank.get(s, 0)
+        rank[s] = k + 1
+        if k < cap:
+            kept.add(id(e))
+        else:
+            skipped.append({**e, "cap_state": state, "trade_no": k + 1})
+    return ([e for e in opens if id(e) in kept], [e for e in closed if id(e) in kept],
+            skipped)
+
+
+def _cap_muted(new_events: list, day_log: list, cap) -> bool:
+    """Should this batch of scout alerts stay SILENT under the N-trades cap?
+
+    True only when EVERY alert in `new_events` belongs to an index that has already opened
+    more than `cap` positions today (counted as NEW rows in `day_log`, which must include
+    `new_events`). The poller holds one position per index, so once an index's (cap+1)-th
+    NEW has fired, every later alert on it — that NEW, its SL/target/flip/timeout — belongs
+    to a trade the cap skips. A batch mixing in any in-cap index still beeps."""
+    if not cap or not new_events:
+        return False
+    n_new: dict = {}
+    for a in day_log:
+        if a.get("kind") == "NEW":
+            n_new[a.get("label")] = n_new.get(a.get("label"), 0) + 1
+    return all(n_new.get(a.get("label"), 0) > cap for a in new_events)
+
+
 def _scout_trade_status(entry, now, sl, tgt, peak) -> str:
     """Live trajectory of an OPEN scout position on its option premium (NOT a close — the
     poller alone closes on SL/TARGET/FLIP). Shows WHY a position is still open:
