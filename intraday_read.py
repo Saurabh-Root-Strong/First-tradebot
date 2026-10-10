@@ -32,8 +32,10 @@ import pandas as pd
 import footprint_chart as fc
 import feature_engine as FE
 import hour_forecast as hf
+import oi_flag
+import range_flag
 import regime_classifier as rc
-from core.constants import INDEX_SYMBOLS, LABELS, IST
+from core.constants import FINNIFTY, INDEX_SYMBOLS, LABELS, IST
 
 FY = {"NSE:NIFTY50-INDEX": "NIFTY50", "NSE:NIFTYBANK-INDEX": "NIFTYBANK",
       "NSE:FINNIFTY-INDEX": "FINNIFTY", "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY"}
@@ -132,7 +134,22 @@ def read(sym: str, date=None, as_of: dt.datetime | None = None) -> dict:
         bcov = hf.band_coverage(sym, H_eff)
     except Exception:
         bcov = {"cover": None, "n": 0, "conf": "none"}
-    return {"sym": sym, "label": label, "ok": True, "spot": spot,
+    # SIZE flag — "moved N× what is normal BY NOW" (range_flag: same clock time, prior 20
+    # sessions). A risk reading, never a direction; None until 09:45 / 10 sessions of history.
+    try:
+        rflag = range_flag.read(sym, ref, as_of)
+    except Exception:
+        rflag = None
+    # OI pile-up — "a sudden heavy build just started on one side", scored against today +
+    # the earlier days of THIS expiry (oi_flag). Context, not a forecast: [] when nothing fired.
+    try:
+        oflag = oi_flag.read(sym, ref, as_of)
+        for _f in oflag:                      # a % build on a thin book is small in absolute terms
+            _f["thin"] = sym == FINNIFTY      # same index the scout already marks thin (_THIN)
+    except Exception:
+        oflag = []
+    return {"sym": sym, "label": label, "ok": True, "spot": spot, "range_flag": rflag,
+            "oi_flag": oflag,
             "regime": r["regime"], "conf": r["confidence"], "action": r["action"],
             "structure": r.get("structure", ""), "carry": r["carry"],
             "posture": r.get("posture", ""), "size": r.get("size"),

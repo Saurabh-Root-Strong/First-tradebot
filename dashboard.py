@@ -9476,6 +9476,118 @@ def _parse_asof_hhmm(date, asof_str):
     return _dt.datetime.combine(_dt.date.fromisoformat(d), _dt.time(hh, mm), tzinfo=IST)
 
 
+def _range_flag_chip(rf):
+    """SIZE chip on the cockpit posture line: how far the index has ranged versus what is
+    normal BY THIS CLOCK TIME (range_flag). Silent below 1.5× — a normal day needs no chip.
+
+    Deliberately carries NO arrow. The reading says how much is left in the day, not which
+    way: on flagged days following the move made +1.3 bps (t 0.19) and fading it −1.3. It is
+    here so a stop or a size gets set for the day that is actually happening."""
+    if not rf or not rf.get("level"):
+        return html.Span("")
+    hot = rf["level"] == "flag"
+    # After 14:30 there is no "rest of day" worth forecasting (and the measured table stops
+    # there) — the chip then only states what the day HAS done.
+    fc = rf.get("rest") is not None
+    return html.Span(
+        f"  ·  {'🔥' if hot else '▲'} {rf['mult']:.1f}× normal for {rf['hm']}"
+        + (f" → rest of day ~{rf['rest']:.1f}× usual" if fc else ""),
+        title=(f"SIZE, not direction. By {rf['hm']} this index has ranged {rf['mult']:.1f}× the "
+               f"median for this clock time over the last {rf['n']} sessions.\n\n"
+               + (f"Measured on 2 years (4 indices, 1,932 index-days): at this level the REST of "
+                  f"the day ranges about {rf['rest']:.1f}× its usual, and is itself a big move "
+                  f"(>1.5× usual) {rf['big']}% of the time — against 19% on a normal day. Stable "
+                  f"in every half-year and on every index (rank IC +0.33).\n\n" if fc else
+                  "After 14:30 no rest-of-day expectation is shown: too little session is left "
+                  "and the measured table stops there.\n\n")
+               + f"It does NOT say which way: following the move so far made +1.3 bps, fading it "
+               f"−1.3, both indistinguishable from zero. It does NOT make buying options pay "
+               f"either — implied volatility has already repriced by the time this lights up "
+               f"(a straddle bought here still lost 1.3% an hour).\n\n"
+               f"Use it for RISK: wider stop, smaller size, and do not fade the band edge as "
+               f"if it were a quiet day. The band itself needs no adjusting — it widens with "
+               f"the day's own volatility.\n\n"
+               f"Open interest is not part of this on purpose: tested three ways, an OI "
+               f"build-up follows the price move rather than warning of it."),
+        style={"color": "#f87171" if hot else "#fbbf24", "fontWeight": "700", "cursor": "help"})
+
+
+_OI_STAGE_TXT = {
+    "FIRST": "the FIRST day of earlier expiries (a new contract has no history of its own yet)",
+    "MID": "the earlier mid-cycle days of THIS expiry (topped up from the previous one early on)",
+    "LATE": "the last 1–2 days of earlier expiries",
+    "EXPIRY": "earlier EXPIRY days",
+}
+
+
+# the yardstick, as the line itself names it — it is only "this expiry's" mid-cycle
+_OI_STAGE_SHORT = {"FIRST": "normal for a contract's first day", "MID": "this expiry's normal",
+                   "LATE": "normal for the last days before expiry",
+                   "EXPIRY": "normal for an expiry day"}
+
+
+def _oi_flag_lines(flags):
+    """One cockpit sub-line per OI pile-up that fired in the last 30 minutes (oi_flag) — a sudden
+    heavy build on the CALL or PUT side, unusual against today and the earlier days of THIS
+    expiry. Nothing is rendered on an ordinary stretch.
+
+    The line states the activity AND what has followed it, because the two are not the same
+    thing: this is the reading the desk asked to see, and replayed over 76 sessions it is
+    followed by a slightly QUIETER hour, not a bigger one, with no direction. Amber, not red —
+    it is information about the book, never an instruction."""
+    import oi_flag as _of
+    out = []
+    for f in (flags or []):
+        nxt, big = _of.MEASURED.get(f["side"], _of.BASELINE)
+        ratio = f"{min(f['ratio'], 99):.0f}×" if f.get("ratio") else "far above"
+        strike = ""
+        if f.get("strike"):
+            add = f.get("strike_add") or 0
+            amt = f"+{add / 1e5:.1f}L" if add >= 1e5 else f"+{add / 1e3:.0f}K"
+            strike = (f" · most at {f['strike']:,} {'CE' if f['side'] == 'CALL' else 'PE'} "
+                      f"({amt}, {f['strike_share']:.0%} of it)")
+        kind = {"writers": " · premium fell → mostly WRITERS",
+                "buyers": " · premium rose → mostly BUYERS"}.get(f.get("kind"), "")
+        if f.get("thin"):
+            kind += " · thin book — small in absolute terms"
+        out.append(html.Div([
+            html.Span(f"{'':13}", style={"color": "#334155"}),
+            html.Span(f"⚠ {f['side']} OI pile-up {f['hm']}" + ("" if f.get("live") else " (still showing)"),
+                      style={"color": "#fbbf24", "fontWeight": "700"}),
+            html.Span(f" · +{f['build']:.1f}% in 15m = {ratio} "
+                      f"{_OI_STAGE_SHORT.get(f.get('stage'), 'normal')}{strike}{kind}",
+                      style={"color": "#cbd5e1"}),
+            html.Span(f" · after these: next hour ×{nxt:.2f} of usual (any time ×{_of.BASELINE[0]:.2f}) "
+                      f"— an ordinary hour, no direction", style={"color": "#64748b"}),
+        ], title=(
+            f"{f['side']} open interest grew {f['build']:.2f}% in the 15 minutes to {f['hm']} — "
+            f"{f['z']}σ above the yardstick ({f['pool']} earlier 15-minute readings).\n\n"
+            f"COMPARED WITH WHAT: {_OI_STAGE_TXT.get(f.get('stage'), 'same-stage sessions')} — "
+            f"today so far + {f.get('pool_days', 0)} earlier session(s). Like is compared with "
+            "like because normal OI activity is not one number: the typical 15-minute build is "
+            "1.15% on the first day of a contract, 0.44% mid-cycle, 1.53% in the last 1–2 days and "
+            "2.08% on expiry day. The opening flood (before 10:15) is scored only against other "
+            "openings.\n\n"
+            "WHICH CONTRACT: the nearest expiry only (NIFTY weekly, the others monthly). The next "
+            "contract is not in the feed — near expiry, positions rolling forward show here only "
+            "as OI LEAVING, and the morning after an expiry the totals are the new contract.\n\n"
+            f"WHAT IT HAS MEANT (this exact flag replayed over 76 sessions, 148 fires with outcome "
+            f"data): the next hour ranged ×{nxt:.2f} its usual and was a big hour {big}% of the time "
+            f"— against ×{_of.BASELINE[0]:.2f} and {_of.BASELINE[1]}% for any moment, inside the "
+            "margin of error. Direction afterwards −3.2 bps [−7.6, +1.2], up 45%: a coin.\n\n"
+            "WHY: every contract has a buyer AND a writer, and a pile-up on one side can be "
+            "writing (a range view), buying (already in the premium), a spread, a hedge, a roll "
+            "or arbitrage — which pull different ways. And OI lines up with the price move 5 "
+            "minutes EARLIER, not the one after: it answers price, it does not announce it.\n\n"
+            "The strike named is where most of the build went; as a ceiling/floor it has held "
+            "68.6% of the time against 66.2% for any strike at the same distance — no better.\n\n"
+            "For 'how big is today', read the 🔥/▲ range chip on the line above — that one is "
+            "measured to carry forward. This line tells you what the book is doing."),
+            style={"fontSize": "0.56rem", "padding": "0 0 3px 0", "whiteSpace": "nowrap",
+                   "cursor": "help", **MONO}))
+    return out
+
+
 def _render_cockpit(date, asof_str=""):
     import datetime as _dt
     today = _dt.datetime.now(IST).date().isoformat()
@@ -9560,7 +9672,9 @@ def _render_cockpit(date, asof_str=""):
             html.Span(f" size {szx:5} · ", style={"color": "#64748b"}),
             html.Span(f"{r.get('state', '—'):14}", style={"color": "#94a3b8"}),
             html.Span(f" · option-buy: {r.get('opt_buy', '')}", style={"color": "#64748b"}),
+            _range_flag_chip(r.get("range_flag")),
         ], style={"fontSize": "0.58rem", "padding": "0 0 3px 0", "whiteSpace": "nowrap", **MONO}))
+        rows.extend(_oi_flag_lines(r.get("oi_flag")))
         if r.get("carry"):
             carries.append(r["label"])
     def _hh(txt):   # section heading
