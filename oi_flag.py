@@ -204,35 +204,19 @@ _DAY_BUILDS: dict = {}      # day -> {sym: builds frame} for FINISHED sessions (
 
 
 def _load(day: str) -> "pd.DataFrame | None":
-    """One day's oi_snapshots, only the needed columns, straight off the parquet (kept out of
-    the shared past-day cache in core.mirror_io — same reason as range_flag._load_ticks)."""
-    from core.constants import IST, LIVE_DIR
-    p = LIVE_DIR / f"{day}_oi_snapshots.parquet"
-    if not p.exists() or p.stat().st_size < 100:
-        return None
-    try:
-        import pyarrow.parquet as pq
-        have = set(pq.read_schema(p).names)
-        df = pd.read_parquet(p, columns=[c for c in _COLS if c in have])
-    except Exception:
-        return None
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    return df.sort_values("ts")
+    """One finished session's oi_snapshots, only the needed columns (day_files.load: the parquet
+    mirror on the laptop, the per-day DuckDB on the VM). Kept out of the shared past-day cache in
+    core.mirror_io — same reason as range_flag._load_ticks."""
+    import day_files
+    return day_files.load("oi_snapshots", day, _COLS)
 
 
 def _captured() -> list:
+    """Captured TRADING sessions that have OI snapshots (mirror or per-day database)."""
+    import day_files
     from core import market_calendar as mc
-    from core.constants import LIVE_DIR
-    out = []
-    for p in LIVE_DIR.glob("*_oi_snapshots.parquet"):
-        d = p.name[:10]
-        try:
-            dd = dt.date.fromisoformat(d)
-        except ValueError:
-            continue
-        if p.stat().st_size > 20_000 and mc.is_trading_day(dd):
-            out.append(d)
-    return sorted(out)
+    return [d for d in day_files.days("oi_snapshots", 20_000)
+            if mc.is_trading_day(dt.date.fromisoformat(d))]
 
 
 def _day(day: str, sym: str) -> "pd.DataFrame":

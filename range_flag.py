@@ -162,43 +162,27 @@ _DAY_CURVES: dict = {}    # day -> {sym: curve} for FINISHED prior sessions (imm
 
 
 def _load_ticks(day: str) -> "pd.DataFrame | None":
-    """One day's ticks, ONLY the columns the curve needs, read straight off the parquet.
+    """One finished session's ticks, ONLY the columns the curve needs (day_files.load: the
+    parquet mirror on the laptop, the per-day DuckDB on the VM).
 
     Deliberately NOT core.mirror_io.read_mirror for past days: that reader keeps whole
     past-day frames in a shared 32-slot cache (right for the replay that re-reads one chain
     file hundreds of times). Twenty past tick files there is ~180 MB pinned on a 1 GB capture
     VM, and it evicts the frames the replay actually wants. Here each file is read once,
     reduced to four tiny curves, and dropped."""
-    from core.constants import IST, LIVE_DIR
-    p = LIVE_DIR / f"{day}_ticks.parquet"
-    if not p.exists() or p.stat().st_size < 100:
-        return None
-    try:
-        import pyarrow.parquet as pq
-        have = set(pq.read_schema(p).names)
-        df = pd.read_parquet(p, columns=[c for c in _COLS if c in have])
-    except Exception:
-        return None
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(IST)
-    return df.sort_values("ts")
+    import day_files
+    return day_files.load("ticks", day, _COLS)
 
 
 def _prior_days(ref_date: str) -> list:
     """Up to LOOKBACK captured TRADING sessions strictly before ref_date. Weekend / holiday
     files are excluded: mock and special sessions get captured too (2026-07-04, a Saturday,
     carries the previous day's open for its first minutes) and are not 'a normal day'."""
+    import day_files
     from core import market_calendar as mc
-    from core.constants import LIVE_DIR
-    out = []
-    for p in LIVE_DIR.glob("*_ticks.parquet"):
-        d = p.name[:10]
-        try:
-            dd = dt.date.fromisoformat(d)
-        except ValueError:
-            continue
-        if d < ref_date and p.stat().st_size > 200_000 and mc.is_trading_day(dd):
-            out.append(d)
-    return sorted(out)[-LOOKBACK:]
+    out = [d for d in day_files.days("ticks", 200_000)        # 200 KB: skip dead / near-empty captures
+           if d < ref_date and mc.is_trading_day(dt.date.fromisoformat(d))]
+    return out[-LOOKBACK:]
 
 
 def _prior_curves(sym: str, ref_date: str) -> list:
