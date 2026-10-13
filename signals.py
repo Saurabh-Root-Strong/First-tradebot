@@ -17,6 +17,7 @@ import pandas as pd
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 from tradebot.adapters.broker.token import APP_ID, TOKEN_FILE   # single broker-token source
+from tradebot.adapters.broker import rest as _broker_rest      # call accounting only
 from core.constants import IST   # single source of truth  # noqa: E402
 
 HISTORY_URL = "https://api-t1.fyers.in/data/history"
@@ -83,6 +84,7 @@ def fetch_ohlcv(sym: str, resolution: str, days: int) -> pd.DataFrame:
     range_to   = now.strftime("%Y-%m-%d")
     range_from = (now - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
 
+    _broker_rest.note_history_call()
     try:
         resp = requests.get(
             HISTORY_URL,

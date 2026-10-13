@@ -192,9 +192,9 @@ def _idb_write_futures(index_sym: str, futures: list) -> None:
 
 def fetch_futures(index_sym: str) -> list[dict]:
     """Fetch near/next/far futures quotes (broker adapter) + persist the strip.
-    DB write fires only on a fresh network fetch (not cache hits) via on_fresh."""
-    return _broker_rest.fetch_futures(
-        index_sym, on_fresh=lambda r: _idb_write_futures(index_sym, r))
+    DB write fires only on a fresh network fetch (not cache hits) via on_fresh —
+    once per index, since one fetch now returns every index's strip."""
+    return _broker_rest.fetch_futures(index_sym, on_fresh=_idb_write_futures)
 
 
 def render_futures(futures: list[dict], spot: float) -> html.Div:
@@ -480,10 +480,22 @@ def _oi_background_poller():
     # fast again would just re-burn whatever ran out and oscillate. Worst case this
     # degrades to the old 90s (then 180s) having already banked the morning — strictly
     # better than a silent death, which is what the clock split was really guarding.
+    #
+    # ── 2026-10-09: the call budget is now REAL and known — 5,000 Data calls/day ──
+    # (Fyers Standard plan; was 100,000). 30s × 4 is 3,016 of it, and futures + open-trade
+    # quotes + the browser spend the rest, so a normal day sits near the cap. Still not
+    # rationed by the clock: the broker adapter counts every Data call, and each cycle
+    # asks whether what is left covers the rest of the session at full rate. Only when it
+    # does not do the three monthly-expiry indices drop to every other cycle (60s) —
+    # NIFTY, the only weekly and the BTST instrument, keeps 30s to the close.
     POLL_LADDER = (30, 90, 180)
     _poll_ix = 0
     _fail_cycles = 0
     FAIL_CYCLES_TO_BACKOFF = 3
+    OTHER_CALLS_PER_MIN = 4     # futures batch 1 + open-trade quotes 3 (20s tracker)
+    RATION_HYSTERESIS   = 150   # calls of slack before going back to full rate
+    _ration = False
+    _cycle = 0
     # Strikes: fetch/persist a WIDE band so last night's OI WALLS (often well OTM,
     # the put floor especially) are actually in the captured chain — at ±15 the
     # floor wall fell outside the map on ~90% of samples, blinding the continuity/
@@ -500,9 +512,24 @@ def _oi_background_poller():
             if OPEN <= now_t <= CLOSE:
                 with _lock:
                     spots = {s: (_latest.get(s) or {}).get("ltp", 0) for s in INDEX_SYMBOLS}
+                _cycle += 1
+                _left = ((CLOSE.hour - now_t.hour) * 3600 + (CLOSE.minute - now_t.minute) * 60
+                         - now_t.second)
+                _need = (_left / POLL_LADDER[_poll_ix] * len(INDEX_SYMBOLS)
+                         + _left / 60 * OTHER_CALLS_PER_MIN)
+                _rem = _broker_rest.data_calls_remaining()
+                if _ration != (_rem < _need + (RATION_HYSTERESIS if _ration else 0)):
+                    _ration = not _ration
+                    print(f"  [chain] Data-API budget @ {datetime.datetime.now(tz=IST):%H:%M:%S}"
+                          f" — {_rem} calls left, full rate to the close needs {_need:.0f}: "
+                          + (f"{LABELS.get(INDEX_SYMBOLS[0])} stays {POLL_LADDER[_poll_ix]}s, "
+                             f"the other indices drop to every other cycle" if _ration
+                             else "back to full rate on all indices"), flush=True)
                 for sym in INDEX_SYMBOLS:
                     spot = spots.get(sym, 0)
                     if not spot:
+                        continue
+                    if _ration and sym != INDEX_SYMBOLS[0] and _cycle % 2:
                         continue
                     _tried += 1
                     try:
@@ -615,7 +642,10 @@ class LiveFeed:
             return (_latest.get(sym) or {}).get("ltp", 0)
 
     def chain(self, sym):
-        oc = fetch_option_chain(sym)
+        # Ride on the capture poller's fetch: the 60s eval landing >25s after a poll
+        # used to spend its own call (and cache a narrow chain the poller then reused).
+        # 75s still covers the poller's rationed 60s cadence; past that it fetches.
+        oc = fetch_option_chain(sym, max_age=75)
         if oc.get("s") != "ok":
             return None
         d   = oc.get("data", {})
