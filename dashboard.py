@@ -513,18 +513,24 @@ def _oi_background_poller():
                 with _lock:
                     spots = {s: (_latest.get(s) or {}).get("ltp", 0) for s in INDEX_SYMBOLS}
                 _cycle += 1
-                _left = ((CLOSE.hour - now_t.hour) * 3600 + (CLOSE.minute - now_t.minute) * 60
-                         - now_t.second)
-                _need = (_left / POLL_LADDER[_poll_ix] * len(INDEX_SYMBOLS)
-                         + _left / 60 * OTHER_CALLS_PER_MIN)
-                _rem = _broker_rest.data_calls_remaining()
-                if _ration != (_rem < _need + (RATION_HYSTERESIS if _ration else 0)):
-                    _ration = not _ration
-                    print(f"  [chain] Data-API budget @ {datetime.datetime.now(tz=IST):%H:%M:%S}"
-                          f" — {_rem} calls left, full rate to the close needs {_need:.0f}: "
-                          + (f"{LABELS.get(INDEX_SYMBOLS[0])} stays {POLL_LADDER[_poll_ix]}s, "
-                             f"the other indices drop to every other cycle" if _ration
-                             else "back to full rate on all indices"), flush=True)
+                try:   # the budget read must never be what stops a capture cycle
+                    _left = ((CLOSE.hour - now_t.hour) * 3600
+                             + (CLOSE.minute - now_t.minute) * 60 - now_t.second)
+                    _need = (_left / POLL_LADDER[_poll_ix] * len(INDEX_SYMBOLS)
+                             + _left / 60 * OTHER_CALLS_PER_MIN)
+                    _rem = _broker_rest.data_calls_remaining()
+                    if _ration != (_rem < _need + (RATION_HYSTERESIS if _ration else 0)):
+                        _ration = not _ration
+                        print(f"  [chain] Data-API budget @ "
+                              f"{datetime.datetime.now(tz=IST):%H:%M:%S} — {_rem} calls left, "
+                              f"full rate to the close needs {_need:.0f}: "
+                              + (f"{LABELS.get(INDEX_SYMBOLS[0])} stays "
+                                 f"{POLL_LADDER[_poll_ix]}s, the other indices drop to every "
+                                 f"other cycle" if _ration
+                                 else "back to full rate on all indices"), flush=True)
+                except Exception as exc:
+                    print(f"  [chain] budget check error: {type(exc).__name__}: "
+                          f"{str(exc)[:100]}", flush=True)
                 for sym in INDEX_SYMBOLS:
                     spot = spots.get(sym, 0)
                     if not spot:
@@ -548,6 +554,11 @@ def _oi_background_poller():
                                 print(f"  [chain] {LABELS.get(sym, sym)} recovered @ "
                                       f"{datetime.datetime.now(tz=IST):%H:%M:%S}", flush=True)
                         if not ok:
+                            # Our own gate holding a call back (budget, or the pause after
+                            # a Fyers rejection) is not a dead feed: it must not walk the
+                            # one-way backoff ladder below.
+                            if "local rate gate" in str(data.get("message")):
+                                _tried -= 1
                             continue
                         _ok_count += 1
                         d   = data.get("data", {})
@@ -7847,7 +7858,10 @@ def update_oc(_, expiry, sym):
     with _lock:
         spot = (_latest.get(sym) or {}).get("ltp", 0)
 
-    data = fetch_option_chain(sym, expiry or "")
+    # max_age 40s > the 30s capture poll: on the nearest expiry the panel then never
+    # fetches itself, so the poller's snapshots stay stamped with their own fetch time
+    # (a panel-triggered fetch reused by the poller is up to 25s older than its stamp).
+    data = fetch_option_chain(sym, expiry or "", max_age=40)
     if data.get("s") != "ok":
         return html.Div(f"API error: {data.get('message','unknown')}",
                         style={"color": "#ef4444", "padding": "20px", **MONO}), "", "", ""
@@ -9196,7 +9210,7 @@ def update_trade_rec(tf_key, _, expiry, sym):
         spot = (_latest.get(sym) or {}).get("ltp", 0)
 
     # Fetch option chain with selected expiry
-    oc_data = fetch_option_chain(sym, expiry or "")
+    oc_data = fetch_option_chain(sym, expiry or "", max_age=40)
     if oc_data.get("s") != "ok":
         return (html.Div("Option chain unavailable",
                          style={"color": "#475569", "fontSize": "0.65rem", **MONO}),
@@ -9227,11 +9241,11 @@ def update_trade_rec(tf_key, _, expiry, sym):
                 for sp in sorted(strike_map)]
     mp = compute_max_pain(mp_chain) if mp_chain else 0
 
-    # Snapshot into OI store (background poller also does this, but capture here
-    # for the active index at higher frequency when OC panel is open)
-    snap = build_oi_snapshot(sym, spot, strike_map, tot_c_oi, tot_p_oi, pcr, mp)
-    if snap:
-        oi_store.add(snap)
+    # No oi_store.add here: the background poller is the ONE writer of OI snapshots.
+    # This callback used to add its own "for higher frequency", but the store accepts
+    # one per 30s — the poller's cadence — so it never added frequency; it could only
+    # win the slot from the poller with a ±15, panel-aged chain, or with whichever
+    # (possibly far) expiry the dropdown happened to be on.
 
     # Futures
     futures = fetch_futures(sym)

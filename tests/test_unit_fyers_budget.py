@@ -48,11 +48,14 @@ def net(monkeypatch, tmp_path):
 
     monkeypatch.setattr(rest, "_STATE_FILE", tmp_path / "calls.json")
     monkeypatch.setattr(rest, "_SEC_SOFT", 10 ** 6)        # no real-time waiting in units
-    monkeypatch.setattr(rest, "_fut_fail_ts", 0.0)
+    monkeypatch.setattr(rest, "_fut_fail_until", 0.0)
+    monkeypatch.setattr(rest, "_market_live", lambda now=None: True)
+    monkeypatch.setattr(rest, "_reserve", lambda now=None: 0)
+    monkeypatch.setattr(rest, "_cool", {"until": 0.0, "level": 0, "last": 0.0})
     monkeypatch.setattr(rest, "auth_header", lambda: "app:token")
     monkeypatch.setattr(rest.requests, "get", fake_get)
     for store in (rest._day, rest._said, rest._recent, rest._oc_cache,
-                  rest._oc_nearest, rest._fut_cache):
+                  rest._oc_nearest, rest._oc_flight, rest._fut_cache):
         store.clear()
     yield calls
     for store in (rest._day, rest._said, rest._recent):
@@ -92,9 +95,11 @@ def test_day_budget_spent_returns_an_error_chain_without_a_request(net, monkeypa
 
 def test_count_survives_a_restart_but_not_midnight(net, monkeypatch):
     rest.fetch_quotes(["NSE:A"])
-    rest._save(0, every=-1)
+    rest._write(rest._snapshot(every=-1))
     rest._day.clear()                                       # a new process
-    assert rest.data_call_stats()["used"] == 1
+    rest._recent.clear()
+    st = rest.data_call_stats()
+    assert st["used"] == 1 and st["last_minute"] == 1       # the minute window came back too
     stale = dict(json.loads(rest._STATE_FILE.read_text()), date="2000-01-01", used=4000)
     rest._STATE_FILE.write_text(json.dumps(stale))
     rest._day.clear()
@@ -105,8 +110,7 @@ def test_fyers_side_limit_rejection_is_counted_not_swallowed(net, monkeypatch):
     monkeypatch.setattr(rest.requests, "get", lambda *a, **k: _Resp(
         {"s": "error", "message": "request limit reached"}))
     assert rest.fetch_quotes(["NSE:A"]) == {}
-    assert rest.fetch_futures("NSE:NIFTY50-INDEX") == []
-    assert rest.data_call_stats()["rejected"] == 2
+    assert rest.data_call_stats()["rejected"] == 1
 
 
 def test_history_is_counted_apart_from_the_data_budget(net):
@@ -164,3 +168,147 @@ def test_max_age_rides_an_older_good_chain_but_never_an_error(net, monkeypatch):
     e["ts"] -= 20
     rest.fetch_option_chain("NSE:NIFTY50-INDEX", max_age=75)
     assert len(net) == 3
+
+
+# ── failure modes ──────────────────────────────────────────────────────────────
+
+def test_a_fyers_rejection_pauses_every_data_call_and_escalates(net, monkeypatch):
+    sent = []
+
+    def rejecting(url, **k):
+        sent.append(url)
+        return _Resp({"s": "error", "message": "request limit reached"})
+
+    monkeypatch.setattr(rest.requests, "get", rejecting)
+    assert rest.fetch_quotes(["NSE:A"]) == {}                 # sent, rejected
+    assert rest.fetch_option_chain("NSE:NIFTY50-INDEX")["s"] == "error"
+    assert rest.fetch_futures("NSE:NIFTY50-INDEX") == []
+    assert len(sent) == 1                                     # the pause held the other two
+    assert 55 < rest._cool["until"] - rest.time.monotonic() <= 60
+    rest._cool["until"] = 0.0                                 # the pause runs out ...
+    rest._oc_cache.clear()
+    rest.fetch_option_chain("NSE:NIFTY50-INDEX")              # ... and Fyers rejects again
+    assert 115 < rest._cool["until"] - rest.time.monotonic() <= 120
+
+
+def test_http_429_without_a_json_body_still_counts_as_a_rejection(net, monkeypatch):
+    class _Raw(_Resp):
+        status_code, text = 429, "Too Many Requests"
+
+        def json(self):
+            raise ValueError("no json")
+
+    monkeypatch.setattr(rest.requests, "get", lambda *a, **k: _Raw(None))
+    rest.fetch_option_chain("NSE:NIFTY50-INDEX")
+    rest._cool["until"] = 0.0
+    rest.fetch_quotes(["NSE:A"])
+    rest._cool["until"] = 0.0
+    rest.fetch_futures("NSE:NIFTY50-INDEX")
+    assert rest.data_call_stats()["rejected"] == 3
+
+
+def test_when_budget_is_short_only_the_essential_feeds_are_sent(net, monkeypatch):
+    monkeypatch.setattr(rest, "_reserve", lambda now=None: 10 ** 6)   # everything is reserved
+    assert rest.fetch_option_chain("NSE:NIFTYBANK-INDEX")["s"] == "error"
+    assert rest.fetch_option_chain("NSE:NIFTY50-INDEX", "222")["s"] == "error"   # a far expiry
+    assert len(net) == 0
+    assert rest.fetch_option_chain("NSE:NIFTY50-INDEX")["s"] == "ok"
+    assert rest.fetch_futures("NSE:NIFTY50-INDEX") and rest.fetch_quotes(["NSE:A"])
+    assert len(net) == 3
+
+
+def test_reserve_covers_the_rest_of_the_session_and_nothing_outside_it():
+    import datetime as dt
+
+    def at(day, h, m):                                        # 13 Oct 2026 is a Tuesday
+        return dt.datetime(2026, 10, day, h, m, tzinfo=rest.IST)
+
+    full = 377 * rest._ESSENTIAL_PER_MIN + rest._ESSENTIAL_TAIL
+    assert rest._reserve(at(13, 7, 0)) == full                # before the open: the whole day
+    assert rest._reserve(at(13, 9, 14)) == full
+    assert rest._reserve(at(13, 15, 1)) == 30 * rest._ESSENTIAL_PER_MIN + rest._ESSENTIAL_TAIL
+    assert rest._reserve(at(13, 15, 40)) == rest._ESSENTIAL_TAIL
+    assert rest._reserve(at(13, 15, 46)) == 0
+    assert rest._reserve(at(17, 11, 0)) == 0                  # Saturday
+    assert rest._market_live(at(13, 9, 0)) and rest._market_live(at(13, 15, 45))
+    assert not rest._market_live(at(13, 8, 59)) and not rest._market_live(at(17, 11, 0))
+
+
+def test_market_shut_a_chain_and_a_strip_are_not_bought_again(net, monkeypatch):
+    rest.fetch_option_chain("NSE:NIFTY50-INDEX")
+    rest.fetch_futures("NSE:NIFTY50-INDEX")
+    rest._oc_cache[("NSE:NIFTY50-INDEX", "")]["ts"] -= 300
+    rest._fut_cache["NSE:NIFTY50-INDEX"]["ts"] -= 300
+    monkeypatch.setattr(rest, "_market_live", lambda now=None: False)
+    rest.fetch_option_chain("NSE:NIFTY50-INDEX")
+    rest.fetch_futures("NSE:NIFTY50-INDEX")
+    assert len(net) == 2                                      # a tab left open costs nothing
+    monkeypatch.setattr(rest, "_market_live", lambda now=None: True)
+    rest.fetch_option_chain("NSE:NIFTY50-INDEX")
+    assert len(net) == 3                                      # the open: stale again at once
+
+
+def test_a_dead_token_is_not_retried_every_few_seconds(net, monkeypatch):
+    monkeypatch.setattr(rest.requests, "get", lambda *a, **k: _Resp(
+        {"s": "error", "code": -15, "message": "Please provide valid token"}))
+    rest.fetch_option_chain("NSE:NIFTY50-INDEX")
+    rest.fetch_futures("NSE:NIFTY50-INDEX")
+    rest._oc_cache[("NSE:NIFTY50-INDEX", "")]["ts"] -= 30     # past the ordinary 8s back-off
+    monkeypatch.setattr(rest, "_fut_fail_until", rest._fut_fail_until - 30)
+    used = rest.data_call_stats()["used"]
+    rest.fetch_option_chain("NSE:NIFTY50-INDEX")
+    rest.fetch_futures("NSE:NIFTY50-INDEX")
+    assert rest.data_call_stats()["used"] == used
+    assert rest.data_call_stats()["rejected"] == 0            # not a limit: no pause
+
+
+def test_callers_arriving_together_share_one_fetch(net, monkeypatch):
+    import threading
+    import time as _t
+    sent = []
+
+    def slow(url, headers=None, params=None, timeout=None):
+        sent.append(url)
+        _t.sleep(0.3)
+        if url == rest.OC_URL:
+            return _Resp(_chain_body(25))
+        return _Resp({"s": "ok", "d": [{"n": s, "v": {"lp": 1.0}}
+                                       for s in params["symbols"].split(",")]})
+
+    monkeypatch.setattr(rest.requests, "get", slow)
+    out = []
+    jobs = [threading.Thread(
+        target=lambda: out.append(rest.fetch_option_chain("NSE:NIFTY50-INDEX")["s"]))
+        for _ in range(6)]
+    jobs += [threading.Thread(target=lambda s=s: out.append(bool(rest.fetch_futures(s))))
+             for s in rest._FUT_UNDERLYING]
+    for j in jobs:
+        j.start()
+    for j in jobs:
+        j.join()
+    assert sorted(sent) == sorted([rest.OC_URL, rest.QUOTES_URL])
+    assert out.count("ok") == 6 and out.count(True) == 4
+
+
+def test_a_lopsided_chain_is_recentred_on_the_underlying(net):
+    rows = [{"strike_price": -1, "option_type": "", "ltp": 22010.0}]
+    for k in range(-5, 35):                                   # strikes ran out below ATM
+        rows.append({"strike_price": 22000 + 50 * k, "option_type": "CE"})
+    data = {"s": "ok", "data": {"optionsChain": rows}}
+    assert _strikes(rest._trim_chain(data, 3)) == [21850, 21900, 21950, 22000, 22050, 22100, 22150]
+    rows[0]["ltp"] = 21760.0                                  # ATM at the very edge: still 2n+1
+    edge = _strikes(rest._trim_chain(data, 3))
+    assert edge[0] == 21750 and len(edge) == 7
+
+
+def test_more_than_fifty_symbols_go_out_in_chunks(net):
+    syms = [f"NSE:S{i}" for i in range(120)] + ["NSE:S0"]     # one duplicate
+    assert len(rest.fetch_quotes(syms)) == 120
+    assert [len(c[1]["symbols"].split(",")) for c in net] == [50, 50, 20]
+
+
+def test_wall_clock_jumping_backwards_does_not_jam_the_gate(net, monkeypatch):
+    rest.fetch_quotes(["NSE:A"])
+    real = rest.time.time
+    monkeypatch.setattr(rest.time, "time", lambda: real() - 86400)
+    assert rest.fetch_quotes(["NSE:B"])                       # the window runs on monotonic

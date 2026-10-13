@@ -22,7 +22,7 @@ import time
 
 import requests
 
-from core.constants import DATA_DIR, IST
+from core.constants import DATA_DIR, IST, NIFTY
 
 from .token import auth_header
 
@@ -43,19 +43,58 @@ QUOTES_URL = "https://api-t1.fyers.in/data/quotes"
 #
 # Soft limits sit just inside Fyers' own so our clock and theirs can disagree a
 # little. A Prime account overrides via env.
-DATA_PER_SEC = int(os.environ.get("FYERS_DATA_PER_SEC", "5"))
-DATA_PER_MIN = int(os.environ.get("FYERS_DATA_PER_MIN", "50"))
-DATA_PER_DAY = int(os.environ.get("FYERS_DATA_PER_DAY", "5000"))
+DATA_PER_SEC = max(1, int(os.environ.get("FYERS_DATA_PER_SEC", "5")))
+DATA_PER_MIN = max(1, int(os.environ.get("FYERS_DATA_PER_MIN", "50")))
+DATA_PER_DAY = max(1, int(os.environ.get("FYERS_DATA_PER_DAY", "5000")))
 _SEC_SOFT = max(1, DATA_PER_SEC - 1)
 _MIN_SOFT = max(1, DATA_PER_MIN - 5)
 _DAY_SOFT = max(1, DATA_PER_DAY - 100)
 _GATE_WAIT_SEC = 2.0          # longest a caller waits for a per-second slot
 
+# What the budget is FOR. If it runs short, the feeds below are the last to go: the
+# NIFTY chain (the only weekly, the BTST instrument), the futures strip (the CAS-tail
+# fill price) and open-trade quotes. Everything else — the three monthly-expiry
+# indices, far expiries opened in the panel — is refused once what is left only
+# covers these to the close. Without this the day's last hour, the part that matters
+# most, was simply whatever happened to be left.
+_ESSENTIAL_PER_MIN = 6        # NIFTY chain 2 + futures batch 1 + open-trade quotes 3
+_ESSENTIAL_TAIL    = 60       # 15:31-15:45: CAS-tail futures + quotes to the EOD mark
+_CAPTURE_FROM = datetime.time(9, 14)      # the chain poller's window (dashboard)
+_CAPTURE_TO   = datetime.time(15, 31)
+_LIVE_FROM    = datetime.time(9, 0)
+_LIVE_TO      = datetime.time(15, 45)
+_IDLE_TTL     = 900.0         # market shut: the chain is not moving, do not re-buy it
+
+# A limit rejection from Fyers means their count disagrees with ours (another machine,
+# another script, their clock). Their older rule blocks the account for the rest of the
+# day after repeated per-minute breaches, so a rejection silences EVERY Data call for a
+# while — losing a minute of capture is cheap next to losing the session.
+_COOL_STEPS = (60, 120, 300, 600)
+_COOL_FORGET_SEC = 1800
+
 _STATE_FILE = DATA_DIR / "fyers_data_calls.json"
 _gate_lock  = threading.Lock()
-_recent: collections.deque = collections.deque()   # send times, last 60s
+_io_lock    = threading.Lock()
+_recent: collections.deque = collections.deque()   # send times (monotonic), last 60s
 _day: dict = {}               # today's counters — see _fresh_day
 _said: dict = {}              # log throttles: key -> last wall time / milestone
+_cool = {"until": 0.0, "level": 0, "last": 0.0}    # monotonic
+
+
+def _market_live(now: datetime.datetime | None = None) -> bool:
+    now = now or datetime.datetime.now(tz=IST)
+    return now.weekday() < 5 and _LIVE_FROM <= now.time() <= _LIVE_TO
+
+
+def _reserve(now: datetime.datetime | None = None) -> int:
+    """Data calls the essential feeds still need between now and the end of today."""
+    now = now or datetime.datetime.now(tz=IST)
+    t = now.time()
+    if now.weekday() >= 5 or t > _LIVE_TO:
+        return 0
+    start = max(t, _CAPTURE_FROM)
+    mins = max(0, (_CAPTURE_TO.hour * 60 + _CAPTURE_TO.minute) - (start.hour * 60 + start.minute))
+    return mins * _ESSENTIAL_PER_MIN + _ESSENTIAL_TAIL
 
 
 def _fresh_day(date: str) -> dict:
@@ -64,7 +103,8 @@ def _fresh_day(date: str) -> dict:
 
 def _roll() -> None:
     """Start today's counters (caller holds _gate_lock). Reload the state file on the
-    first call of a process so a mid-session restart does not forget the morning."""
+    first call of a process so a mid-session restart forgets neither the morning's
+    count nor the last minute's sends — a restart burst is what tripped the limit."""
     today = datetime.datetime.now(tz=IST).date().isoformat()
     if _day.get("date") == today:
         return
@@ -74,6 +114,10 @@ def _roll() -> None:
             saved = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
             if saved.get("date") == today:
                 fresh.update({k: saved[k] for k in fresh if k in saved})
+                wall, mono = time.time(), time.monotonic()
+                for w in saved.get("recent", []):
+                    if 0 <= wall - w < 60:
+                        _recent.append(mono - (wall - w))
         except Exception:
             pass
     _day.clear()
@@ -81,16 +125,29 @@ def _roll() -> None:
     _said.clear()
 
 
-def _save(now: float, every: float = 5.0) -> None:
-    if now - _said.get("saved", 0) < every:
+def _snapshot(every: float = 5.0) -> str | None:
+    """The state file's next contents, if one is due (caller holds _gate_lock)."""
+    wall = time.time()
+    if wall - _said.get("saved", 0) < every:
+        return None
+    _said["saved"] = wall
+    mono = time.monotonic()
+    return json.dumps({**_day, "recent": [round(wall - (mono - t), 2) for t in _recent]})
+
+
+def _write(payload: str | None) -> None:
+    """Write the state file OUTSIDE the gate lock — a stalled disk (the VM swaps) must
+    not hold every Data call behind it. A write already in flight is simply skipped."""
+    if not payload or not _io_lock.acquire(blocking=False):
         return
-    _said["saved"] = now
     try:
         tmp = _STATE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(_day), encoding="utf-8")
+        tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, _STATE_FILE)
     except Exception:
         pass
+    finally:
+        _io_lock.release()
 
 
 def _say(key: str, msg: str, every: float = 60.0) -> None:
@@ -100,28 +157,38 @@ def _say(key: str, msg: str, every: float = 60.0) -> None:
         print(f"  [fyers] {msg}", flush=True)
 
 
-def _acquire(kind: str) -> bool:
-    """Take one Data-API slot. False = do not send (minute or day budget spent)."""
-    deadline = time.time() + _GATE_WAIT_SEC
+def _acquire(kind: str, essential: bool = True) -> bool:
+    """Take one Data-API slot. False = do not send.
+
+    Refused when the day or minute budget is spent, during a cool-down after Fyers
+    rejected a call, or — for a non-essential call — when what is left today only
+    covers the essential feeds to the close. A full second just waits (≤2s)."""
+    deadline = time.monotonic() + _GATE_WAIT_SEC
     while True:
         with _gate_lock:
-            now = time.time()
+            now = time.monotonic()
             _roll()
             while _recent and now - _recent[0] > 60:
                 _recent.popleft()
             slot = sum(1 for t in _recent if now - t < 1.0) < _SEC_SOFT
-            why = ("day" if _day["used"] >= _DAY_SOFT else
+            left = _DAY_SOFT - _day["used"]
+            why = ("day" if left <= 0 else
+                   "cool-down" if now < _cool["until"] else
+                   "reserve" if (not essential and left <= _reserve()) else
                    "minute" if len(_recent) >= _MIN_SOFT else
                    "second" if (not slot and now > deadline) else "")
+            took = None
             if why:
+                took = False
                 _day["denied"] += 1
                 _say(f"deny-{why}",
-                     f"Data call ({kind}) NOT sent — {why} budget spent: "
+                     f"Data call ({kind}) NOT sent — {why}: "
                      f"{_day['used']}/{DATA_PER_DAY} today, {len(_recent)}/{DATA_PER_MIN} "
-                     f"in the last minute, {_day['denied']} refused today")
-                _save(now)
-                return False
-            if slot:
+                     f"in the last minute, {_day['denied']} refused today"
+                     + (" — the rest is held for NIFTY chain, futures and open-trade quotes"
+                        if why == "reserve" else ""))
+            elif slot:
+                took = True
                 _recent.append(now)
                 _day["used"] += 1
                 _day["by_kind"][kind] = _day["by_kind"].get(kind, 0) + 1
@@ -134,21 +201,39 @@ def _acquire(kind: str) -> bool:
                                   f"{datetime.datetime.now(tz=IST):%H:%M:%S} — "
                                   f"{_day['used']}/{DATA_PER_DAY} {_day['by_kind']}", flush=True)
                         break
-                _save(now)
-                return True
+            payload = _snapshot() if took is not None else None
+        if took is not None:
+            _write(payload)
+            return took
         time.sleep(0.1)
 
 
-def _note_reject(kind: str, message) -> None:
-    """Count a Fyers-side limit rejection — the futures/quotes paths used to swallow it."""
-    if "limit" not in str(message).lower():
+def _note_reject(kind: str, message, status: int | None = None) -> None:
+    """Count a Fyers-side limit rejection and start a cool-down. The futures/quotes
+    paths used to swallow these; a 429 with no JSON body counts too."""
+    if status != 429 and "limit" not in str(message).lower():
         return
     with _gate_lock:
         _roll()
+        now = time.monotonic()
         _day["rejected"] += 1
         n, used = _day["rejected"], _day["used"]
-    _say("reject", f"Fyers REJECTED a {kind} call — {str(message)[:80]} "
-                   f"(our count {used}/{DATA_PER_DAY}, {n} rejections today)")
+        if now >= _cool["until"]:              # calls already in flight do not escalate
+            if now - _cool["last"] > _COOL_FORGET_SEC:
+                _cool["level"] = 0
+            secs = _COOL_STEPS[min(_cool["level"], len(_COOL_STEPS) - 1)]
+            _cool.update(until=now + secs, level=_cool["level"] + 1, last=now)
+        wait = max(0, _cool["until"] - now)
+    _say("reject", f"Fyers REJECTED a {kind} call — {str(message)[:80]} (our count "
+                   f"{used}/{DATA_PER_DAY}, {n} rejections today) — all Data calls "
+                   f"paused {wait:.0f}s", every=0)
+
+
+def _error_ttl(message, base: float) -> float:
+    """How long to stop retrying after a failed fetch. A dead token cannot heal on its
+    own, so it is not worth a call every 8s from every open panel until it is renewed."""
+    m = str(message).lower()
+    return 60.0 if ("token" in m or "authenticate" in m) else base
 
 
 def note_history_call() -> None:
@@ -169,7 +254,7 @@ def data_calls_remaining() -> int:
 def data_call_stats() -> dict:
     with _gate_lock:
         _roll()
-        now = time.time()
+        now = time.monotonic()
         return {**_day, "by_kind": dict(_day["by_kind"]), "cap": DATA_PER_DAY,
                 "last_minute": sum(1 for t in _recent if now - t <= 60)}
 
@@ -178,6 +263,7 @@ def data_call_stats() -> dict:
 _oc_lock    = threading.Lock()
 _oc_cache: dict = {}          # (sym, expiry) -> {"data":.., "ts":.., "ttl":.., "n":..}
 _oc_nearest: dict = {}        # sym -> epoch of the nearest expiry (what expiry="" returns)
+_oc_flight: dict = {}         # (sym, expiry) -> Lock held by the one caller fetching it
 _OC_TTL     = 25.0            # seconds to reuse a good chain (matches 30s poll)
 _OC_ERR_TTL = 8.0            # back-off after a failed/limited fetch
 _OC_MIN_STRIKES = 25          # ± strikes; the capture poller's width (dashboard CHAIN_STRIKES)
@@ -209,60 +295,83 @@ def fetch_option_chain(sym: str, expiry: str = "", n_strikes: int = 15,
     if expiry and _oc_nearest.get(sym) == expiry:
         expiry = ""
     key = (sym, expiry)
-    now = time.time()
-    with _oc_lock:
-        e = _oc_cache.get(key)
-        if e:
+
+    def cached():
+        with _oc_lock:
+            e = _oc_cache.get(key)
+            if not e:
+                return None
             good = e["data"].get("s") == "ok"
-            ttl = max(e["ttl"], max_age) if (good and max_age) else e["ttl"]
-            if now - e["ts"] < ttl and (not good or e["n"] >= n_strikes):
-                return _trim_chain(e["data"], want)
-    if not _acquire("chain"):
-        data = {"s": "error", "message": "local rate gate — Fyers Data-API budget spent"}
-    else:
-        try:
-            resp = requests.get(
-                OC_URL,
-                headers={
-                    "Authorization": auth_header(),
-                    "Content-Type":  "application/json",
-                    "version":       "3",
-                },
-                params={
-                    "symbol":      sym,
-                    "strikecount": n_strikes,
-                    "timestamp":   expiry_to_epoch(expiry) if expiry else "",
-                    "greeks":      "1",
-                },
-                timeout=10,
-            )
-            try:
-                data = resp.json()
-            except Exception:
-                data = {"s": "error", "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
-        except Exception as e:
-            data = {"s": "error", "message": str(e)}
-        if data.get("s") != "ok":
-            _note_reject("chain", data.get("message"))
-    ok = data.get("s") == "ok"
-    if ok and not expiry:
-        try:
-            _oc_nearest[sym] = str(data["data"]["expiryData"][0]["expiry"])
-        except Exception:
-            pass
+            ttl = e["ttl"]
+            if good:
+                ttl = max(_OC_TTL if _market_live() else _IDLE_TTL, max_age or 0)
+            if time.time() - e["ts"] < ttl and (not good or e["n"] >= n_strikes):
+                return e["data"]
+            return None
+
+    hit = cached()
+    if hit is not None:
+        return _trim_chain(hit, want)
     with _oc_lock:
-        _oc_cache[key] = {"data": data, "ts": time.time(), "n": n_strikes,
-                          "ttl": _OC_TTL if ok else _OC_ERR_TTL}
-    return _trim_chain(data, want)
+        flight = _oc_flight.setdefault(key, threading.Lock())
+    with flight:                  # one fetch per key; the callers queued behind share it
+        hit = cached()
+        if hit is not None:
+            return _trim_chain(hit, want)
+        if not _acquire("chain", essential=(sym == NIFTY and not expiry)):
+            data = {"s": "error", "message": "local rate gate — Fyers Data-API budget "
+                                             "spent or held for the essential feeds"}
+        else:
+            status = None
+            try:
+                resp = requests.get(
+                    OC_URL,
+                    headers={
+                        "Authorization": auth_header(),
+                        "Content-Type":  "application/json",
+                        "version":       "3",
+                    },
+                    params={
+                        "symbol":      sym,
+                        "strikecount": n_strikes,
+                        "timestamp":   expiry_to_epoch(expiry) if expiry else "",
+                        "greeks":      "1",
+                    },
+                    timeout=10,
+                )
+                status = resp.status_code
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"s": "error", "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
+            except Exception as e:
+                data = {"s": "error", "message": str(e)}
+            if not isinstance(data, dict):
+                data = {"s": "error", "message": f"unexpected response: {str(data)[:120]}"}
+            if data.get("s") != "ok":
+                _note_reject("chain", data.get("message"), status)
+        ok = data.get("s") == "ok"
+        if ok and not expiry:
+            try:
+                _oc_nearest[sym] = str(data["data"]["expiryData"][0]["expiry"])
+            except Exception:
+                pass
+        with _oc_lock:
+            _oc_cache[key] = {
+                "data": data, "ts": time.time(), "n": n_strikes,
+                "ttl": _OC_TTL if ok else _error_ttl(data.get("message"), _OC_ERR_TTL)}
+        return _trim_chain(data, want)
 
 
 def _trim_chain(data: dict, n_strikes: int) -> dict:
     """Hand a caller the ±n_strikes it asked for out of a wider cached chain.
 
-    Fyers centres the chain on ATM, so the middle 2n+1 strikes of a wide response ARE
-    the narrow response (checked live 2026-10-13: ±15 == centre of ±25). Callers keep
-    the shape they always had; only the fetch is shared. Totals (callOi/putOi) are
-    expiry-wide either way."""
+    Fyers centres the chain on ATM, so the 2n+1 strikes around ATM of a wide response
+    ARE the narrow response (checked live 2026-10-13 on all four indices: ±15 == centre
+    of ±25). Callers keep the shape they always had; only the fetch is shared. Totals
+    (callOi/putOi) are expiry-wide either way. A full-width response is centred by Fyers,
+    so its middle strike is used as is; a lopsided one (strikes run out on one side) is
+    re-centred on the underlying's own price."""
     try:
         chain = data["data"]["optionsChain"]
     except Exception:
@@ -271,6 +380,10 @@ def _trim_chain(data: dict, n_strikes: int) -> dict:
     if len(strikes) <= 2 * n_strikes + 1:
         return data
     mid = len(strikes) // 2
+    spot = next((e.get("ltp") for e in chain if e.get("strike_price", -1) == -1), 0) or 0
+    if spot and len(strikes) != 2 * _OC_MIN_STRIKES + 1:
+        mid = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+        mid = max(n_strikes, min(mid, len(strikes) - n_strikes - 1))   # keep 2n+1 in range
     keep = set(strikes[mid - n_strikes: mid + n_strikes + 1])
     keep.add(-1)                                   # the underlying's own row
     return {**data, "data": {**data["data"], "optionsChain": [
@@ -292,7 +405,8 @@ _fut_lock  = threading.Lock()
 _fut_cache: dict = {}
 _FUT_TTL     = 30.0           # was 2s: the 2s option-chain tick turned that into 30 calls/min
 _FUT_ERR_TTL = 8.0            # after a failed fetch, do not retry on every tick
-_fut_fail_ts = 0.0
+_fut_fail_until = 0.0         # wall time before which a failed fetch is not retried
+_fut_flight = threading.Lock()
 
 
 def futures_symbols(index_sym: str) -> list[dict]:
@@ -338,18 +452,34 @@ def fetch_futures(index_sym: str, on_fresh=None) -> list[dict]:
     only on a real network fetch (not on a cache hit) — lets a caller persist the
     strips without the adapter knowing storage.
     """
-    global _fut_fail_ts
-    with _fut_lock:
-        c = _fut_cache.get(index_sym)
-        if c and time.time() - c["ts"] < _FUT_TTL:
-            return c["data"]
-        if time.time() - _fut_fail_ts < _FUT_ERR_TTL:
-            return []
+    def cached():
+        """The strip to return without a fetch, or None when one is due."""
+        with _fut_lock:
+            c = _fut_cache.get(index_sym)
+            if c and time.time() - c["ts"] < (_FUT_TTL if _market_live() else _IDLE_TTL):
+                return c["data"]
+            if time.time() < _fut_fail_until:
+                return []
+            return None
 
+    hit = cached()
+    if hit is not None:
+        return hit
+    if index_sym not in _FUT_UNDERLYING:
+        return []
+    with _fut_flight:             # one fetch at a time; callers queued behind share it
+        hit = cached()
+        if hit is not None:
+            return hit
+        return _fetch_futures_batch(index_sym, on_fresh)
+
+
+def _fetch_futures_batch(index_sym: str, on_fresh) -> list[dict]:
+    global _fut_fail_until
     infos = {s: futures_symbols(s) for s in _FUT_UNDERLYING}
     if not infos.get(index_sym):
         return []
-    raw = None
+    raw, status = None, None
     if _acquire("futures"):
         try:
             resp = requests.get(
@@ -359,14 +489,17 @@ def fetch_futures(index_sym: str, on_fresh=None) -> list[dict]:
                 params={"symbols": ",".join(s["symbol"] for si in infos.values() for s in si)},
                 timeout=10,
             )
+            status = resp.status_code
             raw = resp.json()
         except Exception:
             raw = None
-        if raw is not None and raw.get("s") != "ok":
-            _note_reject("futures", raw.get("message"))
+        if not isinstance(raw, dict):
+            raw = {"s": "error", "message": f"HTTP {status}"}
+        if raw.get("s") != "ok":
+            _note_reject("futures", raw.get("message"), status)
     if not raw or raw.get("s") != "ok":
         with _fut_lock:
-            _fut_fail_ts = time.time()
+            _fut_fail_until = time.time() + _error_ttl((raw or {}).get("message"), _FUT_ERR_TTL)
         return []
 
     q_map = {item["n"]: item.get("v", {}) for item in raw.get("d", [])}
@@ -402,28 +535,36 @@ def fetch_futures(index_sym: str, on_fresh=None) -> list[dict]:
     return fresh[index_sym]
 
 
+_QUOTES_MAX = 50
+
+
 def fetch_quotes(symbols: list[str]) -> dict:
     """Fetch last price (lp) for a list of Fyers symbols via /data/quotes."""
     if not symbols:
         return {}
     out: dict = {}
-    if not _acquire("quotes"):
-        return out
-    try:
-        resp = requests.get(
-            QUOTES_URL,
-            headers={"Authorization": auth_header(), "version": "3"},
-            params={"symbols": ",".join(symbols)},
-            timeout=8,
-        )
-        body = resp.json()
-        if body.get("s") != "ok":
-            _note_reject("quotes", body.get("message"))
-        for item in (body.get("d") or []):
-            n = item.get("n")
-            lp = (item.get("v") or {}).get("lp")
-            if n and lp is not None:
-                out[n] = float(lp)
-    except Exception:
-        pass
+    symbols = list(dict.fromkeys(symbols))
+    for i in range(0, len(symbols), _QUOTES_MAX):      # Standard plan: 50 symbols a request
+        if not _acquire("quotes"):
+            break
+        status = None
+        try:
+            resp = requests.get(
+                QUOTES_URL,
+                headers={"Authorization": auth_header(), "version": "3"},
+                params={"symbols": ",".join(symbols[i:i + _QUOTES_MAX])},
+                timeout=8,
+            )
+            status = resp.status_code
+            body = resp.json()
+            if body.get("s") != "ok":
+                _note_reject("quotes", body.get("message"), status)
+            for item in (body.get("d") or []):
+                n = item.get("n")
+                lp = (item.get("v") or {}).get("lp")
+                if n and lp is not None:
+                    out[n] = float(lp)
+        except Exception:
+            if status == 429:
+                _note_reject("quotes", "HTTP 429", status)
     return out
