@@ -139,11 +139,14 @@ def _remote_listing(host: str, key: str, *globs: str) -> dict[str, int]:
 
 
 def _sync_perday(host: str, key: str, remote_glob: str, local_dir: Path,
-                 quiet: bool) -> tuple[int, int]:
-    """Additive copy: fetch each remote file only if local missing or size differs."""
+                 quiet: bool, skip_day: str | None = None) -> tuple[int, int]:
+    """Additive copy: fetch each remote file only if local missing or size differs.
+    `skip_day`: leave that day's files for the next run (see the duckdb call in main)."""
     remote = _remote_listing(host, key, remote_glob)
     fetched = skipped = 0
     for rpath, rsize in sorted(remote.items()):
+        if skip_day and _day_stem(Path(rpath).name) == skip_day:
+            continue
         lpath = local_dir / Path(rpath).name
         if lpath.exists() and lpath.stat().st_size == rsize:
             skipped += 1
@@ -290,8 +293,12 @@ def main() -> None:
                           f"{REMOTE_ROOT}/data/intraday/live/*.parquet", LIVE_DIR, q)
     print(f"        fetched {mf}, up-to-date {ms}")
     print("  [2/6] per-day duckdb (intraday/*.duckdb)")
+    # NOT today's: the capturer still writes it after 15:45 (post-close ticks to ~16:00), so a
+    # copy now is a mid-write snapshot — and once its size matches the VM's, the purge below
+    # deletes the VM's whole copy. Happened 10-14/10-15/10-19 (archive stops at 15:45). The
+    # mirrors (atomic) cover today; the closed database comes down on the next run.
     df, ds = _sync_perday(args.host, args.key,
-                          f"{REMOTE_ROOT}/data/intraday/*.duckdb", _INTRADAY, q)
+                          f"{REMOTE_ROOT}/data/intraday/*.duckdb", _INTRADAY, q, skip_day=today)
     print(f"        fetched {df}, up-to-date {ds}")
     print("  [3/6] merge paper-trades")
     _merge_trades(args.host, args.key, q)

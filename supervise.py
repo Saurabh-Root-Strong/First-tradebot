@@ -85,11 +85,35 @@ def is_market_hours(now: datetime.datetime) -> bool:
     return is_trading_day(now.date()) and MKT_OPEN <= now.time() <= MKT_CLOSE
 
 
-def heartbeat_age() -> float:
-    try:
-        return time.time() - float(HEARTBEAT.read_text().strip())
-    except Exception:
-        return 1e9
+def heartbeat_age(retries: int = 3, pause: float = 0.3) -> "float | None":
+    """Seconds since the dashboard's last tick, or None when the heartbeat cannot be READ.
+
+    None is "unknown", not "stale" — the caller decides how long unknown may last. This used
+    to return 1e9 on any read error, so a read that landed while the dashboard was rewriting
+    the file (an empty file for an instant) looked like a feed dead for 31 years, and the
+    loop below killed a healthy capturer: 2026-10-16 14:35, "WS stalled — no tick for
+    1000000000s". A few quick retries ride out a rewrite; the writer is also atomic now."""
+    for i in range(retries):
+        try:
+            txt = HEARTBEAT.read_text().strip()
+            if txt:
+                return time.time() - float(txt)
+        except Exception:
+            pass
+        if i < retries - 1:
+            time.sleep(pause)
+    return None
+
+
+def stall_age(age: "float | None", unreadable_since: "float | None", now: float) -> tuple:
+    """(age to judge, updated unreadable_since). A readable heartbeat is judged as it is and
+    clears the unknown clock. An unreadable one is judged only by HOW LONG it has been
+    unreadable — so a moment of unreadability never restarts anything, but a heartbeat that
+    stays unreadable past the stall window is treated exactly like a stall."""
+    if age is not None:
+        return age, None
+    since = unreadable_since if unreadable_since is not None else now
+    return now - since, since
 
 
 def _free_port_8050() -> None:
@@ -196,6 +220,7 @@ def main() -> None:
     proc = launch(first=True)
     started = time.time()
     harvested_date = None          # footprint-validation harvest runs once/day post-close
+    unreadable_since = None        # when the heartbeat first became unreadable (None = readable)
     try:
         while True:
             time.sleep(HEALTH_POLL)
@@ -234,14 +259,21 @@ def main() -> None:
             since_open = (now - open_dt).total_seconds()
             if (is_market_hours(now) and (time.time() - started) > START_GRACE
                     and since_open > WS_STALL_SEC):
-                age = heartbeat_age()
+                raw = heartbeat_age()
+                was_unknown = unreadable_since
+                age, unreadable_since = stall_age(raw, unreadable_since, time.time())
+                if raw is None and was_unknown is None:
+                    log("heartbeat unreadable — not a stall yet; restarting only if it "
+                        f"stays unreadable for {WS_STALL_SEC}s")
                 if age > WS_STALL_SEC:
-                    log(f"WS stalled — no tick for {age:.0f}s during market hours — restarting")
+                    why = (f"no tick for {age:.0f}s" if raw is not None else
+                           f"heartbeat unreadable for {age:.0f}s")
+                    log(f"WS stalled — {why} during market hours — restarting")
                     try:
                         proc.kill(); proc.wait(timeout=10)
                     except Exception:
                         pass
-                    proc = launch(); started = time.time()
+                    proc = launch(); started = time.time(); unreadable_since = None
     except KeyboardInterrupt:
         log("Supervisor stopped by user — terminating dashboard")
         try:

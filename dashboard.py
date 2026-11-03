@@ -423,10 +423,19 @@ def _heartbeat_writer():
     """Write the wall-clock of the last received tick to a file every 10s, so the
     supervisor can detect a stalled WebSocket (no ticks during market hours) and
     restart the process before capture is lost."""
+    import os                      # dashboard has no module-level os import
     HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = HEARTBEAT_FILE.with_suffix(".tmp")
     while True:
         try:
-            HEARTBEAT_FILE.write_text(f"{_last_tick_wall:.0f}")
+            # WRITE-THEN-RENAME, never write_text() in place. write_text truncates the file
+            # first, so a supervisor read landing in that instant saw an EMPTY file, took it
+            # as "no heartbeat at all" and killed a perfectly healthy capturer: logged as
+            # "WS stalled — no tick for 1000000000s" (2026-10-16 14:35). os.replace swaps
+            # the whole file in one step — a reader sees the old value or the new, never
+            # nothing.
+            tmp.write_text(f"{_last_tick_wall:.0f}")
+            os.replace(tmp, HEARTBEAT_FILE)
         except Exception:
             pass
         time.sleep(10)
