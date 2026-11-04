@@ -32,10 +32,18 @@ LOG = ROOT / "logs" / "morning_capture_alarm.log"
 
 
 def _log(msg: str):
-    LOG.parent.mkdir(exist_ok=True)
+    """Append to LOG; never raise. From 24 Jul to 4 Nov 2026 every run died HERE: the .cmd
+    launcher redirected stdout into this same file, Windows refused the second open
+    (PermissionError), and a watchdog that cannot write its diary raised no alarm at all.
+    The launcher now writes to its own .console.log; if the diary is still unwritable the
+    line goes to stdout and the alarm carries on."""
     ts = datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG, "a", encoding="utf-8") as f:
-        f.write(f"{ts}  {msg}\n")
+    try:
+        LOG.parent.mkdir(exist_ok=True)
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(f"{ts}  {msg}\n")
+    except OSError as exc:
+        print(f"{ts}  {msg}   [diary unwritable: {exc}]", flush=True)
 
 
 def _alarm(title: str, body: str):
