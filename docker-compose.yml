@@ -10,9 +10,16 @@ services:
       - DASH_PORT=8050
       - FYERS_HEADLESS=1
       - TRADEBOT_NO_BROWSER=1
+      # glibc gives each thread its own malloc arena and keeps freed pages; with ~20
+      # threads of pandas work the capturer grew to ~1.9 GB (RAM + swap) by mid-afternoon
+      # on this 908 MB box (2026-11-06) and every click waited on swap. 2 arenas caps that.
+      - MALLOC_ARENA_MAX=2
     volumes:
       - ./data:/app/data       # persist captured ticks/candles/OI across restarts
       - ./logs:/app/logs
+      # daily token: morning_token.bat scp's it to the VM, `docker compose restart` picks it
+      # up without a rebuild (was an uncommitted VM-only edit, lost on every branch reset)
+      - ./access_token.txt:/app/access_token.txt
     expose:
       - "8050"                 # internal only — reachable by caddy, not the internet
     restart: unless-stopped
