@@ -23,7 +23,13 @@ set LOG=%~dp0logs\vm_deploy.log
 echo ================================================================ >> "%LOG%"
 echo === VM DEPLOY  %date% %time% === >> "%LOG%"
 
-echo [1/4] pushing %BRANCH% -> origin (so the VM can pull it)...
+REM The arrow below is escaped as -^> on purpose. Written plainly, cmd reads
+REM the angle bracket as a redirect: this line printed NOTHING and instead
+REM wrote a file called "origin" into the repo root. That file then made every
+REM command that names origin as a revision fail -- "git log origin" and
+REM "git diff origin" both died with "ambiguous argument: both revision and
+REM filename". Escaping it keeps the arrow and prints the message.
+echo [1/4] pushing %BRANCH% -^> origin (so the VM can pull it)...
 git push origin %BRANCH%
 if errorlevel 1 (
   echo   PUSH FAILED — VM would deploy STALE code. Aborting.
